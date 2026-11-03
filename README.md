@@ -8,7 +8,7 @@ shell commands, file edits and tool calls appear as real tool blocks. It syncs i
 continuously, without duplicating turns.
 
 **Status: pre-alpha, not usable yet.** The design and the decisions behind it are in
-[docs/DECISIONS.md](docs/DECISIONS.md).
+[docs/DECISIONS.md](docs/DECISIONS.md); where to pick the work up is in [docs/HANDOFF.md](docs/HANDOFF.md).
 
 ## License
 
