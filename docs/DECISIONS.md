@@ -2,18 +2,19 @@
 
 Status: pre-alpha. The design below comes from a working prototype that ran on one agent fleet in
 November 2026, kept a handful of real conversations in sync both ways, and was tested end to end
-against Claude Code 2.1.3xx and Codex 0.163. This file records what was decided and what was learned,
-so the package can be built from it.
+against the Claude Code builds that fleet ran (2.1.303 to 2.1.316) and Codex 0.163.0. This file records
+what was decided and what was learned, so the package can be built from it.
 
 ## What duologue is
 
 One AI coding conversation that lives in two places at once: Anthropic's Claude Code and OpenAI's
 Codex. You talk to it in the Claude app (Claude Code Remote Control) or in the ChatGPT/Codex app
-(`codex app-server --remote-control`) and switch whenever you like. Each side's history shows the
-other side's work natively. Messages, shell commands, file edits and tool calls appear as real tool
-blocks, not pasted text. Sync is continuous, in both directions, appends to the same conversation on
-each side, never duplicates a turn, and keeps each model's context within a budget while older
-history stays visible in the app and readable on demand.
+(`codex remote-control start`, which runs Codex's app-server daemon with remote control on) and
+switch whenever you like. Each side's history shows the other side's work natively. Messages, shell
+commands, file edits and tool calls appear as real tool blocks, not pasted text. Sync is continuous,
+in both directions, appends to the same conversation on each side, never duplicates a turn, and keeps
+each model's context within a budget. Older history stays in the files and readable on demand, though
+an app may show only the recent part: Claude shows a long session from its last compaction onward.
 
 Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" below.
 
@@ -53,7 +54,11 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
      `skipped_busy` means retry later.
   3. Take the writer lock `~/.codex/thread-writer-locks/<id>.lock` (flock, non-blocking). If it is held,
      do not write.
-  4. Require the projection checkpoint `next_rollout_byte_offset` to equal the file size.
+  4. Require the projection checkpoint `next_rollout_byte_offset` to equal the file size. A longer
+     file means an earlier append stopped before Codex indexed it (the prototype stopped here with an
+     error and needed a person). Recover first: when the extra lines are exactly the ones duologue
+     recorded before writing them (steal-list item 2), run steps 6 and 7 for them, then start again;
+     otherwise block the pair and report it. Never append after lines Codex has not indexed.
   5. Append canonical lines with contiguous `ordinal`s starting at `next_rollout_ordinal`.
   6. Call `thread/resume` with no overrides: overrides persist on the thread. This is what makes Codex
      index the tail itself (codex-rs `thread_processor`: "Paginated JSONL is canonical, but its SQLite
@@ -110,14 +115,21 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
   - Claude: the last synced record uuid.
   - Codex: a byte offset anchored to the id of the last finished turn. It is found again after Codex
     rewrites the file, for example during migration, so a restart never replays old turns.
-- **Deterministic ids** (uuid5) in both directions, so a retry after a crash adds nothing.
+- **Deterministic ids** (uuid5) in both directions, so a retry can recognise what it already wrote.
+  Before writing, each side checks whether its ids are already there (Codex: the turn ids in the
+  history index; Claude: the uuid of the first record to write) and writes nothing if they are. That
+  covers a crash after a complete write. A write cut off partway needs steal-list items 2 and 3: the
+  ids recorded before writing, read back, and an accepted cursor that moves only after verification.
 - **Quiet and open-turn checks.** Sync only finished turns. If the user typed on both sides, stop and
   report a conflict.
 - **Output caps.** The model sees 4,000 characters per tool output, the app shows 20,000. The rest
   goes to a pointer file.
 - **History rebuilds.**
   - Merge every source, native first: original native threads, older transcripts, rescued index rows.
-  - Dedupe by turn id, then by the opening message.
+  - Dedupe by turn id. Then, between different sources (copies of the same conversation), by the
+    opening message; never within one source, where a repeat is a real new turn ("status?" asked
+    twice). Text alone can still merge two genuine turns from different sources, so the rebuild's plan
+    step reports how many turns each source adds before anything is applied.
   - Skip copies that fall within the original's own time period, and drop app noise.
   - Give the model the newest ~400k characters. Older turns are shown in the app only, plus a pointer
     file the model can read on demand.
