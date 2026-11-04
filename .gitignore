@@ -218,3 +218,8 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local
+.DS_Store
+CLAUDE.local.md
+.claude/
