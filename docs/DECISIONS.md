@@ -24,9 +24,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 |---|---|
 | Name | `duologue`: PyPI `duologue`, CLI `duologue`, repo `creynir/duologue`. The npm name is taken and not needed. |
 | Distribution | Pure-Python wheel on PyPI. Runtime stays standard-library only (the prototype is ~3,300 lines of stdlib Python). Install with `uv tool install duologue` or `pipx install duologue`. |
-| Python | `>=3.11`, tested on 3.11, 3.12 and 3.13. |
+| Python | `>=3.11`, tested on 3.11, 3.12, 3.13 and 3.14. |
 | License | Apache-2.0 (chosen when the repo was created). |
-| CI/CD | GitHub Actions, modelled on `creynir/phalanx`. `ci.yml` runs on push and PR to main: ruff, pytest, Linux and macOS, Python 3.11 to 3.13. `publish.yml` runs on a `v*` tag: tests, `python -m build`, then PyPI, preferably via Trusted Publishing (`id-token: write`, no stored token). Add a version check that the tag matches `pyproject.toml`. |
+| CI/CD | GitHub Actions, modelled on `creynir/phalanx`. `ci.yml` runs on push and PR to main: ruff; pytest on Linux with Python 3.11 to 3.14 and on macOS with 3.14 only, because GitHub's macOS runners were often too busy to start queued jobs; a wheel build and smoke test. `publish.yml` runs on a `v*` tag: the tag must match the `pyproject.toml` version, then CI, `python -m build`, and PyPI via Trusted Publishing (`id-token: write`, no stored token). Actions are pinned to commit SHAs, kept current by Dependabot. |
 | Default setup | One person, one machine: the same OS user runs Claude Code and Codex (macOS or Linux, both apps installed). |
 | Advanced setup | Separate OS users per agent, a shared work folder, a notifier hook for alerts. Driven by config, not code. |
 | Service | launchd (macOS) or a `systemd --user` timer (Linux). |
