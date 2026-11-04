@@ -18,6 +18,10 @@ def test_no_command_prints_help_with_every_command(capsys):
         assert name in out
 
 
+def test_not_implemented_has_its_own_exit_code():
+    assert NOT_IMPLEMENTED not in (0, 1, 2)  # success, failure, argparse usage error
+
+
 @pytest.mark.parametrize("name", sorted(COMMANDS))
 def test_planned_commands_say_they_are_not_implemented(name, capsys):
     assert main([name]) == NOT_IMPLEMENTED

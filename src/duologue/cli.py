@@ -23,7 +23,7 @@ COMMANDS = {
     "log": "show recent sync activity",
 }
 
-NOT_IMPLEMENTED = 2
+NOT_IMPLEMENTED = 3  # distinct from argparse's usage error (2) and a general failure (1)
 
 
 def build_parser() -> argparse.ArgumentParser:
