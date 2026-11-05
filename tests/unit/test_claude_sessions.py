@@ -412,6 +412,24 @@ def test_a_record_claude_writes_after_duologue_is_never_taken_back(tmp_path: Pat
     assert path.read_bytes().endswith(claude_record)
 
 
+def test_take_back_leaves_a_rewritten_or_moved_transcript_alone(tmp_path: Path):
+    from duologue.claude.sessions import _take_back
+    from duologue.journal import prefix_hash
+
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    base = path.stat().st_size
+    intent = Intent("claude", path, base, encode(records), (), prefix_hash(path, base))
+    with open(path, "ab") as fh:
+        fh.write(intent.data)
+    data = path.read_bytes()
+    path.write_bytes(data[:10].upper() + data[10:])  # same size, earlier bytes rewritten
+    assert not _take_back(path, intent)
+    assert path.stat().st_size == intent.end
+    path.unlink()
+    assert not _take_back(path, intent)  # moved away: nothing to take back, no error
+
+
 def test_a_transcript_that_moved_on_waits(tmp_path: Path):
     c = a_session()
     path = write(tmp_path, c.records)

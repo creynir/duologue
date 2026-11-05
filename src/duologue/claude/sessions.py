@@ -9,6 +9,7 @@ stops instead.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import uuid
 from collections.abc import Callable, Iterable
@@ -218,7 +219,13 @@ def _take_back(path: Path, intent: Intent) -> bool:
     size and the bytes are checked on the same open handle right before the truncate, so a
     record Claude appends is never cut (Claude Code holds no lock duologue could take; this
     leaves only the instant between the last read and the truncate)."""
-    with open(path, "r+b") as fh:
+    try:
+        fh = open(path, "r+b")
+    except FileNotFoundError:
+        return False  # moved away (EnterWorktree): nothing here to take back
+    with fh:
+        if intent.before and _prefix_digest(fh, intent.base) != intent.before:
+            return False  # rewritten before our records: not ours to cut
         fh.seek(intent.base)
         if fh.read(len(intent.data) + 1) != intent.data:
             return False
@@ -227,6 +234,18 @@ def _take_back(path: Path, intent: Intent) -> bool:
             return False
         fh.truncate(intent.base)
     return True
+
+
+def _prefix_digest(fh, length: int) -> str:
+    digest, left = hashlib.sha256(), length
+    fh.seek(0)
+    while left > 0:
+        chunk = fh.read(min(left, 1 << 20))
+        if not chunk:
+            break
+        digest.update(chunk)
+        left -= len(chunk)
+    return digest.hexdigest()
 
 
 def _take_out(path: Path, intent: Intent) -> None:
