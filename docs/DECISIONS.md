@@ -1,9 +1,11 @@
 # duologue: decisions so far
 
-Status: pre-alpha. The design below comes from a working prototype that ran on one agent fleet in
-November 2026, kept a handful of real conversations in sync both ways, and was tested end to end
-against the Claude Code builds that fleet ran (2.1.303 to 2.1.316) and Codex 0.163.0. This file records
-what was decided and what was learned, so the package can be built from it.
+Status: alpha. The design comes from a working prototype that ran on one agent fleet in November
+2026, kept a handful of real conversations in sync both ways, and was tested end to end against the
+Claude Code builds that fleet ran (2.1.303 to 2.1.316) and Codex 0.163.0. The package was then
+built from it and checked again, in throwaway homes, against Claude Code 2.1.318 and Codex 0.166.0;
+its end-to-end tests run both real CLIs in CI. This file records what was decided and what was
+learned.
 
 ## What duologue is
 
@@ -30,7 +32,7 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 | Default setup | One person, one machine: the same OS user runs Claude Code and Codex (macOS or Linux, both apps installed). |
 | Advanced setup | Separate OS users per agent, a shared work folder, a notifier hook for alerts. Driven by config, not code. |
 | Service | launchd (macOS) or a `systemd --user` timer (Linux). |
-| CLI | `link`, `unlink`, `status`, `sync`, `rebuild`, `doctor`, `hold`/`release`, `log`. |
+| CLI | `link`, `unlink`, `status`, `sync`, `doctor`, `hold`/`release`, `resolve`, `log`, `service`. `rebuild` (a whole history merged from several copies) comes after 0.1. |
 | Naming | No vendor trademarks in names or branding. |
 | Scope | No company-specific code in the package. Deployment details live in the user's config. |
 
@@ -48,23 +50,32 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 - **Lines appended from outside never show by themselves.** `thread/inject_items` is model-only and
   never rendered (openai/codex#49328).
 - **Append path (works, no database writes).**
-  1. If the thread is loaded, close it with `thread/archive` + `thread/unarchive`. Archiving moves the
-     rollout to `archived_sessions/`, so re-resolve the path afterwards.
+  1. If the thread is loaded, do not write. In a shared app-server daemon (`codex remote-control`,
+     reached through `codex app-server proxy`), close it with `thread/archive` + `thread/unarchive`
+     when `thread/read` says it is idle; never while a turn runs. Archiving moves the rollout to
+     `archived_sessions/`, so re-resolve the path afterwards. Without a daemon (the ChatGPT app
+     runs its own app-server privately), wait. An archived thread is left alone until unarchived.
   2. If the thread is legacy, convert it first: `codex migrate-rollouts --thread <id> --apply --json`.
      `skipped_busy` means retry later.
-  3. Take the writer lock `~/.codex/thread-writer-locks/<id>.lock` (flock, non-blocking). If it is held,
-     do not write.
+  3. Take the writer lock `~/.codex/thread-writer-locks/<id>.lock` exactly as codex-rs
+     `rollout/src/writer_lock.rs` does: create, probe and remove it under `.coordination.lock`, and
+     flock it non-blocking. If it is held, do not write. A turn left open by a Codex that stopped is
+     not closed by a resume (Codex 0.166); the next Codex turn closes it, so wait for that.
   4. Require the projection checkpoint `next_rollout_byte_offset` to equal the file size. A longer
      file means an earlier append stopped before Codex indexed it (the prototype stopped here with an
      error and needed a person). Recover first: when the extra lines are exactly the ones duologue
      recorded before writing them (steal-list item 2), run steps 6 and 7 for them, then start again;
      otherwise block the pair and report it. Never append after lines Codex has not indexed.
   5. Append canonical lines with contiguous `ordinal`s starting at `next_rollout_ordinal`.
-  6. Call `thread/resume` with no overrides: overrides persist on the thread. This is what makes Codex
-     index the tail itself (codex-rs `thread_processor`: "Paginated JSONL is canonical, but its SQLite
-     projection can lag").
-  7. Verify that the turns and the checkpoint advanced, then call `thread/unsubscribe`.
-  8. If the app had the thread open, reopen it so the app refetches.
+  6. Call `thread/resume` with no overrides (they persist on the thread) and `excludeTurns: true`
+     (otherwise Codex builds and sends the whole history). This is what makes Codex index the tail
+     itself (codex-rs `thread_processor`: "Paginated JSONL is canonical, but its SQLite projection
+     can lag").
+  7. Verify that every new turn is indexed whole and the checkpoint reached the write's end. If
+     Codex indexed none of it and nothing was written after it, take it out again; either way,
+     block the pair. `thread/unsubscribe` is not needed: it releases neither the thread nor its
+     lock. A private app-server gives both up when it exits; in a daemon, a thread duologue loaded
+     is unloaded with archive and unarchive.
 - **Turn ids must be unique.** Codex silently drops a duplicate turn id. Its importer restarts at
   `external-import-turn-1` on every import. Codex's own turns use UUIDv7; ours are deterministic uuid5.
 - **Item records** (rollout `event_msg/item_completed`; the variant name is PascalCase, fields are
@@ -99,8 +110,14 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 - **Tool names.** Claude's API accepts tool names it does not have in history. Name Codex tools
   `mcp__codex__*`, which Claude renders as tool rows. Plain shell commands map to `Bash`. Hide
   Claude's own `ToolSearch` calls from Codex.
-- **Write only while the copy is not running**, then relaunch it with
-  `claude --resume <id> --remote-control "<title>"`.
+- **Write only while no Claude Code process has the session.** A running Claude keeps the session in
+  memory, and its next message would leave appended records on a side branch. Live sessions are
+  in `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json` (`sessionId`, `pid`, `status`; Claude Code 2.1.318
+  also writes `<pid>.<hash>.key` files there), and a process that resumed the session names it
+  on its command line (`ps -A -ww`: without `-ww` Linux cuts command lines to 80 columns). The
+  check runs again just after the write, which is taken out if Claude opened the session
+  meanwhile. The prototype relaunched copies it ran itself
+  (`claude --resume <id> --remote-control "<title>"`); the package leaves launching to the user.
 - **Large transcripts.** Over 5,242,880 bytes, Claude loads only what follows the last
   `compact_boundary`. Claude shows long sessions from their last compaction onward, so older
   history stays in the file but leaves the view.
@@ -120,8 +137,10 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
   history index; Claude: the uuid of the first record to write) and writes nothing if they are. That
   covers a crash after a complete write. A write cut off partway needs steal-list items 2 and 3: the
   ids recorded before writing, read back, and an accepted cursor that moves only after verification.
-- **Quiet and open-turn checks.** Sync only finished turns. If the user typed on both sides, stop and
-  report a conflict.
+- **Quiet and open-turn checks.** Sync only finished turns: a Codex turn once its `task_complete` is
+  written, a Claude turn once its last message has a final stop reason (or its process is gone and
+  the transcript is quiet). New content on both sides since the last sync is a conflict: nothing
+  is copied until the user keeps one side's new turns (`duologue resolve`).
 - **Output caps.** The model sees 4,000 characters per tool output, the app shows 20,000. The rest
   goes to a pointer file.
 - **History rebuilds.**
@@ -136,9 +155,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 - **Text-to-native parsing.** Earlier converters (Codex's importer's `[external_agent_tool_call: …]`
   and our own `[ran …] / [result — …]`) can be turned back into native items for display.
 
-## Steal list (planned, from studying prior art)
+## Steal list (from studying prior art)
 
-Ranked, each with its source:
+Ranked, each with its source. Items 1 to 5 and 7 to 9 are in 0.1; item 6 in part.
 
 1. **Rewrite detection** (Maxaccurate/claude-codex-sync). Store `sha256(file[:offset])` next to every
    cursor. On mismatch, block the pair and never auto-resync it.
@@ -148,14 +167,18 @@ Ranked, each with its source:
 3. **Persisted verification** (Maxaccurate). A pair with an unverified write gets no new writes, and
    that holds across restarts.
 4. **Hold the Codex writer lock for the whole append** (Maxaccurate).
-5. **Claude busy/idle** from `~/.claude/sessions/<pid>.json` `status` (tandem, Chamotrans), with quiet
-   time only as a fallback. Long tool calls write nothing for minutes.
+5. **Claude busy/idle** from `~/.claude/sessions/<pid>.json` (tandem, Chamotrans), with quiet
+   time only as a fallback. Long tool calls write nothing for minutes. In the package: any live
+   process counts as busy, whatever its `status`, since an idle Claude still holds the session.
 6. **Honest native tool mapping** (tandem).
    - Single-file Codex `apply_patch` becomes `Edit`/`Write` with a `structuredPatch`, so it renders as
      a diff.
    - Claude `Read`/`Grep`/`Glob` become `cat -n`/`rg` equivalents.
    - `TodoWrite` maps to `update_plan`.
    - Fall back verbatim when a mapping fails.
+
+   In 0.1: Claude's `Read`/`Grep`/`Glob` become `cat -n`/`rg`; Codex patches reach Claude as
+   `mcp__codex__apply_patch`. The `Edit`/`Write` diff and `update_plan` mappings are still to do.
 7. **Pair tool calls by id** whatever the file order. Close dangling calls with "(tool result not
    recorded)" (tandem).
 8. **Pre-flight structure check** before `thread/resume` and `claude --resume`. Every parentUuid must
@@ -164,6 +187,9 @@ Ranked, each with its source:
 9. **Version and format gate.** Pin the hash of Codex's v2 `ThreadItem` schema
    (`codex app-server generate-json-schema`) and keep a version floor and ceiling. On drift, stop
    writing and alert. Fail closed only on unknown record types that carry a message (tandem, ORG2).
+   In the package: the hash covers the five item kinds duologue writes and every definition they
+   reference, so a new kind elsewhere does not stop it; there is a version floor and no ceiling.
+   Codex 0.166.0 from npm and the 0.166.0-alpha.6 inside the ChatGPT app have the same hash.
 10. **Quarantine** for untranslatable entries: at most one placeholder per turn, listed by `doctor`
     (tandem).
 11. **Native provenance markers instead of text tags.** Codex `turn/start.clientUserMessageId` comes
@@ -213,16 +239,19 @@ None does one live conversation in both official apps with native blocks on both
   - A scripted fake app-server for the append, resume and verify flow, including
     "thread already has an active writer".
   - Mock Responses and Messages servers to assert what each model actually saw.
-- **End-to-end tests** (manual or canary). Real CLIs: a real Claude session with every tool type
-  goes to Codex; a real Codex turn with command, patch and MCP calls goes to Claude. Each side's model
-  must answer from the other's turns, retries must add nothing, and a thread open in the app must be
-  handled.
+- **End-to-end tests** (in CI). The real `claude` and `codex` CLIs, pinned in `ci.yml`, run against
+  local stand-ins for both model APIs (`tests/e2e/mock_models.py`), so no account is needed:
+  real tool calls on one side reach the other natively, each model is shown them on its next
+  turn, a new side can be created from either one, and nothing is copied twice.
+
+What the tests do not cover yet: the apps' own UIs (the Claude and ChatGPT apps), Codex patches
+and MCP calls from a real Codex turn, and an app holding a thread open while duologue waits.
 
 ## Open questions
 
 - Should Codex's model context get real `function_call` pairs (tandem shows they are accepted)
   instead of prose notes?
 - Should big Claude-side rebuilds use a native `compact_boundary` and summary?
-- Pairing UX: link from inside a conversation (`duologue link` run by the agent), from the CLI, or
-  automatically?
+- Pairing UX: 0.1 links from the CLI (`duologue link --claude last --codex last`). Should an agent be
+  able to link its own conversation, or should pairs form automatically?
 - Which default budgets fit a single-user setup?
