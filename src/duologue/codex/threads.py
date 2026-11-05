@@ -42,13 +42,12 @@ from duologue.codex.rollout import (
     is_compressed,
     model_provider,
     new_rollout_path,
-    prefix_hash,
     sqlite_home,
     uuid7,
 )
 from duologue.codex.rpc import AppServer, AppServerError, daemon_running
 from duologue.ids import require_id
-from duologue.journal import Blocked, Intent, Journal, Wait, tail_state
+from duologue.journal import Blocked, Intent, Journal, Wait, prefix_hash, tail_state
 from duologue.jsonl import dumps, ends_with_newline, iter_lines
 from duologue.translate.claude_to_codex import RolloutLine
 from duologue.translate.common import iso_ms

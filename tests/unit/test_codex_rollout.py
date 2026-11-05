@@ -15,12 +15,12 @@ from duologue.codex.rollout import (
     model_provider,
     new_rollout_path,
     open_turn,
-    prefix_hash,
     session_meta,
     sqlite_home,
     turn_ends,
     uuid7,
 )
+from duologue.journal import prefix_hash
 from duologue.jsonl import read_lines
 
 THREAD = "01a1ab4d-705e-7cc1-9b67-8e3e3f3f96ef"

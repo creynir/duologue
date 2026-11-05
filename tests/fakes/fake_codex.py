@@ -9,6 +9,8 @@ It does what duologue relies on Codex for, the way Codex 0.166 does it, and no m
 - ``migrate-rollouts --thread <id> --apply --json``: converts a legacy rollout to paginated.
 - ``app-server daemon-serve`` (fake only) runs a shared app-server on the home's control socket,
   and ``app-server proxy`` connects stdio to it, as ``codex app-server proxy`` does.
+- ``app-server generate-json-schema --out <dir>``: a small synthetic schema with the item kinds
+  duologue writes (``FAKE_CODEX_SCHEMA=changed`` changes one of them).
 - ``--version``.
 
 Like Codex, it creates its history index when it starts, and a thread's status in
@@ -316,6 +318,31 @@ def proxy() -> int:
     return 0
 
 
+def schema(out: Path) -> None:
+    def kind(name: str, extra: dict | None = None) -> dict:
+        props = {"type": {"enum": [name], "type": "string"}, "id": {"type": "string"}}
+        return {"type": "object", "properties": {**props, **(extra or {})}}
+
+    variants = [
+        kind("userMessage"),
+        kind("agentMessage", {"phase": {"$ref": "#/definitions/MessagePhase"}}),
+        kind("commandExecution", {"command": {"type": "string"}}),
+        kind("fileChange"),
+        kind("mcpToolCall"),
+        kind("reasoning"),
+    ]
+    if os.environ.get("FAKE_CODEX_SCHEMA") == "changed":
+        variants[2]["properties"]["command"] = {"type": "array"}
+    doc = {
+        "definitions": {
+            "ThreadItem": {"oneOf": variants},
+            "MessagePhase": {"enum": ["commentary", "final_answer"], "type": "string"},
+        }
+    }
+    (out / "v2").mkdir(parents=True, exist_ok=True)
+    (out / "v2" / "Schemas.json").write_text(json.dumps(doc))
+
+
 def main(argv: list[str]) -> int:
     if argv[:1] == ["--version"]:
         print("codex-cli 0.166.0")
@@ -331,6 +358,9 @@ def main(argv: list[str]) -> int:
         serve(server, sys.stdin, write)
         for thread_id in list(server.locks):  # a Codex that exits gives its threads up
             server.unload(thread_id)
+        return 0
+    if argv[:2] == ["app-server", "generate-json-schema"]:
+        schema(Path(argv[argv.index("--out") + 1]))
         return 0
     if argv == ["app-server", "proxy"]:
         return proxy()

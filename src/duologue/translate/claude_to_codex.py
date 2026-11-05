@@ -81,6 +81,21 @@ def is_user_input(record: dict) -> bool:
     return False
 
 
+def has_content(records: Iterable[dict]) -> bool:
+    """Whether the records hold something Codex would get: a message the user typed, text or a
+    tool call. Thinking alone, bookkeeping and duologue's own notes do not count."""
+    for r in conversation(records):
+        if r.get("type") == "user":
+            if is_user_input(r):
+                return True
+            continue
+        content = (r.get("message") or {}).get("content")
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        if any(_translatable(b) for b in blocks):
+            return True
+    return False
+
+
 def _has_note(content: object) -> bool:
     if isinstance(content, str):
         return is_note(content)
@@ -108,6 +123,17 @@ def claude_to_codex(
     name their folder. ``now_ms`` stamps lines whose source has no timestamp at all.
     """
     return _Translator(thread_id, key, outputs, default_cwd, now_ms).run(conversation(records))
+
+
+def note_turn(text: str, *, thread_id: str, key: str, ms: int) -> list[RolloutLine]:
+    """A turn holding only a duologue note as its user message. The note's prefix keeps it from
+    travelling back to Claude."""
+    t = _Translator(thread_id, key, None, "", ms)
+    ref = f"note-{ms}"
+    t._start(ms, ref)
+    t._user_message(ms, ref, f"[{MARK}: {text}]")
+    t._end(ms)
+    return t.out
 
 
 class _Translator:

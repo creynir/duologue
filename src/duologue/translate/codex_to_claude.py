@@ -241,6 +241,7 @@ def claude_records(
     git_branch: str = "",
     dangling: tuple[str, ...] = (),
     source_assistant: str | None = None,
+    lead_extra: str = "",
     now_ms: int | None = None,
 ) -> list[dict]:
     """Transcript records for ``steps``, to append after the record ``parent_uuid`` (of type
@@ -251,11 +252,11 @@ def claude_records(
     tool calls at the end of the session that never got a result (Claude stopped mid-tool); the
     first record answers them, as Claude requires (after a user message too: Claude Code writes the
     results of parallel calls one record each). ``source_assistant`` is the assistant message
-    those calls are in, which the results link back to.
+    those calls are in, which the results link back to. ``lead_extra`` is added to the lead note.
     """
     if not steps:
         return []
-    seq = _with_notes(list(steps), parent_type, dangling)
+    seq = _with_notes(list(steps), parent_type, dangling, lead_extra)
     messages = _alternate(seq)
     anchor = next((s.key for s in steps if s.key), session_id)
     stamps = _fill_timestamps([m.timestamp for m in messages], now_ms)
@@ -307,7 +308,10 @@ def claude_records(
 
 
 def _with_notes(
-    seq: list[ClaudeStep], parent_type: str | None, dangling: tuple[str, ...] = ()
+    seq: list[ClaudeStep],
+    parent_type: str | None,
+    dangling: tuple[str, ...] = (),
+    lead_extra: str = "",
 ) -> list[ClaudeStep]:
     """The lead note before the Codex part, and a closing note when it ends on the user's side.
     Results for ``dangling`` calls open the first user message: tool results go first."""
@@ -319,7 +323,8 @@ def _with_notes(
         {"type": "tool_result", "tool_use_id": t, "content": NOT_RECORDED, "is_error": True}
         for t in dangling
     ]
-    lead = closing + [{"type": "text", "text": f"[{MARK}: {LEAD_NOTE}]"}]
+    lead_text = f"{LEAD_NOTE} {lead_extra}" if lead_extra else LEAD_NOTE
+    lead = closing + [{"type": "text", "text": f"[{MARK}: {lead_text}]"}]
     if seq[0].role == "user":
         if parent_type == "user" and not closing:
             seq.insert(0, note("assistant", "continued in Codex"))
