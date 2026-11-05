@@ -2,7 +2,8 @@ from pathlib import Path
 
 import pytest
 
-from duologue.journal import Intent, MemoryJournal, tail_state
+from duologue.journal import Intent, MemoryJournal, prefix_hash, tail_state
+from duologue.jsonl import read_lines
 
 
 @pytest.fixture
@@ -26,9 +27,9 @@ def test_the_whole_write_is_complete(intent: Intent):
     assert tail_state(intent.path, intent) == "complete"
 
 
-def test_a_write_followed_by_the_apps_own_lines_is_complete(intent: Intent):
+def test_a_write_followed_by_the_apps_own_lines(intent: Intent):
     intent.path.write_bytes(b"one\ntwo\nthree\nfour\n")
-    assert tail_state(intent.path, intent) == "complete"
+    assert tail_state(intent.path, intent) == "followed"
 
 
 @pytest.mark.parametrize(
@@ -46,6 +47,11 @@ def test_a_missing_file_is_changed(intent: Intent):
     assert tail_state(intent.path, intent) == "changed"
 
 
+def test_a_new_file_never_made_is_absent(tmp_path: Path):
+    intent = Intent("claude", tmp_path / "new.jsonl", 0, b"x\n", ("u",))
+    assert tail_state(intent.path, intent) == "absent"
+
+
 def test_intent_end_and_digest(intent: Intent):
     assert intent.end == 14
     assert len(intent.digest) == 64
@@ -54,4 +60,28 @@ def test_intent_end_and_digest(intent: Intent):
 def test_memory_journal_keeps_the_last_intent(intent: Intent):
     journal = MemoryJournal()
     journal.begin(intent)
-    assert journal.intent is intent
+    later = Intent("claude", intent.path, 0, b"x\n", ("v",))
+    journal.begin(later)
+    assert journal.intent is later
+
+
+def test_a_rewrite_of_the_same_size_before_the_write_is_changed(intent: Intent):
+    checked = Intent(
+        intent.side,
+        intent.path,
+        intent.base,
+        intent.data,
+        intent.ids,
+        prefix_hash(intent.path, intent.base),
+    )
+    assert tail_state(intent.path, checked) == "absent"
+    intent.path.write_bytes(b"ONE\n")  # same size, other bytes
+    assert tail_state(intent.path, checked) == "changed"
+
+
+def test_reading_from_inside_a_line_is_refused(tmp_path: Path):
+    path = tmp_path / "f.jsonl"
+    path.write_bytes(b'{"a": 1}\n{"b": 2}\n')
+    assert [ln.record for ln in read_lines(path, 9)] == [{"b": 2}]
+    with pytest.raises(ValueError):
+        read_lines(path, 3)

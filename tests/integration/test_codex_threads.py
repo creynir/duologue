@@ -21,6 +21,7 @@ from duologue.codex.threads import (
     turn_ids,
 )
 from duologue.journal import Blocked, Intent, MemoryJournal, Wait
+from duologue.jsonl import encode as encode_records
 from duologue.jsonl import read_lines
 from duologue.translate.claude_to_codex import claude_to_codex
 from duologue.translate.outputs import OutputStore
@@ -131,10 +132,13 @@ def test_a_running_turn_waits(codex, tmp_path, holder):
     assert len(read_lines(path)) == 3
 
 
-def test_a_turn_left_open_by_a_stopped_codex_blocks(codex, tmp_path):
-    write_rollout(codex.home, THREAD, codex_turn("turn-1")[:2])
-    with pytest.raises(Blocked, match="never finished"):
+def test_a_turn_left_open_by_a_stopped_codex_waits_for_the_next_turn(codex, tmp_path):
+    # Codex 0.166 does not close such a turn on resume; its next turn closes it.
+    path = write_rollout(codex.home, THREAD, codex_turn("turn-1")[:2])
+    size = path.stat().st_size
+    with pytest.raises(Wait, match="never finished"):
         append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+    assert path.stat().st_size == size
 
 
 def test_an_index_that_lags_catches_up_first(codex, thread, tmp_path):
@@ -192,6 +196,139 @@ def test_a_compressed_thread_waits(codex, tmp_path):
         append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
 
 
+class CheckingJournal:
+    """Checks that the intent is recorded under the writer lock and before any byte is written."""
+
+    def __init__(self, codex: Codex, thread_id: str):
+        self.codex, self.thread_id, self.intent = codex, thread_id, None
+
+    def begin(self, intent: Intent) -> None:
+        assert lock.is_held(self.codex.home, self.thread_id), "the write must hold the lock"
+        size = intent.path.stat().st_size if intent.path.exists() else 0
+        assert size == intent.base, "the intent must be recorded before the write"
+        self.intent = intent
+
+
+def test_the_append_holds_the_lock_and_records_its_intent_first(codex, thread, tmp_path):
+    journal = CheckingJournal(codex, THREAD)
+    append_turns(codex, THREAD, claude_lines(tmp_path), journal=journal)
+    assert journal.intent is not None
+
+
+def test_create_holds_the_lock_and_records_its_intent_first(codex, tmp_path):
+    journal = CheckingJournal(codex, "")
+
+    def build(thread_id):
+        journal.thread_id = thread_id
+        return claude_lines(tmp_path, thread_id=thread_id)
+
+    create_thread(codex, cwd=CWD, build=build, journal=journal)
+    assert journal.intent is not None
+
+
+def two_turns(tmp_path: Path, thread_id: str = THREAD):
+    c = ClaudeTranscript()
+    c.user("first")
+    c.assistant("one")
+    c.user("second")
+    c.assistant("two")
+    return claude_to_codex(
+        c.records,
+        thread_id=thread_id,
+        key="pair-1",
+        outputs=OutputStore(tmp_path / "outputs"),
+        default_cwd=CWD,
+    )
+
+
+def test_a_partly_indexed_write_blocks_and_stays(codex, thread, tmp_path, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_INDEX_TURNS", "1")
+    before = thread.stat().st_size
+    with pytest.raises(Blocked, match="indexed 1 of the 2"):
+        append_turns(codex, THREAD, two_turns(tmp_path), journal=MemoryJournal())
+    assert thread.stat().st_size > before  # Codex indexed part of it: nothing is taken out
+
+
+def test_a_write_whose_last_line_codex_did_not_index_blocks(codex, thread, tmp_path, monkeypatch):
+    # Every turn id is in the index, but the turn's end and the checkpoint are not.
+    monkeypatch.setenv("FAKE_CODEX_LEAVE_LINES", "1")
+    with pytest.raises(Blocked, match="indexed 0 of the 1 turns duologue added whole"):
+        append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+
+
+def test_a_batch_that_repeats_a_turn_id_blocks(codex, thread, tmp_path):
+    lines = claude_lines(tmp_path)
+    with pytest.raises(Blocked, match="repeat a turn id"):
+        append_turns(codex, THREAD, lines + lines, journal=MemoryJournal())
+
+
+def test_the_index_is_read_where_codex_keeps_its_databases(codex, tmp_path, monkeypatch):
+    elsewhere = tmp_path / "sqlite"
+    elsewhere.mkdir()
+    monkeypatch.setenv("CODEX_SQLITE_HOME", str(elsewhere))
+    write_rollout(codex.home, THREAD, codex_turn("turn-1"))
+    resume(codex, THREAD)  # the fake follows CODEX_SQLITE_HOME as Codex does
+    assert (elsewhere / "thread_history_1.sqlite").exists()
+    assert list(codex.index(THREAD).turns) == ["turn-1"]
+
+
+def test_a_thread_ending_in_a_half_line_waits(codex, thread, tmp_path):
+    with open(thread, "ab") as fh:
+        fh.write(b'{"timestamp":"2026-11-04T14:00:09.000Z","type":"event_msg","pay')
+    size = thread.stat().st_size
+    with pytest.raises(Wait, match="writing"):
+        append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+    assert thread.stat().st_size == size
+
+
+def test_an_index_that_does_not_catch_up_blocks(codex, thread, tmp_path, monkeypatch):
+    with open(thread, "a") as fh:
+        for n, r in enumerate(codex_turn("turn-2"), start=5):
+            fh.write(json.dumps(dict(r, ordinal=n), separators=(",", ":")) + "\n")
+    size = thread.stat().st_size
+    monkeypatch.setenv("FAKE_CODEX_NO_INDEX", "1")
+    with pytest.raises(Blocked, match="index of the thread ends at byte"):
+        append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+    assert thread.stat().st_size == size
+
+
+def test_resume_of_a_thread_open_elsewhere_waits(codex, thread, holder):
+    with pytest.raises(Wait, match="open in Codex"):
+        resume(codex, THREAD)
+
+
+def test_an_archived_thread_waits(codex, thread, tmp_path):
+    archived = codex.home / "archived_sessions" / thread.name
+    archived.parent.mkdir()
+    thread.rename(archived)
+    with pytest.raises(Wait, match="archived"):
+        append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+
+
+def test_a_retry_reports_where_the_turns_are(codex, thread, tmp_path):
+    lines = claude_lines(tmp_path)
+    first = append_turns(codex, THREAD, lines, journal=MemoryJournal())
+    with open(thread, "a") as fh:  # Codex writes a turn of its own after them
+        for n, r in enumerate(codex_turn("turn-9"), start=100):
+            fh.write(json.dumps(dict(r, ordinal=n), separators=(",", ":")) + "\n")
+    resume(codex, THREAD)
+    again = append_turns(codex, THREAD, lines, journal=MemoryJournal())
+    assert not again.written
+    assert (again.start, again.end) == (first.start, first.end)
+
+
+def test_a_lone_surrogate_in_claude_output_is_written_as_a_replacement(codex, thread, tmp_path):
+    c = ClaudeTranscript()
+    c.user("read it")
+    c.call("Read", {"file_path": "/x"}, json.loads('"cut emoji \\ud83d"'))
+    c.assistant("done")
+    lines = claude_to_codex(
+        c.records, thread_id=THREAD, key="k", outputs=OutputStore(tmp_path / "o"), default_cwd=CWD
+    )
+    done = append_turns(codex, THREAD, lines, journal=MemoryJournal())
+    assert "cut emoji \ufffd" in thread.read_text(encoding="utf-8")[done.start :]
+
+
 # ------------------------------------------------------------------------------------ recovery
 def interrupted(codex: Codex, thread: Path, tmp_path: Path, cut: int | None = None) -> Intent:
     """The intent of an append that stopped after writing ``cut`` bytes (all when None)."""
@@ -225,6 +362,38 @@ def test_recover_an_indexed_write_is_done(codex, thread, tmp_path):
     intent = interrupted(codex, thread, tmp_path)
     resume(codex, THREAD)
     assert recover(codex, THREAD, intent)
+
+
+def test_recover_never_takes_out_what_codex_wrote_after(codex, thread, tmp_path, monkeypatch):
+    intent = interrupted(codex, thread, tmp_path)
+    with open(thread, "ab") as fh:  # the user's own Codex turn, after duologue's lines
+        fh.write(encode_records([{"type": "event_msg", "payload": {"type": "user_message"}}]))
+    size = thread.stat().st_size
+    monkeypatch.setenv("FAKE_CODEX_NO_INDEX", "1")
+    with pytest.raises(Blocked, match="left as it is"):
+        recover(codex, THREAD, intent)
+    assert thread.stat().st_size == size
+
+
+def test_recover_a_cut_off_write_codex_indexed_part_of_blocks(codex, thread, tmp_path):
+    lines = two_turns(tmp_path)
+    data = encode(lines, codex.index(THREAD).next_ordinal)
+    base = thread.stat().st_size
+    first_turn_end = data.index(b'"task_complete"')
+    cut = data.index(b"\n", first_turn_end) + 1 + 40  # turn 1 whole, turn 2 cut off
+    with open(thread, "ab") as fh:
+        fh.write(data[:cut])
+    intent = Intent("codex", thread, base, data, turn_ids(lines))
+    resume(codex, THREAD)  # the user opened the thread: Codex indexed turn 1
+    assert codex.index(THREAD).next_offset > base
+    with pytest.raises(Blocked, match="indexed part"):
+        recover(codex, THREAD, intent)
+    assert thread.stat().st_size == base + cut
+
+
+def test_recover_a_create_whose_file_was_never_made(codex, tmp_path):
+    intent = Intent("codex", tmp_path / "x.jsonl", 0, b"{}\n", ("t",))
+    assert not recover(codex, "01a1ab4d-0000-7000-8000-000000000001", intent)
 
 
 def test_recover_a_thread_that_changed_blocks(codex, thread, tmp_path):
@@ -282,7 +451,8 @@ def test_codex_version_and_migrate(codex):
 
 # ------------------------------------------------------------------------------- shared daemon
 def methods(log: Path) -> list[str]:
-    return [json.loads(x)["method"] for x in log.read_text().splitlines()]
+    calls = [json.loads(x)["method"] for x in log.read_text().splitlines()]
+    return [m for m in calls if m != "initialize"]
 
 
 class TestSharedDaemon:
@@ -325,6 +495,26 @@ class TestSharedDaemon:
         calls = methods(daemon)
         assert calls[calls.index("thread/archive") + 1] == "thread/unarchive"
         assert calls.count("thread/archive") == 2  # closed before the write, unloaded after it
+
+    def test_a_thread_with_a_turn_running_in_the_daemon_is_not_closed(
+        self, codex, tmp_path, daemon
+    ):
+        path = write_rollout(codex.home, THREAD, codex_turn("turn-1") + codex_turn("turn-2")[:2])
+        with codex.app_server() as app:
+            app.request("thread/resume", {"threadId": THREAD})
+        size = path.stat().st_size
+        with pytest.raises(Wait, match="turn is running"):
+            append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
+        assert "thread/archive" not in methods(daemon)
+        assert path.stat().st_size == size
+
+    def test_a_thread_the_user_has_open_stays_open_after_a_resume(self, codex, daemon):
+        write_rollout(codex.home, THREAD, codex_turn("turn-1"))
+        with codex.app_server() as app:
+            app.request("thread/resume", {"threadId": THREAD})
+        resume(codex, THREAD)
+        assert "thread/archive" not in methods(daemon)
+        assert lock.is_held(codex.home, THREAD)
 
     def test_a_thread_another_process_holds_is_not_closed_by_the_daemon(
         self, codex, thread, tmp_path, daemon, holder

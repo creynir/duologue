@@ -18,10 +18,12 @@ from pathlib import Path
 
 REGISTRY = "sessions"
 RESUME_FLAGS = ("--resume", "-r", "--session-id")
+UNKNOWN = -1  # the process list could not be read: the session may be open
 
 
 def live_pid(claude_home: Path, session_id: str) -> int | None:
-    """The pid of a running Claude Code process that has the session, or None."""
+    """The pid of a running Claude Code process that has the session, :data:`UNKNOWN` when the
+    process list cannot be read, or None."""
     return _registered(Path(claude_home) / REGISTRY, session_id) or _resumed(session_id)
 
 
@@ -36,30 +38,50 @@ def _registered(registry: Path, session_id: str) -> int | None:
         if not isinstance(entry, dict) or entry.get("sessionId") != session_id:
             continue
         pid = entry.get("pid")
-        if isinstance(pid, int) and alive(pid):
+        if isinstance(pid, int) and alive(pid) and _is_claude(pid):
             return pid
     return None
 
 
-def _resumed(session_id: str) -> int | None:
+def _is_claude(pid: int) -> bool:
+    """Whether ``pid`` is still a Claude Code process (a stale entry's pid can be reused)."""
     try:
         out = subprocess.run(
-            ["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=10
+            ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=10
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return None
+        return True  # cannot tell: assume the session is open
+    return "claude" in out.lower()
+
+
+def _resumed(session_id: str) -> int | None:
+    try:
+        r = subprocess.run(
+            ["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=10
+        )
+    except (OSError, subprocess.SubprocessError):
+        return UNKNOWN
+    if r.returncode != 0:
+        return UNKNOWN
+    out = r.stdout
     for line in out.splitlines():
         pid_text, _, args = line.strip().partition(" ")
         if not pid_text.isdigit() or int(pid_text) == os.getpid():
             continue
-        words = args.split()
-        if "claude" not in args or "duologue" in args:
-            continue
-        named = any(w == session_id or w.endswith("=" + session_id) for w in words)
-        flagged = any(w.split("=", 1)[0] in RESUME_FLAGS for w in words)
-        if named and flagged:
+        if "claude" in args.lower() and _resumes(args.split(), session_id):
             return int(pid_text)
     return None
+
+
+def _resumes(words: list[str], session_id: str) -> bool:
+    """Whether a command line resumes ``session_id``: a resume flag with the id as its value."""
+    for n, w in enumerate(words):
+        flag, eq, value = w.partition("=")
+        if flag not in RESUME_FLAGS:
+            continue
+        if (value if eq else (words[n + 1] if n + 1 < len(words) else "")) == session_id:
+            return True
+    return False
 
 
 def alive(pid: int) -> bool:

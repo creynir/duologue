@@ -14,7 +14,8 @@ from typing import Protocol
 
 
 class Wait(Exception):
-    """The other app is busy with the conversation; a later pass tries again."""
+    """The other app is busy with the conversation; a later pass tries again. Raised after a
+    write's intent was recorded, it leaves that intent to settle with ``recover`` first."""
 
 
 class Blocked(Exception):
@@ -30,6 +31,7 @@ class Intent:
     base: int  # the file's size before the write
     data: bytes
     ids: tuple[str, ...]  # Codex turn ids or Claude record uuids, as written
+    before: str = ""  # sha256 of the file's first ``base`` bytes, to notice a rewrite
 
     @property
     def end(self) -> int:
@@ -56,17 +58,26 @@ class MemoryJournal:
 
 
 def tail_state(path: Path, intent: Intent) -> str:
-    """Where an interrupted write stands in ``path``: ``"absent"`` (nothing of it is there),
-    ``"partial"`` (a cut-off start of it), ``"complete"`` (all of it) or ``"changed"`` (the file
-    no longer matches what was written, or something else was written after it)."""
+    """Where an interrupted write stands in ``path``:
+
+    - ``"absent"``: nothing of it is there (for a new file: the file is not there);
+    - ``"partial"``: a cut-off start of it ends the file;
+    - ``"complete"``: all of it, and the file ends with it;
+    - ``"followed"``: all of it, and an app wrote more after it;
+    - ``"changed"``: the file no longer matches what was written.
+
+    Only ``"partial"`` and ``"complete"`` leave nothing but duologue's bytes after ``base``.
+    """
     try:
         size = path.stat().st_size
     except FileNotFoundError:
+        return "absent" if intent.base == 0 else "changed"
+    if size < intent.base:
+        return "changed"
+    if intent.before and prefix_hash(path, intent.base) != intent.before:
         return "changed"
     if size == intent.base:
         return "absent"
-    if size < intent.base:
-        return "changed"
     with open(path, "rb") as fh:
         fh.seek(intent.base)
         written = fh.read(len(intent.data) + 1)
@@ -75,5 +86,18 @@ def tail_state(path: Path, intent: Intent) -> str:
     if len(written) < len(intent.data) and intent.data.startswith(written):
         return "partial"
     if written.startswith(intent.data):
-        return "complete"  # the app appended after it: still all there
+        return "followed"
     return "changed"
+
+
+def prefix_hash(path: Path, length: int) -> str:
+    """The sha256 of the first ``length`` bytes of ``path``."""
+    digest, left = hashlib.sha256(), length
+    with open(path, "rb") as fh:
+        while left > 0:
+            chunk = fh.read(min(left, 1 << 20))
+            if not chunk:
+                break
+            digest.update(chunk)
+            left -= len(chunk)
+    return digest.hexdigest()

@@ -5,14 +5,19 @@ itself when the thread is resumed ("Paginated JSONL is canonical, but its SQLite
 lag", codex-rs ``thread_processor``). So an append never touches Codex's databases:
 
 1. A thread that is loaded somewhere is not written to. In a shared app-server daemon, duologue
-   closes it first (``thread/archive`` + ``thread/unarchive``); otherwise it waits.
+   closes it first (``thread/archive`` + ``thread/unarchive``) when it is idle there; otherwise
+   it waits. An archived thread is left alone until it is unarchived.
 2. A legacy thread is converted with ``codex migrate-rollouts`` first.
 3. Codex's index must end where the file ends. If it lags, a resume lets Codex catch up first.
 4. Under the thread's writer lock, the journal records the intent, then the lines go on with
    ordinals that continue the index.
 5. ``thread/resume`` (no overrides: they would persist on the thread) makes Codex index them.
-6. The index must then hold every new turn. When Codex indexed none of them, the lines are taken
-   out again and the pair is blocked; a partial index blocks it as it is.
+6. The index must then hold every new turn. When Codex indexed none of them and nothing was
+   written after them, the lines are taken out again; either way the pair is blocked.
+
+Only duologue's own bytes are ever taken out of a rollout: never bytes Codex indexed or wrote
+after them. Any exception after the intent was recorded leaves it for :func:`recover`; a caller
+settles a recorded intent before it appends again.
 """
 
 from __future__ import annotations
@@ -33,13 +38,18 @@ from duologue.codex.rollout import (
     TURN_ENDS,
     find_rollout,
     history_mode,
+    is_archived,
     is_compressed,
     model_provider,
     new_rollout_path,
+    prefix_hash,
+    sqlite_home,
     uuid7,
 )
 from duologue.codex.rpc import AppServer, AppServerError, daemon_running
+from duologue.ids import require_id
 from duologue.journal import Blocked, Intent, Journal, Wait, tail_state
+from duologue.jsonl import dumps, ends_with_newline, iter_lines
 from duologue.translate.claude_to_codex import RolloutLine
 from duologue.translate.common import iso_ms
 
@@ -70,11 +80,16 @@ class Codex:
             argv, env=self.environment(), cwd=self.home, timeout=self.timeout, shared=shared
         )
 
+    @property
+    def sqlite(self) -> Path:
+        """Where this Codex keeps its databases."""
+        return sqlite_home(self.home, self.environment())
+
     def rollout(self, thread_id: str) -> Path | None:
-        return find_rollout(self.home, thread_id)
+        return find_rollout(self.home, thread_id, self.sqlite)
 
     def index(self, thread_id: str) -> HistoryIndex:
-        return read_index(self.home, thread_id)
+        return read_index(self.sqlite, thread_id)
 
     def run(self, *args: str, timeout: float | None = None) -> subprocess.CompletedProcess:
         return subprocess.run(
@@ -140,7 +155,7 @@ def encode(lines: Sequence[RolloutLine], first_ordinal: int) -> bytes:
             "type": ln.type,
             "payload": ln.payload,
         }
-        out.append(json.dumps(record, ensure_ascii=False, separators=(",", ":")) + "\n")
+        out.append(dumps(record, compact=True) + "\n")
     return "".join(out).encode()
 
 
@@ -150,101 +165,126 @@ def append_turns(
 ) -> Appended:
     """Append ``lines`` (whole turns from the translator) to the thread and have Codex index
     them. Raises :class:`Wait` when the thread is busy and :class:`Blocked` when it needs a
-    person."""
+    person; see the module docstring for what an exception after the write means."""
+    require_id(thread_id, "thread id")
     turns = turn_ids(lines)
+    if len(set(turns)) != len(turns):
+        raise Blocked("the turns to add repeat a turn id; Codex would keep only one of them")
     path = _rollout(codex, thread_id)
-    size = path.stat().st_size
     if not lines:
+        size = path.stat().st_size
         return Appended(path, size, size, (), False)
-    if lock.is_held(codex.home, thread_id):
+    if not ends_with_newline(path):
+        raise Wait("Codex is writing to the thread")
+    if _is_held(codex, thread_id):
         if last_turn_open(path):
             raise Wait("a Codex turn is running in the thread")
         if not _close_in_daemon(codex, thread_id):
             raise Wait("the thread is open in Codex")
         path = _rollout(codex, thread_id)
     if last_turn_open(path):
-        # Nobody has the thread loaded, so nobody works on that turn: a Codex that stopped
-        # left it open. Loading the thread lets Codex settle it.
-        resume(codex, thread_id)
-        path = _rollout(codex, thread_id)
-        if last_turn_open(path):
-            raise Blocked("the Codex thread's last turn never finished")
+        # Nobody has the thread loaded, so nobody works on that turn: a Codex that stopped left
+        # it open (Codex 0.166 does not close it on resume). Its next turn closes it.
+        raise Wait("the last Codex turn in the thread never finished; it syncs after the next one")
     path = _paginated(codex, thread_id, path)
     index, size = _caught_up(codex, thread_id, path)
     present = [t for t in turns if t in index.turns]
     if present:
         if len(present) == len(turns):
-            return Appended(path, size, size, turns, False)
+            start, end = _turn_range(path, turns)
+            return Appended(path, start, end, turns, False)
         raise Blocked(
             f"{len(present)} of the {len(turns)} turns to add are already in the Codex thread"
         )
     data = encode(lines, index.next_ordinal or 0)
-    intent = Intent("codex", path, size, data, turns)
     with _writer(codex, thread_id):
         if path.stat().st_size != size:
             raise Wait("the Codex thread changed while duologue prepared its turns")
+        intent = Intent("codex", path, size, data, turns, prefix_hash(path, size))
         journal.begin(intent)
-        _write(path, data)
+        _write(path, intent)
     finish(codex, thread_id, intent)
     return Appended(path, size, intent.end, turns, True)
 
 
 def finish(codex: Codex, thread_id: str, intent: Intent) -> None:
-    """Have Codex index a write duologue made, and check that it did. When Codex indexed none of
-    it, the write is taken out again; either way a failure raises :class:`Blocked`."""
+    """Have Codex index a write duologue made, and check that it did. A write Codex indexed none
+    of is taken out again when nothing follows it; a failure raises :class:`Blocked`."""
     resume(codex, thread_id)
+    path = codex.rollout(thread_id)
+    if path is not None:
+        intent = replace(intent, path=path)  # an archive round trip may have moved it
     index = codex.index(thread_id)
-    missing = [t for t in intent.ids if t not in index.turns]
-    if not missing and (index.next_offset or 0) >= intent.end:
+    if index.holds(intent.ids, intent.end):
         return
-    if len(missing) == len(intent.ids) and index.next_offset in (None, intent.base):
-        _roll_back(codex, thread_id, intent)
+    if not index.found:
         raise Blocked(
-            f"Codex did not index the {len(intent.ids)} turn(s) duologue added; "
-            "they were taken out of the thread again"
+            "Codex's history index was not found after the write; the thread was left as it is"
         )
+    nothing = not any(t in index.turns for t in intent.ids)
+    if nothing and index.next_offset in (None, intent.base):
+        if _take_out(codex, thread_id, intent):
+            raise Blocked(
+                f"Codex did not index the {len(intent.ids)} turn(s) duologue added; "
+                "they were taken out of the thread again"
+            )
+        raise Blocked(
+            "Codex did not index the turns duologue added, and wrote after them; "
+            "the thread was left as it is"
+        )
+    whole = sum(index.turns.get(t) not in (None, "inProgress") for t in intent.ids)
     raise Blocked(
-        f"Codex indexed {len(intent.ids) - len(missing)} of the {len(intent.ids)} turns "
-        f"duologue added (index at byte {index.next_offset}, the write ends at {intent.end})"
+        f"Codex indexed {whole} of the {len(intent.ids)} turns duologue added whole (index at "
+        f"byte {index.next_offset}, the write ends at {intent.end}); the thread was left as it is"
     )
 
 
 def recover(codex: Codex, thread_id: str, intent: Intent) -> bool:
     """Settle an append that was interrupted. True when it is complete and indexed now; False
-    when nothing of it is in the thread (so the caller can write it again)."""
-    index = codex.index(thread_id)
-    if intent.ids and all(t in index.turns for t in intent.ids):
-        return True
+    when nothing of it is in the thread (a cut-off part nobody indexed is taken out), so the
+    caller can write it again."""
+    require_id(thread_id, "thread id")
     path = codex.rollout(thread_id)
-    if path is None or is_compressed(path):
-        raise Wait("the Codex thread's file is not readable now")
+    if path is None:
+        if intent.base == 0:
+            return False  # a new thread whose file was never made
+        raise Wait("the Codex thread's file is not there now")
+    if is_compressed(path):
+        raise Wait("the Codex thread's file is compressed now")
     intent = replace(intent, path=path)  # archiving moves the file
     state = tail_state(path, intent)
-    if state == "absent":
-        return False
-    if state == "complete":
+    if state in ("complete", "followed"):
+        if codex.index(thread_id).holds(intent.ids, intent.end):
+            return True
         finish(codex, thread_id, intent)
         return True
-    if state == "partial":
-        with _writer(codex, thread_id):
-            if tail_state(path, intent) == "partial":
-                os.truncate(path, intent.base)
+    if state == "absent":
         return False
+    if state == "partial":
+        index = codex.index(thread_id)
+        if (index.next_offset or 0) > intent.base:
+            raise Blocked(
+                "Codex indexed part of an interrupted write by duologue; the thread was left "
+                "as it is"
+            )
+        if _take_out(codex, thread_id, intent):
+            return False
     raise Blocked("the Codex thread changed after an interrupted write by duologue")
 
 
 def resume(codex: Codex, thread_id: str) -> None:
-    """``thread/resume`` with no overrides: Codex indexes whatever its index lacks."""
+    """``thread/resume`` with no overrides (they would persist on the thread): Codex indexes
+    whatever its index lacks. In a shared daemon, a thread duologue loaded is unloaded again."""
     with codex.app_server() as server:
+        loaded_before = server.shared and _status(server, thread_id) != "notLoaded"
         try:
-            server.request("thread/resume", {"threadId": thread_id})
+            server.request("thread/resume", {"threadId": thread_id, "excludeTurns": True})
         except AppServerError as e:
             if e.active_writer:
                 raise Wait("the thread is open in Codex") from e
             raise
-        if server.shared:
-            # The daemon keeps a resumed thread loaded, and with it the writer lock.
-            _archive_round_trip(server, thread_id)
+    if server.shared and not loaded_before:
+        _archive_round_trip(codex, thread_id)
 
 
 # ------------------------------------------------------------------------------------- create
@@ -259,6 +299,9 @@ def create_thread(
 ) -> tuple[str, Appended]:
     """Create a paginated thread holding the turns ``build(thread_id)`` returns, and have Codex
     index it. ``source`` is how the thread is listed; the Codex app lists ``vscode`` threads."""
+    provider = model_provider(codex.home)
+    if provider is None:
+        raise Blocked("Codex's config.toml could not be read, so its model provider is unknown")
     created_ms = int(time.time() * 1000) if created_ms is None else created_ms
     thread_id = uuid7(created_ms)
     lines = list(build(thread_id))
@@ -272,22 +315,26 @@ def create_thread(
         "cli_version": codex.version() or "",
         "source": source,
         "thread_source": "user",
-        "model_provider": model_provider(codex.home),
+        "model_provider": provider,
         "history_mode": "paginated",
     }
     first = {"timestamp": iso_ms(created_ms), "ordinal": 0, "type": "session_meta", "payload": meta}
-    data = (json.dumps(first, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
-    data += encode(lines, 1)
+    data = (dumps(first, compact=True) + "\n").encode() + encode(lines, 1)
     path = new_rollout_path(codex.home, thread_id, created_ms)
     path.parent.mkdir(parents=True, exist_ok=True)
     intent = Intent("codex", path, 0, data, turn_ids(lines))
     with _writer(codex, thread_id):
         journal.begin(intent)
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(data)
-            fh.flush()
-            os.fsync(fh.fileno())
+        # Owner-only, like the Claude transcript it is made from.
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(data)
+                fh.flush()
+                os.fsync(fh.fileno())
+        except BaseException:
+            path.unlink(missing_ok=True)
+            raise
     finish(codex, thread_id, intent)
     return thread_id, Appended(path, 0, len(data), intent.ids, True)
 
@@ -297,21 +344,14 @@ def last_turn_open(path: Path) -> bool:
     """Whether the rollout's last turn started and has not finished. Only lines that start or
     end a turn are parsed."""
     state = False
-    with open(path, "rb") as fh:
-        for raw in fh:
-            if b'"task_started"' not in raw and not any(e.encode() in raw for e in TURN_ENDS):
-                continue
-            try:
-                record = json.loads(raw)
-            except ValueError:
-                continue
-            p = record.get("payload") if isinstance(record, dict) else None
-            if record.get("type") != "event_msg" or not isinstance(p, dict):
-                continue
-            if p.get("type") == "task_started":
-                state = True
-            elif p.get("type") in TURN_ENDS:
-                state = False
+    for ln in iter_lines(path):
+        p = ln.record.get("payload")
+        if ln.record.get("type") != "event_msg" or not isinstance(p, dict):
+            continue
+        if p.get("type") == "task_started":
+            state = True
+        elif p.get("type") in TURN_ENDS:
+            state = False
     return state
 
 
@@ -321,6 +361,8 @@ def _rollout(codex: Codex, thread_id: str) -> Path:
         raise Blocked(f"Codex thread {thread_id} has no rollout file")
     if is_compressed(path):
         raise Wait("Codex compressed the idle thread; it syncs again once the thread is opened")
+    if is_archived(codex.home, path):
+        raise Wait("the thread is archived in Codex; it syncs again once it is unarchived")
     return path
 
 
@@ -349,56 +391,108 @@ def _caught_up(codex: Codex, thread_id: str, path: Path) -> tuple[HistoryIndex, 
     return index, size
 
 
+def _turn_range(path: Path, turns: tuple[str, ...]) -> tuple[int, int]:
+    """Where ``turns`` are in the rollout: from the start of the first to the end of the last."""
+    start = end = None
+    previous = 0
+    for ln in iter_lines(path):
+        p = ln.record.get("payload") if isinstance(ln.record.get("payload"), dict) else {}
+        if ln.record.get("type") == "event_msg" and p.get("turn_id") in turns:
+            if p.get("type") == "task_started" and start is None and p["turn_id"] == turns[0]:
+                start = previous
+            if p.get("type") in TURN_ENDS and p["turn_id"] == turns[-1]:
+                end = ln.end
+        previous = ln.end
+    if start is None or end is None:
+        raise Blocked("the turns Codex indexed are not whole in the thread's file")
+    return start, end
+
+
+def _is_held(codex: Codex, thread_id: str) -> bool:
+    try:
+        return lock.is_held(codex.home, thread_id)
+    except TimeoutError as e:
+        raise Wait("Codex's thread locks are busy") from e
+
+
 @contextlib.contextmanager
 def _writer(codex: Codex, thread_id: str) -> Iterator[None]:
     held = lock.WriterLock(codex.home, thread_id)
-    if not held.acquire():
-        raise Wait("the thread is open in Codex")
+    try:
+        if not held.acquire():
+            raise Wait("the thread is open in Codex")
+    except TimeoutError as e:
+        raise Wait("Codex's thread locks are busy") from e
     try:
         yield
     finally:
         held.release()
 
 
-def _write(path: Path, data: bytes) -> None:
+def _write(path: Path, intent: Intent) -> None:
+    """Append the intent's bytes; a write that fails partway is taken out again before the lock
+    is released, so no torn line is left for Codex to write after."""
     with open(path, "ab") as fh:
-        fh.write(data)
-        fh.flush()
-        os.fsync(fh.fileno())
+        try:
+            if fh.tell() != intent.base:
+                raise Wait("the Codex thread changed while duologue wrote")
+            fh.write(intent.data)
+            fh.flush()
+            os.fsync(fh.fileno())
+        except BaseException:
+            if tail_state(path, intent) == "partial":
+                os.truncate(path, intent.base)
+            raise
 
 
-def _roll_back(codex: Codex, thread_id: str, intent: Intent) -> None:
+def _take_out(codex: Codex, thread_id: str, intent: Intent) -> bool:
+    """Remove duologue's bytes when they are all that follows ``base`` and Codex indexed none of
+    them. False when that is no longer so (the file is left as it is)."""
     with _writer(codex, thread_id):
         if tail_state(intent.path, intent) not in ("complete", "partial"):
-            raise Blocked("the Codex thread changed after duologue's write; it was left as it is")
+            return False
+        if (codex.index(thread_id).next_offset or 0) > intent.base:
+            return False
         if intent.base == 0:
             intent.path.unlink()
         else:
             os.truncate(intent.path, intent.base)
+    return True
+
+
+def _status(server: AppServer, thread_id: str) -> str | None:
+    """The thread's status in an app-server: notLoaded, idle, active or systemError."""
+    try:
+        thread = server.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+    except AppServerError:
+        return None
+    status = ((thread or {}).get("thread") or {}).get("status") or {}
+    return status.get("type") if isinstance(status, dict) else None
 
 
 def _close_in_daemon(codex: Codex, thread_id: str) -> bool:
-    """Close the thread in the shared daemon when that is where it is loaded. True when its
-    writer lock is free afterwards."""
+    """Close the thread in the shared daemon when that is where it is loaded and it is idle.
+    True when its writer lock is free afterwards."""
     if not daemon_running(codex.home):
         return False
     with codex.app_server() as server:
-        loaded = server.request("thread/loaded/list", {}) or {}
-        ids = {t.get("id") if isinstance(t, dict) else t for t in loaded.get("data") or []}
-        if thread_id not in ids:
-            return False  # some other process holds it
-        _archive_round_trip(server, thread_id)
-    return not lock.is_held(codex.home, thread_id)
+        if not server.shared or _status(server, thread_id) != "idle":
+            return False  # not loaded there (another process holds it), or a turn is running
+    _archive_round_trip(codex, thread_id)
+    return not _is_held(codex, thread_id)
 
 
-def _archive_round_trip(server: AppServer, thread_id: str) -> None:
-    """Unload a thread from an app-server: archiving unloads it, unarchiving brings it back."""
-    server.request("thread/archive", {"threadId": thread_id})
+def _archive_round_trip(codex: Codex, thread_id: str) -> None:
+    """Unload a thread from the shared daemon: archiving unloads it, unarchiving lists it again.
+    Each unarchive attempt uses a new connection, so a dead one does not leave it archived."""
+    with codex.app_server() as server:
+        server.request("thread/archive", {"threadId": thread_id})
     for attempt in range(3):
         try:
-            server.request("thread/unarchive", {"threadId": thread_id})
+            with codex.app_server() as server:
+                server.request("thread/unarchive", {"threadId": thread_id})
             return
-        except AppServerError:
+        except (AppServerError, TimeoutError, OSError):
             if attempt == 2:
                 raise Blocked(
                     "duologue closed the Codex thread but could not unarchive it; "

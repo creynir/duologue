@@ -17,6 +17,7 @@ from duologue.codex.rollout import (
     open_turn,
     prefix_hash,
     session_meta,
+    sqlite_home,
     turn_ends,
     uuid7,
 )
@@ -121,8 +122,12 @@ def test_model_provider(tmp_path: Path):
     assert model_provider(tmp_path) == "openai"
     (tmp_path / "config.toml").write_text('model_provider = "local"\n')
     assert model_provider(tmp_path) == "local"
+    (tmp_path / "config.toml").write_text(
+        'model_provider = "local"\nprofile = "work"\n[profiles.work]\nmodel_provider = "azure"\n'
+    )
+    assert model_provider(tmp_path) == "azure"
     (tmp_path / "config.toml").write_text("not toml = = \n")
-    assert model_provider(tmp_path) == "openai"
+    assert model_provider(tmp_path) is None
 
 
 def test_uuid7_is_time_ordered():
@@ -133,15 +138,19 @@ def test_uuid7_is_time_ordered():
     assert int(a.hex[:12], 16) == ms
 
 
-def test_new_rollout_path_is_dated_by_local_time(tmp_path: Path, monkeypatch):
-    monkeypatch.setenv("TZ", "UTC")
-    time.tzset()
-    try:
-        path = new_rollout_path(tmp_path, THREAD, 1_793_800_800_000)
-    finally:
-        monkeypatch.delenv("TZ")
-        time.tzset()
-    assert path == tmp_path / "sessions/2026/11/04" / f"rollout-2026-11-04T14-00-00-{THREAD}.jsonl"
+def test_new_rollout_path_is_dated_by_local_time(tmp_path: Path):
+    ms = 1_793_800_800_000
+    local = time.localtime(ms / 1000)
+    day, stamp = time.strftime("%Y/%m/%d", local), time.strftime("%Y-%m-%dT%H-%M-%S", local)
+    path = new_rollout_path(tmp_path, THREAD, ms)
+    assert path == tmp_path / "sessions" / day / f"rollout-{stamp}-{THREAD}.jsonl"
+
+
+def test_sqlite_home_follows_codex(tmp_path: Path):
+    assert sqlite_home(tmp_path, {}) == tmp_path
+    assert sqlite_home(tmp_path, {"CODEX_SQLITE_HOME": "/elsewhere"}) == Path("/elsewhere")
+    (tmp_path / "config.toml").write_text('sqlite_home = "/configured"\n')
+    assert sqlite_home(tmp_path, {"CODEX_SQLITE_HOME": "/elsewhere"}) == Path("/configured")
 
 
 def test_read_index(tmp_path: Path):

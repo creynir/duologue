@@ -17,16 +17,27 @@ HISTORY_DB = "thread_history_1.sqlite"
 
 @dataclass(frozen=True)
 class HistoryIndex:
-    """One thread's checkpoint and turns. ``next_offset`` is None when Codex has not indexed the
-    thread at all."""
+    """One thread's checkpoint and turns. ``found`` is False when Codex's index is not there at
+    all (a new home, or a Codex that keeps it elsewhere); ``next_offset`` is None when Codex has
+    not indexed this thread."""
 
     next_offset: int | None = None
     next_ordinal: int | None = None
     turns: dict[str, str] = field(default_factory=dict)  # turn id -> status, in rollout order
+    found: bool = False
+
+    def holds(self, turns: tuple[str, ...], end: int) -> bool:
+        """Whether Codex indexed ``turns`` whole, through byte ``end``."""
+        return (
+            (self.next_offset or 0) >= end
+            and all(t in self.turns for t in turns)
+            and all(self.turns[t] != "inProgress" for t in turns)
+        )
 
 
-def read_index(codex_home: Path, thread_id: str) -> HistoryIndex:
-    db = Path(codex_home) / HISTORY_DB
+def read_index(sqlite_home: Path, thread_id: str) -> HistoryIndex:
+    """The thread's index, from the folder Codex keeps its databases in."""
+    db = Path(sqlite_home) / HISTORY_DB
     if not db.exists():
         return HistoryIndex()
     con = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True, timeout=30)
@@ -47,5 +58,5 @@ def read_index(codex_home: Path, thread_id: str) -> HistoryIndex:
     finally:
         con.close()
     if state is None:
-        return HistoryIndex(turns=dict(turns))
-    return HistoryIndex(state[0], state[1], dict(turns))
+        return HistoryIndex(turns=dict(turns), found=True)
+    return HistoryIndex(state[0], state[1], dict(turns), found=True)

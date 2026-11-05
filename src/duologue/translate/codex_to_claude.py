@@ -240,6 +240,7 @@ def claude_records(
     cwd: str,
     git_branch: str = "",
     dangling: tuple[str, ...] = (),
+    source_assistant: str | None = None,
     now_ms: int | None = None,
 ) -> list[dict]:
     """Transcript records for ``steps``, to append after the record ``parent_uuid`` (of type
@@ -248,12 +249,12 @@ def claude_records(
     ``model`` goes on every assistant record: without it ``claude --resume`` hangs. Pass the last
     model the session used, or ``"<synthetic>"`` before Claude has run in it. ``dangling`` are
     tool calls at the end of the session that never got a result (Claude stopped mid-tool); the
-    first record answers them, as Claude requires.
+    first record answers them, as Claude requires (after a user message too: Claude Code writes the
+    results of parallel calls one record each). ``source_assistant`` is the assistant message
+    those calls are in, which the results link back to.
     """
     if not steps:
         return []
-    if dangling and parent_type != "assistant":
-        raise ValueError("only an assistant message can leave tool calls unanswered")
     seq = _with_notes(list(steps), parent_type, dangling)
     messages = _alternate(seq)
     anchor = next((s.key for s in steps if s.key), session_id)
@@ -279,10 +280,13 @@ def claude_records(
         }
         if m.role == "user":
             r["message"] = {"role": "user", "content": m.blocks}
-            if previous_role == "assistant" and any(
-                b.get("type") == "tool_result" for b in m.blocks
-            ):
-                r["sourceToolAssistantUUID"] = parent  # as Claude Code links a result to its call
+            if any(b.get("type") == "tool_result" for b in m.blocks):
+                # As Claude Code links a result to its call: the message before it, or for the
+                # first record, the transcript's last assistant message.
+                if n == 0 and source_assistant:
+                    r["sourceToolAssistantUUID"] = source_assistant
+                elif previous_role == "assistant":
+                    r["sourceToolAssistantUUID"] = parent
             if m.tool_use_result:
                 r["toolUseResult"] = m.tool_use_result
         else:
@@ -317,11 +321,11 @@ def _with_notes(
     ]
     lead = closing + [{"type": "text", "text": f"[{MARK}: {LEAD_NOTE}]"}]
     if seq[0].role == "user":
-        if parent_type == "user":
+        if parent_type == "user" and not closing:
             seq.insert(0, note("assistant", "continued in Codex"))
         i = 1 if seq[0].role == "assistant" else 0
         seq[i] = replace(seq[i], blocks=lead + list(seq[i].blocks))
-    elif parent_type == "assistant":
+    elif parent_type == "assistant" or closing:
         seq.insert(0, ClaudeStep("user", lead, None, None))
     else:
         seq[0] = replace(seq[0], blocks=lead + list(seq[0].blocks))

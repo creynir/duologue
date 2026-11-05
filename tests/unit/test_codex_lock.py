@@ -90,3 +90,28 @@ def test_coordination_is_waited_for_then_given_up(tmp_path: Path):
             pass
     finally:
         os.close(other)
+
+
+def test_release_gives_up_the_lock_even_when_coordination_times_out(tmp_path: Path, monkeypatch):
+    held = WriterLock(tmp_path, THREAD)
+    assert held.acquire()
+    directory = tmp_path / lock.LOCK_DIR
+    other = os.open(directory / lock.COORDINATION, os.O_RDWR)
+    fcntl.flock(other, fcntl.LOCK_EX)  # a Codex suspended while holding coordination
+    real = lock._coordination
+    monkeypatch.setattr(lock, "_coordination", lambda d, wait=0.2: real(d, wait=0.2))
+    try:
+        with pytest.raises(TimeoutError):
+            held.release()
+    finally:
+        os.close(other)
+    assert not held.held
+    assert WriterLock(tmp_path, THREAD).acquire()  # the flock was given up
+
+
+@pytest.mark.parametrize("bad", ["*", "../../outside/x", "not-a-uuid"])
+def test_a_malformed_thread_id_names_no_lock_file(tmp_path: Path, bad: str):
+    with pytest.raises(ValueError):
+        WriterLock(tmp_path, bad)
+    with pytest.raises(ValueError):
+        is_held(tmp_path, bad)

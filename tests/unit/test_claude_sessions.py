@@ -18,7 +18,7 @@ from duologue.claude.transcript import (
     tail,
 )
 from duologue.journal import Blocked, Intent, MemoryJournal, Wait
-from duologue.jsonl import encode, read_lines
+from duologue.jsonl import Line, encode, read_lines
 from duologue.translate.codex_to_claude import NOT_RECORDED, ClaudeStep, claude_records
 from duologue.translate.common import MARK
 
@@ -68,6 +68,7 @@ def records_after(lines, steps=None) -> list[dict]:
         version=t.version,
         cwd=t.cwd,
         dangling=t.dangling,
+        source_assistant=t.last_assistant,
     )
 
 
@@ -117,6 +118,36 @@ def test_tail_finds_tool_calls_left_without_a_result(tmp_path: Path):
     assert tail(read_lines(write(tmp_path, c.records))).dangling == ("toolu_1",)
 
 
+def test_tail_matches_parallel_calls_by_id(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant([{"type": "tool_use", "id": "toolu_A", "name": "Read", "input": {}}])
+    c.assistant([{"type": "tool_use", "id": "toolu_B", "name": "Bash", "input": {}}])
+    c.user([{"type": "tool_result", "tool_use_id": "toolu_A", "content": "a"}])
+    t = tail(read_lines(write(tmp_path, c.records)))
+    assert t.parent_type == "user" and t.dangling == ("toolu_B",)
+
+
+def test_a_new_prompt_settles_older_calls(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant([{"type": "tool_use", "id": "toolu_A", "name": "Read", "input": {}}])
+    c.user("never mind, do this instead")
+    c.assistant("ok")
+    assert tail(read_lines(write(tmp_path, c.records))).dangling == ()
+
+
+def test_settled_skips_compaction_and_local_commands(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant("done")
+    c.user("This session is being continued from a previous conversation", isCompactSummary=True)
+    c.user("<command-name>/cost</command-name>")
+    c.user("<local-command-stdout>Total cost: $0.00</local-command-stdout>")
+    c.user("caveat", isMeta=True)
+    assert settled(read_lines(write(tmp_path, c.records)))
+
+
 def test_settled(tmp_path: Path):
     c = ClaudeTranscript()
     assert settled([])
@@ -130,38 +161,85 @@ def test_settled(tmp_path: Path):
 
 
 # ---------------------------------------------------------------------------------------- live
+WAIT_FOR_INPUT = "import sys; print('ready', flush=True); sys.stdin.read()"
+
+
+def started(*args: str) -> subprocess.Popen:
+    """A process whose command line holds ``args``, once it runs (on Linux a forked child shows
+    its parent's command line until it execs)."""
+    argv = [sys.executable, "-c", WAIT_FOR_INPUT, *args]
+    p = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    assert p.stdout.readline().strip() == "ready"
+    return p
+
+
+def stop(p: subprocess.Popen) -> None:
+    p.stdin.close()
+    p.wait(10)
+
+
+def register(home: Path, pid: int, session: str = SESSION) -> None:
+    registry = home / "sessions"
+    registry.mkdir(exist_ok=True)
+    entry = {"sessionId": session, "pid": pid, "status": "idle"}
+    (registry / f"{pid}.json").write_text(json.dumps(entry))
+
+
 def test_a_registered_live_session(tmp_path: Path):
-    registry = tmp_path / "sessions"
-    registry.mkdir()
-    entry = {"sessionId": SESSION, "pid": os.getpid(), "status": "idle"}
-    (registry / f"{os.getpid()}.json").write_text(json.dumps(entry))
-    (registry / "junk.json").write_text("not json")
-    assert live.live_pid(tmp_path, SESSION) == os.getpid()
-    assert live.live_pid(tmp_path, "another-session") is None
+    p = started("claude")
+    try:
+        register(tmp_path, p.pid)
+        (tmp_path / "sessions" / "junk.json").write_text("not json")
+        assert live.live_pid(tmp_path, SESSION) == p.pid
+        assert live.live_pid(tmp_path, "5e550000-0000-4000-8000-0000000000ff") is None
+    finally:
+        stop(p)
 
 
 def test_a_registered_session_whose_process_is_gone(tmp_path: Path):
     gone = subprocess.Popen([sys.executable, "-c", "pass"])
     gone.wait()
-    registry = tmp_path / "sessions"
-    registry.mkdir()
-    entry = {"sessionId": SESSION, "pid": gone.pid, "status": "busy"}
-    (registry / f"{gone.pid}.json").write_text(json.dumps(entry))
+    register(tmp_path, gone.pid)
     assert live.live_pid(tmp_path, SESSION) is None
 
 
-@pytest.mark.parametrize("flag", [["--resume", SESSION], [f"--resume={SESSION}"], ["-r", SESSION]])
+def test_a_registered_pid_now_used_by_another_program(tmp_path: Path):
+    other = subprocess.Popen(["sleep", "30"])
+    try:
+        register(tmp_path, other.pid)
+        assert live.live_pid(tmp_path, SESSION) is None
+    finally:
+        other.kill()
+        other.wait()
+
+
+@pytest.mark.parametrize(
+    "flag",
+    [["--resume", SESSION], [f"--resume={SESSION}"], ["-r", SESSION], ["--session-id", SESSION]],
+)
 def test_a_process_that_resumed_the_session(tmp_path: Path, flag):
-    p = subprocess.Popen(
-        [sys.executable, "-c", "import sys; sys.stdin.read()", "claude", *flag],
-        stdin=subprocess.PIPE,
-    )
+    p = started("claude", *flag)
     try:
         assert live.live_pid(tmp_path, SESSION) == p.pid
     finally:
-        p.stdin.close()
-        p.wait(10)
+        stop(p)
     assert live.live_pid(tmp_path, SESSION) is None
+
+
+def test_a_claude_whose_command_line_mentions_duologue_counts(tmp_path: Path):
+    p = started("/home/dev/duologue/bin/claude", "--resume", SESSION)
+    try:
+        assert live.live_pid(tmp_path, SESSION) == p.pid
+    finally:
+        stop(p)
+
+
+def test_naming_the_session_without_resuming_it_does_not_count(tmp_path: Path):
+    p = started("claude", "--name", SESSION, "--resume", "other")
+    try:
+        assert live.live_pid(tmp_path, SESSION) is None
+    finally:
+        stop(p)
 
 
 def test_alive():
@@ -176,7 +254,7 @@ def test_append_after_a_finished_turn(tmp_path: Path):
     path = write(tmp_path, a_session().records)
     lines = read_lines(path)
     records = records_after(lines)
-    assert check_structure([ln.record for ln in lines], records) == []
+    assert check_structure(tail(lines), records) == []
     journal = MemoryJournal()
     done = append_records(path, records, journal=journal)
     assert done.written and done.start == lines[-1].end and done.end == path.stat().st_size
@@ -241,31 +319,105 @@ def test_dangling_tool_calls_are_answered_first(tmp_path: Path):
         "is_error": True,
     }
     assert first[1]["text"].startswith(f"[{MARK}:")
-    assert check_structure([ln.record for ln in lines], records) == []
+    assert check_structure(tail(lines), records) == []
     assert append_records(path, records, journal=MemoryJournal()).written
 
 
-def test_only_an_assistant_message_leaves_calls_unanswered():
-    with pytest.raises(ValueError):
-        claude_records(
-            codex_steps(),
-            session_id=SESSION,
-            parent_uuid="x",
-            parent_type="user",
-            model="m",
-            version="v",
-            cwd=CWD,
-            dangling=("toolu_1",),
+def test_a_closing_result_links_to_the_assistant_message_with_the_call(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    call = c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
+    attachment = {"type": "attachment", "uuid": "a7700000-0000-4000-8000-000000000001"}
+    path = write(tmp_path, [*c.records, {**attachment, "parentUuid": call["uuid"]}])
+    records = records_after(read_lines(path))
+    assert records[0]["parentUuid"] == attachment["uuid"]
+    assert records[0]["sourceToolAssistantUUID"] == call["uuid"]
+
+
+def test_an_unreadable_process_list_counts_as_open(tmp_path: Path, monkeypatch):
+    def broken(*args, **kwargs):
+        raise OSError("no ps")
+
+    monkeypatch.setattr(live.subprocess, "run", broken)
+    assert live.live_pid(tmp_path, SESSION) == live.UNKNOWN
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    with pytest.raises(Wait, match="could not be read"):
+        append_records(
+            path, records, journal=MemoryJournal(), live=lambda: live.live_pid(tmp_path, SESSION)
         )
+
+
+def test_a_parallel_call_left_without_result_is_answered_after_the_other_result(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant([{"type": "tool_use", "id": "toolu_A", "name": "Read", "input": {}}])
+    c.assistant([{"type": "tool_use", "id": "toolu_B", "name": "Bash", "input": {}}])
+    c.user([{"type": "tool_result", "tool_use_id": "toolu_A", "content": "a"}])
+    path = write(tmp_path, c.records)
+    lines = read_lines(path)
+    records = records_after(lines)
+    first = records[0]
+    assert first["type"] == "user"
+    assert first["message"]["content"][0]["tool_use_id"] == "toolu_B"
+    assert check_structure(tail(lines), records) == []
+    assert append_records(path, records, journal=MemoryJournal()).written
+
+
+def test_the_live_check_runs_before_the_write(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    size = path.stat().st_size
+    with pytest.raises(Wait, match="process 4242"):
+        append_records(path, records, journal=MemoryJournal(), live=lambda: 4242)
+    assert path.stat().st_size == size
+
+
+def test_a_claude_that_opens_the_session_during_the_write_gets_it_back_untouched(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    size = path.stat().st_size
+    answers = iter([None, 4242])
+    with pytest.raises(Wait, match="opened the session"):
+        append_records(path, records, journal=MemoryJournal(), live=lambda: next(answers))
+    assert path.stat().st_size == size
+
+
+def test_a_transcript_that_moved_on_waits(tmp_path: Path):
+    c = a_session()
+    path = write(tmp_path, c.records)
+    records = records_after(read_lines(path))
+    c.user("one more thing")
+    path.write_bytes(encode(c.records))
+    with pytest.raises(Wait, match="moved on"):
+        append_records(path, records, journal=MemoryJournal())
+
+
+class CheckingJournal:
+    """Records the intent, and checks it is recorded before anything is written."""
+
+    def __init__(self):
+        self.intent = None
+
+    def begin(self, intent):
+        size = intent.path.stat().st_size if intent.path.exists() else 0
+        assert size == intent.base, "the intent must be recorded before the write"
+        self.intent = intent
+
+
+def test_the_intent_is_recorded_before_the_claude_write(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    journal = CheckingJournal()
+    append_records(path, records_after(read_lines(path)), journal=journal)
+    assert journal.intent is not None
 
 
 # ---------------------------------------------------------------------------- structure check
 def checked(mutate) -> list[str]:
-    existing = a_session().records
-    lines = [type("L", (), {"record": r})() for r in existing]
+    lines = [Line(r, 0) for r in a_session().records]
     records = records_after(lines)
     mutate(records)
-    return check_structure(existing, records)
+    return check_structure(tail(lines), records)
 
 
 @pytest.mark.parametrize(
@@ -273,7 +425,13 @@ def checked(mutate) -> list[str]:
     [
         (lambda rs: rs[0].update(parentUuid="elsewhere"), "does not link"),
         (lambda rs: rs[1].update(uuid=rs[0]["uuid"]), "repeated uuid"),
-        (lambda rs: rs[0].pop("uuid"), "missing or repeated uuid"),
+        (lambda rs: rs[0].pop("uuid"), "missing, malformed or repeated uuid"),
+        (lambda rs: rs[0].update(uuid=12345), "malformed"),
+        (lambda rs: rs[0]["message"].update(content={"text": "x"}), "no message content"),
+        (
+            lambda rs: rs[2]["message"]["content"].append(dict(rs[2]["message"]["content"][0])),
+            "once each",
+        ),
         (lambda rs: rs[2].update(type="assistant"), "second assistant message"),
         (lambda rs: rs[0].update(type="summary"), "not a message"),
         (
@@ -296,17 +454,25 @@ def test_structure_check_an_unanswered_last_call():
     c = ClaudeTranscript()
     c.user("go")
     c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
-    assert check_structure([], c.records) == ["the last tool call has no result"]
+    assert check_structure(tail([]), c.records) == ["the last tool call has no result"]
 
 
 def test_structure_check_a_call_answered_too_late():
     c = ClaudeTranscript()
     c.user("go")
     c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
-    existing = c.records[:]
+    existing = [Line(r, 0) for r in c.records]
     c.assistant("moving on")
-    problems = check_structure(existing, c.records[2:])
+    problems = check_structure(tail(existing), c.records[2:])
     assert any("not answered" in p for p in problems)
+
+
+def test_structure_check_two_user_messages_without_owed_results():
+    c = ClaudeTranscript()
+    c.user("go")
+    existing = [Line(r, 0) for r in c.records]
+    c.user("and this")
+    assert any("second user message" in p for p in check_structure(tail(existing), c.records[1:]))
 
 
 # ----------------------------------------------------------------------------------- recovery
@@ -330,7 +496,52 @@ def test_recover(tmp_path: Path):
         recover(path, intent)
 
 
+def test_recover_an_interrupted_create(tmp_path: Path):
+    path = tmp_path / "new.jsonl"
+    intent = Intent("claude", path, 0, b'{"uuid": "x"}\n', ("x",))
+    assert not recover(path, intent)  # the file was never made
+    path.write_bytes(intent.data[:5])
+    assert not recover(path, intent)  # cut off: the empty start is removed
+    assert not path.exists()
+
+
+def test_recover_a_write_the_app_wrote_after(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    base = path.stat().st_size
+    intent = Intent("claude", path, base, encode(records), tuple(r["uuid"] for r in records))
+    with open(path, "ab") as fh:
+        fh.write(intent.data + b'{"type": "last-prompt"}\n')
+    assert recover(path, intent)
+
+
 # ------------------------------------------------------------------------------------- create
+def test_create_session_checks_its_records(tmp_path: Path):
+    def build(session_id: str) -> list[dict]:
+        records = claude_records(
+            codex_steps(),
+            session_id=session_id,
+            parent_uuid=None,
+            parent_type=None,
+            model="m",
+            version="2.1.318",
+            cwd=CWD,
+        )
+        del records[1]["message"]["model"]
+        return records
+
+    with pytest.raises(Blocked, match="names no model"):
+        create_session(tmp_path, cwd=CWD, build=build, journal=MemoryJournal())
+    assert not (tmp_path / "projects").exists() or not any((tmp_path / "projects").rglob("*.jsonl"))
+
+
+def test_ids_are_checked_before_they_name_a_file(tmp_path: Path):
+    with pytest.raises(ValueError):
+        find_transcript(tmp_path, "*")
+    with pytest.raises(ValueError):
+        find_transcript(tmp_path, "../../etc/passwd")
+
+
 def test_create_session(tmp_path: Path):
     journal = MemoryJournal()
 

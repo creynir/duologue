@@ -11,7 +11,13 @@ It does what duologue relies on Codex for, the way Codex 0.166 does it, and no m
   and ``app-server proxy`` connects stdio to it, as ``codex app-server proxy`` does.
 - ``--version``.
 
-Knobs, through the environment: ``FAKE_CODEX_NO_INDEX=1`` makes resume index nothing, and
+Like Codex, it creates its history index when it starts, and a thread's status in
+``thread/read`` is ``notLoaded``, ``idle`` (loaded here) or ``active`` (loaded with a turn open).
+Lock files are created and removed under ``.coordination.lock``, as codex-rs does.
+
+Knobs, through the environment: ``FAKE_CODEX_NO_INDEX=1`` makes resume index nothing,
+``FAKE_CODEX_INDEX_TURNS=<n>`` makes it index only the first n turns it finds,
+``FAKE_CODEX_LEAVE_LINES=<n>`` leaves the last n whole lines unindexed, and
 ``FAKE_CODEX_LOG`` names a file that gets one line per request.
 """
 
@@ -27,6 +33,7 @@ import threading
 from pathlib import Path
 
 HOME = Path(os.environ["CODEX_HOME"])
+SQLITE = Path(os.environ.get("CODEX_SQLITE_HOME") or HOME)
 LOCKS = HOME / "thread-writer-locks"
 SCHEMA = """
 create table if not exists thread_turns (
@@ -47,6 +54,7 @@ def rollout(thread_id: str) -> Path | None:
 class Server:
     def __init__(self) -> None:
         self.locks: dict[str, int] = {}
+        self.moved: dict[str, Path] = {}  # archived rollouts and where they came from
 
     def lock(self, thread_id: str) -> None:
         if thread_id in self.locks:
@@ -67,9 +75,15 @@ class Server:
 
     def unload(self, thread_id: str) -> None:
         fd = self.locks.pop(thread_id, None)
-        if fd is not None:
+        if fd is None:
+            return
+        coord = os.open(LOCKS / ".coordination.lock", os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(coord, fcntl.LOCK_EX)
+        try:
             os.close(fd)
             (LOCKS / f"{thread_id}.lock").unlink(missing_ok=True)
+        finally:
+            os.close(coord)
 
     def handle(self, method: str, params: dict):
         tid = params.get("threadId")
@@ -83,12 +97,29 @@ class Server:
             if not os.environ.get("FAKE_CODEX_NO_INDEX"):
                 index(tid, path)
             return {"thread": {"id": tid, "path": str(path)}}
+        if method == "thread/read":
+            path = rollout(tid)
+            if path is None:
+                raise RpcError(-32600, f"no rollout found for thread id {tid}")
+            status = "notLoaded"
+            if tid in self.locks:
+                status = "active" if turn_open(path) else "idle"
+            return {"thread": {"id": tid, "status": {"type": status}}}
         if method == "thread/loaded/list":
             return {"data": sorted(self.locks), "nextCursor": None}
         if method == "thread/archive":
             self.unload(tid)
+            path = rollout(tid)  # Codex moves an archived rollout to archived_sessions/
+            if path is not None and "archived_sessions" not in path.parts:
+                moved = HOME / "archived_sessions" / path.name
+                moved.parent.mkdir(exist_ok=True)
+                self.moved[tid] = path
+                path.rename(moved)
             return {}
         if method == "thread/unarchive":
+            path, back = rollout(tid), self.moved.pop(tid, None)
+            if path is not None and back is not None:
+                path.rename(back)
             return {"thread": {"id": tid}}
         if method == "thread/unsubscribe":
             return {"status": "unsubscribed"}
@@ -101,10 +132,33 @@ class RpcError(Exception):
         self.code, self.message = code, message
 
 
+def turn_open(path: Path) -> bool:
+    state = False
+    for raw in path.read_bytes().split(b"\n")[:-1]:
+        try:
+            p = json.loads(raw).get("payload") or {}
+        except ValueError:
+            continue
+        if p.get("type") == "task_started":
+            state = True
+        elif p.get("type") in ("task_complete", "turn_aborted"):
+            state = False
+    return state
+
+
+def create_index() -> None:
+    con = sqlite3.connect(SQLITE / "thread_history_1.sqlite")
+    con.executescript(SCHEMA)
+    con.close()
+
+
 def index(thread_id: str, path: Path) -> None:
     """Codex's projector, reduced: index whole lines past the checkpoint; ordinals that go
-    backwards are skipped."""
-    con = sqlite3.connect(HOME / "thread_history_1.sqlite")
+    backwards are skipped. With FAKE_CODEX_INDEX_TURNS, it stops before the turn after the
+    first n it finds."""
+    limit = os.environ.get("FAKE_CODEX_INDEX_TURNS")
+    seen = 0
+    con = sqlite3.connect(SQLITE / "thread_history_1.sqlite")
     con.executescript(SCHEMA)
     row = con.execute(
         "select next_rollout_byte_offset, next_rollout_ordinal "
@@ -114,18 +168,24 @@ def index(thread_id: str, path: Path) -> None:
     offset, ordinal = row if row else (0, 0)
     data = path.read_bytes()
     open_turn = None
-    for raw in data[offset:].split(b"\n")[:-1]:
+    raws = data[offset:].split(b"\n")[:-1]
+    leave = int(os.environ.get("FAKE_CODEX_LEAVE_LINES") or 0)
+    for raw in raws[: len(raws) - leave] if leave else raws:
         start = offset
-        offset += len(raw) + 1
         try:
             line = json.loads(raw)
         except ValueError:
+            offset += len(raw) + 1
             continue
+        p = line.get("payload") or {}
+        if p.get("type") == "task_started" and limit is not None and seen >= int(limit):
+            break
+        seen += p.get("type") == "task_started"
+        offset += len(raw) + 1
         n = line.get("ordinal", ordinal)
         if n < ordinal:
             continue
         ordinal = n + 1
-        p = line.get("payload") or {}
         if line.get("type") != "event_msg":
             continue
         if p.get("type") == "task_started":
@@ -192,9 +252,11 @@ def control_socket() -> Path:
 
 def daemon() -> None:
     """A shared app-server: every connection to the control socket talks to the same server."""
+    create_index()
     server, guard = Server(), threading.Lock()
     path = control_socket()
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.unlink(missing_ok=True)  # a socket file a stopped daemon left behind
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen()
@@ -240,6 +302,7 @@ def main(argv: list[str]) -> int:
         print("codex-cli 0.166.0")
         return 0
     if argv == ["app-server"]:
+        create_index()
         server = Server()
 
         def write(text: str) -> None:

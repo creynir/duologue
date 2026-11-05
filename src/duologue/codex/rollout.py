@@ -8,7 +8,6 @@ are eventually compressed to ``.jsonl.zst``.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import sqlite3
@@ -17,7 +16,11 @@ import tomllib
 import uuid
 from pathlib import Path
 
+from duologue.ids import require_id
+from duologue.journal import prefix_hash
 from duologue.jsonl import Line
+
+__all__ = ["prefix_hash"]  # where callers that read rollouts find it
 
 SESSIONS = "sessions"
 ARCHIVED = "archived_sessions"
@@ -25,11 +28,13 @@ STATE_DB = "state_5.sqlite"
 TURN_ENDS = ("task_complete", "turn_aborted")
 
 
-def find_rollout(codex_home: Path, thread_id: str) -> Path | None:
-    """The thread's rollout: the path Codex's state database records, when the file is there,
-    else the newest file named for the thread under ``sessions/`` or ``archived_sessions/``."""
+def find_rollout(codex_home: Path, thread_id: str, sqlite: Path | None = None) -> Path | None:
+    """The thread's rollout: the path Codex's state database (in ``sqlite``, default the home)
+    records, when the file is there, else the newest file named for the thread under
+    ``sessions/`` or ``archived_sessions/``."""
+    require_id(thread_id, "thread id")
     home = Path(codex_home)
-    recorded = _recorded_path(home, thread_id)
+    recorded = _recorded_path(Path(sqlite or home), thread_id)
     if recorded is not None and recorded.exists():
         return recorded
     found = []
@@ -38,13 +43,20 @@ def find_rollout(codex_home: Path, thread_id: str) -> Path | None:
         if base.is_dir():
             found += base.rglob(f"rollout-*-{thread_id}.jsonl")
             found += base.rglob(f"rollout-*-{thread_id}.jsonl.zst")
-    if not found:
+    stamped = [(_mtime(p), p) for p in found]
+    stamped = [(t, p) for t, p in stamped if t is not None]  # Codex may move one meanwhile
+    return max(stamped)[1] if stamped else None
+
+
+def _mtime(path: Path) -> float | None:
+    try:
+        return path.stat().st_mtime
+    except FileNotFoundError:
         return None
-    return max(found, key=lambda p: p.stat().st_mtime)
 
 
-def _recorded_path(home: Path, thread_id: str) -> Path | None:
-    db = home / STATE_DB
+def _recorded_path(sqlite: Path, thread_id: str) -> Path | None:
+    db = sqlite / STATE_DB
     if not db.exists():
         return None
     try:
@@ -112,28 +124,46 @@ def open_turn(lines: list[Line]) -> bool:
     return state
 
 
-def prefix_hash(path: Path, length: int) -> str:
-    """The sha256 of the first ``length`` bytes of ``path``."""
-    digest, left = hashlib.sha256(), length
-    with open(path, "rb") as fh:
-        while left > 0:
-            chunk = fh.read(min(left, 1 << 20))
-            if not chunk:
-                break
-            digest.update(chunk)
-            left -= len(chunk)
-    return digest.hexdigest()
-
-
-def model_provider(codex_home: Path) -> str:
-    """The model provider new threads use: ``model_provider`` in Codex's config, else openai."""
+def model_provider(codex_home: Path) -> str | None:
+    """The model provider new threads use, as Codex's config sets it: the active profile's
+    ``model_provider``, else the top-level one, else Codex's default, openai. None when the
+    config cannot be read: Codex lists only threads of its active provider, so guessing would
+    hide the thread."""
     path = Path(codex_home) / "config.toml"
     try:
         with open(path, "rb") as fh:
-            value = tomllib.load(fh).get("model_provider")
-    except (OSError, tomllib.TOMLDecodeError):
+            config = tomllib.load(fh)
+    except FileNotFoundError:
         return "openai"
+    except (OSError, tomllib.TOMLDecodeError):
+        return None
+    profile = config.get("profile")
+    profiles = config.get("profiles")
+    if isinstance(profile, str) and isinstance(profiles, dict):
+        chosen = profiles.get(profile)
+        if isinstance(chosen, dict) and isinstance(chosen.get("model_provider"), str):
+            return chosen["model_provider"]
+    value = config.get("model_provider")
     return value if isinstance(value, str) and value else "openai"
+
+
+def sqlite_home(codex_home: Path, env: dict[str, str]) -> Path:
+    """Where Codex keeps its databases: ``sqlite_home`` in its config, else
+    ``$CODEX_SQLITE_HOME``, else its home (codex-rs config_toml.rs)."""
+    try:
+        with open(Path(codex_home) / "config.toml", "rb") as fh:
+            value = tomllib.load(fh).get("sqlite_home")
+    except (OSError, tomllib.TOMLDecodeError):
+        value = None
+    if isinstance(value, str) and value:
+        return Path(value).expanduser()
+    if env.get("CODEX_SQLITE_HOME"):
+        return Path(env["CODEX_SQLITE_HOME"]).expanduser()
+    return Path(codex_home)
+
+
+def is_archived(codex_home: Path, path: Path) -> bool:
+    return Path(codex_home) / ARCHIVED in path.parents
 
 
 def uuid7(ms: int | None = None) -> str:

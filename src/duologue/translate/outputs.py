@@ -8,6 +8,8 @@ import os
 import re
 from pathlib import Path
 
+from duologue.jsonl import clean
+
 # What a model reads of one tool output, and what an app shows.
 MODEL_LIMIT = 4000
 UI_LIMIT = 20000
@@ -54,6 +56,6 @@ class OutputStore:
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(text)
+            fh.write(clean(text))
         os.replace(tmp, path)
         return path

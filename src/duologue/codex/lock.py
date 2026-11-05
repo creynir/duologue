@@ -16,6 +16,8 @@ import time
 from collections.abc import Iterator
 from pathlib import Path
 
+from duologue.ids import require_id
+
 LOCK_DIR = "thread-writer-locks"
 COORDINATION = ".coordination.lock"
 COORDINATION_WAIT = 30.0  # seconds; what Codex itself waits
@@ -45,7 +47,7 @@ class WriterLock:
 
     def __init__(self, codex_home: Path, thread_id: str):
         self.directory = Path(codex_home) / LOCK_DIR
-        self.path = self.directory / f"{thread_id}.lock"
+        self.path = self.directory / f"{require_id(thread_id, 'thread id')}.lock"
         self._fd: int | None = None
 
     def acquire(self) -> bool:
@@ -63,14 +65,21 @@ class WriterLock:
         return True
 
     def release(self) -> None:
-        """Give the lock up and remove its file, as Codex does when a writer finishes."""
+        """Give the lock up and remove its file, as Codex does when a writer finishes. The lock
+        is given up even when the coordination lock cannot be had; its file then stays, and
+        Codex removes such stale files itself."""
         if self._fd is None:
             return
-        with _coordination(self.directory):
-            os.close(self._fd)
-            self._fd = None
-            with contextlib.suppress(FileNotFoundError):
-                self.path.unlink()
+        fd, self._fd = self._fd, None
+        try:
+            with _coordination(self.directory):
+                os.close(fd)
+                fd = None
+                with contextlib.suppress(FileNotFoundError):
+                    self.path.unlink()
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     @property
     def held(self) -> bool:
@@ -90,7 +99,7 @@ def is_held(codex_home: Path, thread_id: str) -> bool:
     that wants the thread at that moment waits for it instead of failing.
     """
     directory = Path(codex_home) / LOCK_DIR
-    path = directory / f"{thread_id}.lock"
+    path = directory / f"{require_id(thread_id, 'thread id')}.lock"
     if not path.exists():
         return False
     with _coordination(directory):
