@@ -154,7 +154,7 @@ def cmd_hold(args) -> int:
         pair = linking.find_pair(e, args.pair)
         pair.hold = args.reason.strip() or "held by you"
         e.save()
-        e.log.write(pair.name, "hold", args.reason)
+        e.log.write(pair.name, "hold", pair.hold)
     print(f'"{pair.name}": on hold; duologue release "{pair.name}" resumes it')
     return 0
 

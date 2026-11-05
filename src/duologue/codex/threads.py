@@ -196,6 +196,7 @@ def append_turns(
         # Nobody has the thread loaded, so nobody works on that turn: a Codex that stopped left
         # it open (Codex 0.166 does not close it on resume). Its next turn closes it.
         raise Wait("the last Codex turn in the thread never finished; it syncs after the next one")
+    converted = history_mode(path) != "paginated"
     path = _paginated(codex, thread_id, path)
     index, size = _caught_up(codex, thread_id, path)
     present = [t for t in turns if t in index.turns]
@@ -208,7 +209,10 @@ def append_turns(
         )
     data = encode(lines, index.next_ordinal or 0)
     with _writer(codex, thread_id):
-        if path.stat().st_size != size:
+        grew = expect_size is not None and not converted and size != expect_size
+        if path.stat().st_size != size or grew:
+            # A turn that finished since the caller read the file must not end up before ours
+            # unseen. (Codex's own conversion of a legacy thread changes the size on purpose.)
             raise Wait("the Codex thread changed while duologue prepared its turns")
         intent = Intent("codex", path, size, data, turns, prefix_hash(path, size))
         journal.begin(intent)
@@ -456,6 +460,11 @@ def _write(path: Path, intent: Intent) -> None:
             if tail_state(path, intent) == "partial":
                 os.truncate(path, intent.base)
             raise
+
+
+def take_out(codex: Codex, thread_id: str, intent: Intent) -> bool:
+    """Remove a write duologue made that Codex indexed none of, when nothing follows it."""
+    return _take_out(codex, thread_id, intent)
 
 
 def _take_out(codex: Codex, thread_id: str, intent: Intent) -> bool:

@@ -109,6 +109,13 @@ def test_activity_log(tmp_path: Path, monkeypatch):
     log.path.chmod(0o644)
     log.write("d", "sync", "tightened")
     assert oct(log.path.stat().st_mode & 0o777) == "0o600"
+    other = tmp_path / "other.txt"
+    other.write_text("not the log")
+    other.chmod(0o644)
+    log.path.unlink()
+    log.path.symlink_to(other)  # a link planted where the log goes is replaced, not followed
+    log.write("e", "sync", "after the link")
+    assert not log.path.is_symlink() and oct(other.stat().st_mode & 0o777) == "0o644"
 
 
 # --------------------------------------------------------------------------------------- gate

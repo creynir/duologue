@@ -295,7 +295,21 @@ class Engine:
         if p is None:
             return
         cpath, xpath = self.paths(pair)
-        if self._landed(pair, p, cpath if p.side == "claude" else xpath):
+        landed = self._landed(pair, p, cpath if p.side == "claude" else xpath)
+        if landed and p.side == "codex":
+            ids, end = tuple(p.ids), p.base + p.length
+            if not self.codex.index(pair.codex).holds(ids, end):
+                # In the file but not in Codex's index, so not shown: take the lines out (only
+                # when Codex indexed none of them and nothing follows), then copy them again.
+                data = self.journal_file(pair).read_bytes()
+                intent = Intent("codex", xpath, p.base, data, ids, p.before)
+                if not codex_threads.take_out(self.codex, pair.codex, intent):
+                    raise Blocked(
+                        "the Codex thread holds lines duologue wrote that Codex has not indexed, "
+                        "and something follows them; check the thread in Codex"
+                    )
+                landed = False
+        if landed:
             # The journal proves the write is there: both cursors move past it.
             for side, target, path in (("claude", p.claude, cpath), ("codex", p.codex, xpath)):
                 if target and target["end"] <= path.stat().st_size:

@@ -169,6 +169,21 @@ def exclusive(lock_file: Path, wait: float = 60.0) -> Iterator[None]:
         os.close(fd)
 
 
+def open_private(path: Path) -> int:
+    """Open ``path`` for appending as an owner-only file. A link planted in its place is
+    removed, never followed (so no other file's mode is changed)."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags, 0o600)
+    except OSError:
+        if not os.path.islink(path):
+            raise
+        os.unlink(path)
+        fd = os.open(path, flags, 0o600)
+    os.fchmod(fd, 0o600)  # also a file created with a looser mode
+    return fd
+
+
 class ActivityLog:
     """What duologue did, one JSON line per event, for ``duologue log``."""
 
@@ -181,8 +196,7 @@ class ActivityLog:
             if self.path.stat().st_size > LOG_LIMIT:
                 os.replace(self.path, self.path.with_name(self.path.name + ".1"))
         line = {"time": now_iso(), "pair": pair, "event": event, "text": text}
-        fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.fchmod(fd, 0o600)  # also a log created with a looser mode
+        fd = open_private(self.path)
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 

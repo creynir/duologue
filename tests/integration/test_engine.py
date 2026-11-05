@@ -14,6 +14,7 @@ from duologue import config, gate, linking
 from duologue.claude.transcript import find_transcript, project_folder
 from duologue.codex.threads import Codex, resume
 from duologue.engine import Engine
+from duologue.journal import Blocked
 from duologue.jsonl import encode, read_lines
 from duologue.pairs import ActivityLog, Store
 from duologue.translate.common import MARK
@@ -768,3 +769,47 @@ def test_a_source_rewritten_while_linking_blocks_the_new_pair(homes, monkeypatch
         engine().pairs["moved"].blocked
         and "changed while duologue copied" in engine().pairs["moved"].blocked
     )
+
+
+def test_a_codex_turn_that_finishes_after_the_pass_read_is_not_skipped(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("in claude", "ok")
+    real = threads._caught_up
+
+    def codex_turn_lands_first(codex, thread_id, path):  # a quick `codex exec` meanwhile
+        pair.codex.turn("in codex meanwhile", "ok")
+        return real(codex, thread_id, path)
+
+    monkeypatch.setattr(threads, "_caught_up", codex_turn_lands_first)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "changed" in outcome.text
+    monkeypatch.setattr(threads, "_caught_up", real)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "conflict"  # both sides wrote: seen, not skipped
+
+
+def test_release_will_not_skip_lines_codex_indexed_only_in_part(pair, monkeypatch):
+    pair.claude.turn("second", "ok")
+    monkeypatch.setenv("FAKE_CODEX_LEAVE_LINES", "1")  # Codex leaves our last line unindexed
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked"
+    size = pair.codex.path.stat().st_size
+    e = engine()
+    with pytest.raises(Blocked, match="has not indexed"):
+        linking.release(e, e.pairs[pair.name])
+    assert engine().pairs[pair.name].blocked  # still blocked, file untouched
+    assert pair.codex.path.stat().st_size == size
+
+
+def test_release_after_codex_took_nothing_copies_the_turn_again(pair, monkeypatch):
+    pair.claude.turn("second", "ok")
+    before = len(pair.codex.turn_ids())
+    monkeypatch.setenv("FAKE_CODEX_NO_INDEX", "1")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked" and "taken out" in outcome.text
+    monkeypatch.delenv("FAKE_CODEX_NO_INDEX")
+    e = engine()
+    linking.release(e, e.pairs[pair.name])
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and len(pair.codex.turn_ids()) == before + 1

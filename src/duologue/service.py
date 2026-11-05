@@ -17,6 +17,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from duologue.pairs import open_private
+
 LABEL = "duologue.sync"
 UNIT = "duologue"
 INTERVAL = 30  # seconds between passes
@@ -132,11 +134,7 @@ class Service:
             f.path.parent.mkdir(parents=True, exist_ok=True)
             f.path.write_bytes(f.content)
         self.log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-        fd = os.open(self.log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        try:
-            os.fchmod(fd, 0o600)  # also a log an older install left readable
-        finally:
-            os.close(fd)
+        os.close(open_private(self.log_file))  # owner-only, even one an older install left
         if self.platform == "darwin":
             target = f"gui/{os.getuid()}"
             self._call(["launchctl", "bootout", f"{target}/{LABEL}"], check=False)

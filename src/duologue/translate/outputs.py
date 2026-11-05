@@ -55,7 +55,7 @@ class OutputStore:
             name = name[:64] + "-" + hashlib.sha256(ref.encode()).hexdigest()[:12]
         path = self.directory / f"{name}.txt"
         text = clean(text)
-        if _ours(path) and path.read_text(encoding="utf-8", errors="replace") == text:
+        if _ours(path) and _read(path) == text:
             return path  # already kept: every pass would otherwise write it again
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -74,3 +74,10 @@ def _ours(path: Path) -> bool:
     return (
         stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.getuid()
     )
+
+
+def _read(path: Path) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None  # damaged or unreadable: written again
