@@ -152,7 +152,7 @@ def cmd_sync(args) -> int:
 def cmd_hold(args) -> int:
     with engine() as e:
         pair = linking.find_pair(e, args.pair)
-        pair.hold = args.reason
+        pair.hold = args.reason.strip() or "held by you"
         e.save()
         e.log.write(pair.name, "hold", args.reason)
     print(f'"{pair.name}": on hold; duologue release "{pair.name}" resumes it')
@@ -179,7 +179,7 @@ def cmd_log(args) -> int:
         with engine(lock=False) as e:  # a start of the name or an id, as elsewhere
             try:
                 name = linking.find_pair(e, name).name
-            except LinkError:
+            except linking.NoSuchPair:
                 pass  # an unlinked pair's entries are still in the log
         cfg = e.config
     else:

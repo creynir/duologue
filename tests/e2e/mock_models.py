@@ -26,6 +26,13 @@ class Rule:
 class MockModels:
     rules: list[Rule] = field(default_factory=list)
     requests: list[dict] = field(default_factory=list)
+    _lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def _record(self, path: str, body: dict) -> int:
+        """Keep a request; its number, unique even when the CLIs send requests at once."""
+        with self._lock:
+            self.requests.append({"path": path, "body": body})
+            return len(self.requests)
 
     def start(self) -> MockModels:
         mock = self
@@ -46,16 +53,16 @@ class MockModels:
                 except ValueError:
                     body = {}
                 path = self.path.split("?")[0]
-                mock.requests.append({"path": path, "body": body})
+                n = mock._record(path, body)
                 if path.endswith("/responses"):
-                    self._sse(mock.responses(body, len(mock.requests)))
+                    self._sse(mock.responses(body, n))
                 elif path.endswith("/count_tokens"):
                     self._json({"input_tokens": 10})
                 elif path.endswith("/messages"):
                     if body.get("stream"):
-                        self._sse(mock.messages_stream(body, len(mock.requests)))
+                        self._sse(mock.messages_stream(body, n))
                     else:
-                        self._json(mock.message(body, len(mock.requests)))
+                        self._json(mock.message(body, n))
                 else:
                     self._json({})
 

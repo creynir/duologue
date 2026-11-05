@@ -112,7 +112,7 @@ def create_session(
     """Create a session in ``cwd`` holding the records ``build(session_id)`` returns, titled
     ``title`` in Claude's session list. ``session_id`` lets the caller record the session
     before it exists."""
-    session_id = require_id(session_id, "session id") if session_id else str(uuid.uuid4())
+    session_id = str(uuid.uuid4()) if session_id is None else require_id(session_id, "session id")
     records = build(session_id)
     problems = check_structure(tail([]), records)
     if problems:

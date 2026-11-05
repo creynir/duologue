@@ -95,3 +95,15 @@ def test_clean_joins_surrogate_pairs_and_replaces_lone_ones():
     assert clean("\ud83d\ude00 ok") == "\U0001f600 ok"  # a pair: the emoji it stands for
     assert clean("cut \ud83d") == "cut \ufffd"
     assert clean("\ude00 then \ud83d\ude00") == "\ufffd then \U0001f600"
+
+
+def test_a_whole_line_of_another_writer_at_base_means_our_write_is_absent(tmp_path: Path):
+    path = tmp_path / "t.jsonl"
+    path.write_bytes(b'{"a": 1}\n')
+    data = b'{"ours": 1}\n{"ours": 2}\n'
+    intent = Intent("claude", path, 9, data, ("x",), prefix_hash(path, 9))
+    with open(path, "ab") as fh:
+        fh.write(b'{"theirs": 1}\n')
+    assert tail_state(path, intent) == "absent"
+    path.write_bytes(b'{"a": 1}\n{"ou' + b'{"theirs": 1}\n')  # our cut-off start, then theirs
+    assert tail_state(path, intent) == "changed"

@@ -21,6 +21,7 @@ from duologue.claude import sessions as claude_sessions
 from duologue.claude.transcript import PROJECTS, find_transcript, is_message, project_folder
 from duologue.codex import threads as codex_threads
 from duologue.codex.rollout import SESSIONS, is_compressed, session_meta, turn_ends, uuid7
+from duologue.codex.threads import last_turn_open
 from duologue.engine import (
     Engine,
     PairJournal,
@@ -30,6 +31,7 @@ from duologue.engine import (
     end_cursor,
 )
 from duologue.ids import UUID as ID
+from duologue.ids import is_id
 from duologue.journal import Blocked, Wait, prefix_hash
 from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import Cursor, Pair
@@ -52,6 +54,10 @@ T = TypeVar("T")
 
 class LinkError(Exception):
     """The link cannot be made as asked."""
+
+
+class NoSuchPair(LinkError):
+    """No pair has that name or id."""
 
 
 # ----------------------------------------------------------------------------------- finding
@@ -80,7 +86,7 @@ def find_codex(engine: Engine, value: str, cwd: str) -> str:
         want = os.path.realpath(cwd)
         for path in found[:SCAN_LIMIT]:
             meta = session_meta(path)
-            if meta.get("cwd") and os.path.realpath(meta["cwd"]) == want and meta.get("id"):
+            if meta.get("cwd") and os.path.realpath(meta["cwd"]) == want and is_id(meta.get("id")):
                 return str(meta["id"])
         raise LinkError(f"no Codex thread found for {cwd}")
     if not ID.fullmatch(value) or engine.codex.rollout(value) is None:
@@ -175,6 +181,7 @@ def _codex_from_claude(engine: Engine, claude: str, name: str | None) -> tuple[P
         )[1],
     )
     engine.confirm(pair, after_claude, {"end": made.end, "anchor": made.turns[-1]})
+    _source_unchanged(engine, pair, cpath, start, "Claude session")
     done = f"created Codex thread {thread_id} with {kept['turns']} turn(s) from Claude"
     if kept["dropped"]:
         done += f" ({kept['dropped']} older turn(s) left out: over the copy budget)"
@@ -223,6 +230,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
         )
 
     after_codex = {"end": ends[-1][1], "anchor": ends[-1][0]}
+    before_digest = prefix_hash(xpath, ends[-1][1])
     made = _create(
         engine,
         pair,
@@ -237,10 +245,21 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
         )[1],
     )
     engine.confirm(pair, {"end": made.end, "anchor": made.uuids[-1]}, after_codex)
+    source = Cursor(ends[-1][1], before_digest, ends[-1][0])
+    _source_unchanged(engine, pair, xpath, source, "Codex thread")
     done = f"created Claude session {session_id} with {kept['turns']} turn(s) from Codex"
     if kept["dropped"]:
         done += f" ({kept['dropped']} older turn(s) left out: over the copy budget)"
     return pair, done
+
+
+def _source_unchanged(engine: Engine, pair: Pair, path: Path, cur: Cursor, what: str) -> None:
+    """Block the new pair when the conversation it was copied from was rewritten meanwhile:
+    the copy may not match it, so a person decides (``duologue release``)."""
+    if path.stat().st_size >= cur.end and prefix_hash(path, cur.end) == cur.digest:
+        return
+    engine.block(pair, f"the {what} changed while duologue copied it; check the new side")
+    engine.save()
 
 
 def _create(engine: Engine, pair: Pair, journal: PairJournal, create):
@@ -283,7 +302,7 @@ def release(engine: Engine, pair: Pair) -> str:
                 engine.settle(pair)
             except Blocked:
                 engine.accept_pending(pair)
-                said.append("the interrupted write was taken as it stands")
+                said.append("the interrupted write was settled as the files stand")
         cpath, xpath = engine.paths(pair)
         if not _cursor_matches(cpath, pair.claude_cursor):
             pair.claude_cursor = _reanchor_claude(cpath, pair.claude_cursor)
@@ -308,6 +327,8 @@ def resolve(engine: Engine, pair: Pair, keep: str) -> str:
     cpath, xpath = engine.paths(pair)
     if keep == "claude":
         cur = engine.codex_cursor(pair, xpath)  # finds the synced turn again after a rewrite
+        if last_turn_open(xpath):
+            raise LinkError("a Codex turn is still running; resolve once it has finished")
         ends = turn_ends(iter_lines(xpath, cur.end))
         if ends:
             pair.codex_cursor = Cursor(ends[-1][1], prefix_hash(xpath, ends[-1][1]), ends[-1][0])
@@ -348,7 +369,7 @@ def find_pair(engine: Engine, ref: str) -> Pair:
         return starts[0]
     if starts:
         raise LinkError(f"{ref!r} matches more than one pair: " + ", ".join(p.name for p in starts))
-    raise LinkError(f"no pair {ref!r}; duologue status lists them")
+    raise NoSuchPair(f"no pair {ref!r}; duologue status lists them")
 
 
 # ------------------------------------------------------------------------------------ helpers
@@ -368,15 +389,19 @@ def newest_lazily(
     over the budget are never made (translating writes long outputs to files)."""
     kept: list[U] = []
     total = 0
+    skipped = 0
     for g in reversed(groups):
         made = make(g)
+        if not made:  # nothing in it to copy (an aborted turn, say): not kept, not left out
+            skipped += 1
+            continue
         s = size(made)
         if kept and total + s > budget:
             break
         kept.append(made)
         total += s
     kept.reverse()
-    return kept, len(groups) - len(kept)
+    return kept, len(groups) - len(kept) - skipped
 
 
 def claude_version(claude_bin: str) -> str:

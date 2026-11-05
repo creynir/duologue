@@ -38,7 +38,7 @@ from duologue.codex.rpc import AppServerError, daemon_running
 from duologue.codex.threads import Codex
 from duologue.config import Config
 from duologue.gate import CodexFormat, cached_format
-from duologue.journal import Blocked, Intent, Wait, prefix_hash
+from duologue.journal import Blocked, Intent, Wait, prefix_hash, tail_state
 from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import ActivityLog, Cursor, Pair, Pending, Store, now_iso, write_atomic
 from duologue.translate.claude_to_codex import claude_to_codex, has_content
@@ -295,21 +295,17 @@ class Engine:
         if p is None:
             return
         cpath, xpath = self.paths(pair)
-        for target, path, start in (
-            (p.claude, cpath, claude_start),
-            (p.codex, xpath, codex_start),
-        ):
-            if not target:
-                continue
-            if target["end"] <= path.stat().st_size:
-                cur = Cursor(target["end"], prefix_hash(path, target["end"]), target["anchor"])
-            else:
-                cur = start(path)
-            if path == cpath:
-                pair.claude_cursor = cur
-            else:
-                pair.codex_cursor = cur
-        self.log.write(pair.name, "release", "an interrupted write was accepted as it stands")
+        if self._landed(pair, p, cpath if p.side == "claude" else xpath):
+            # The journal proves the write is there: both cursors move past it.
+            for side, target, path in (("claude", p.claude, cpath), ("codex", p.codex, xpath)):
+                if target and target["end"] <= path.stat().st_size:
+                    cur = Cursor(target["end"], prefix_hash(path, target["end"]), target["anchor"])
+                    setattr(pair, f"{side}_cursor", cur)
+            said = "an interrupted write is there; it counts as copied"
+        else:
+            # Not proven: the cursors stay, so what it was copying is copied again.
+            said = "an interrupted write could not be confirmed; it is copied again"
+        self.log.write(pair.name, "release", said)
         pair.checked = {}
         self.forget_pending(pair)
 
@@ -319,6 +315,17 @@ class Engine:
         pair.pending = None
         self.save()
         self.journal_file(pair).unlink(missing_ok=True)
+
+    def _landed(self, pair: Pair, p: Pending, path: Path) -> bool:
+        """Whether the journal's bytes are in ``path`` where the write put them."""
+        try:
+            data = self.journal_file(pair).read_bytes()
+        except FileNotFoundError:
+            return False
+        if hashlib.sha256(data).hexdigest() != p.sha256:
+            return False
+        intent = Intent(p.side, path, p.base, data, tuple(p.ids), p.before)
+        return tail_state(path, intent) in ("complete", "followed")
 
     def _ids_present(self, pair: Pair, p: Pending) -> bool:
         if p.side == "codex":

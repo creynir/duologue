@@ -6,6 +6,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 from pathlib import Path
 
 from duologue.jsonl import clean
@@ -54,14 +55,22 @@ class OutputStore:
             name = name[:64] + "-" + hashlib.sha256(ref.encode()).hexdigest()[:12]
         path = self.directory / f"{name}.txt"
         text = clean(text)
-        try:
-            if path.read_text(encoding="utf-8") == text:
-                return path  # already kept: every pass would otherwise write it again
-        except (FileNotFoundError, UnicodeDecodeError):
-            pass
+        if _ours(path) and path.read_text(encoding="utf-8", errors="replace") == text:
+            return path  # already kept: every pass would otherwise write it again
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
             fh.write(text)
         os.replace(tmp, path)
         return path
+
+
+def _ours(path: Path) -> bool:
+    """A regular, owner-only file of this user, not a link that points elsewhere."""
+    try:
+        st = path.lstat()
+    except FileNotFoundError:
+        return False
+    return (
+        stat.S_ISREG(st.st_mode) and stat.S_IMODE(st.st_mode) == 0o600 and st.st_uid == os.getuid()
+    )

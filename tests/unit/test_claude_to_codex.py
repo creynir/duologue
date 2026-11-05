@@ -409,3 +409,11 @@ def test_local_commands_never_reach_codex():
     text = json.dumps([ln.payload for ln in lines])
     assert "command-name" not in text and "local-command" not in text
     assert "real question" in text
+
+
+def test_a_tool_call_alone_is_content():
+    from duologue.translate.claude_to_codex import has_content
+
+    c = ClaudeTranscript()
+    c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
+    assert has_content(c.records)

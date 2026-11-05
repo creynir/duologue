@@ -104,7 +104,7 @@ def cached_format(codex: Codex, allow_untested: bool, cache: Path) -> tuple[Code
         return CodexFormat(
             version, r.get("fingerprint"), bool(r.get("known")), r.get("problem")
         ), False
-    found = codex_format(codex, allow_untested)
+    found = codex_format(codex, allow_untested, version)
     if found.version:
         result = {"fingerprint": found.fingerprint, "known": found.known, "problem": found.problem}
         try:
@@ -115,8 +115,10 @@ def cached_format(codex: Codex, allow_untested: bool, cache: Path) -> tuple[Code
     return found, True
 
 
-def codex_format(codex: Codex, allow_untested: bool = False) -> CodexFormat:
-    version = codex.version()
+def codex_format(
+    codex: Codex, allow_untested: bool = False, version: str | None = None
+) -> CodexFormat:
+    version = version or codex.version()
     if version is None:
         return CodexFormat(None, None, False, f"Codex does not run ({codex.bin} --version failed)")
     found = version_tuple(version)

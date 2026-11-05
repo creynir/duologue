@@ -95,3 +95,28 @@ def test_a_block_is_one_line_not_a_traceback(linked, capsys):
     assert main(["release", "work"]) == 1
     err = capsys.readouterr().err
     assert err.startswith("duologue release: the Claude session") and "Traceback" not in err
+
+
+def test_log_reports_an_ambiguous_pair(linked, capsys):
+    from duologue import config
+    from duologue.pairs import Pair, Store
+
+    store = Store(config.load().state_file)
+    pairs = store.load()
+    pairs["workshop"] = Pair(
+        name="workshop",
+        claude="5e550000-0000-4000-8000-0000000000bb",
+        codex="01a1ab4d-0000-7000-8000-0000000000bb",
+    )
+    store.save(pairs)
+    assert main(["log", "wo"]) == 1
+    assert "more than one pair" in capsys.readouterr().err
+    assert main(["log", "work"]) == 0  # an exact name is never ambiguous
+
+
+def test_hold_with_an_empty_reason_still_holds(linked, capsys):
+    assert main(["hold", "work", "--reason", "   "]) == 0
+    capsys.readouterr()
+    assert main(["status", "--json"]) == 0
+    [pair] = json.loads(capsys.readouterr().out)
+    assert pair["hold"] == "held by you"

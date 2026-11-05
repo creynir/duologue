@@ -588,10 +588,11 @@ def test_a_damaged_journal_blocks_and_release_takes_the_files_as_they_are(pair, 
     assert outcome.state == "blocked" and "missing or damaged" in outcome.text
     e = engine()
     said = linking.release(e, e.pairs[pair.name])
-    assert "taken as it stands" in said
+    assert "settled as the files stand" in said
     assert engine().pairs[pair.name].pending is None
-    pair.claude.turn("third", "ok")
-    assert sync(pair.name)[0].state != "blocked"
+    before = len(pair.codex.turn_ids())
+    outcome, _ = sync(pair.name)  # the write was never proven: the turn is copied again
+    assert outcome.state == "synced" and len(pair.codex.turn_ids()) == before + 1
 
 
 def test_claude_opening_the_session_during_a_write_is_undone_and_retried(pair, monkeypatch):
@@ -707,3 +708,63 @@ def test_the_format_alert_goes_out_once(pair, homes, monkeypatch):
     for _ in range(3):  # three service passes: three processes, one alert
         assert sync(pair.name)[0].state == "waiting"
     assert sent.read_text().count("has not been tested") == 1
+
+
+def test_resolve_keep_claude_waits_for_a_running_codex_turn(pair):
+    pair.claude.turn("in claude", "ok")
+    pair.codex.turn("in codex", "ok")
+    sync(pair.name)
+    with open(pair.codex.path, "a") as fh:  # a Codex turn starts and has not ended
+        start = pair.codex._turn("running", "later")[0]
+        fh.write(json.dumps(dict(start, ordinal=999), separators=(",", ":")) + "\n")
+    e = engine()
+    with pytest.raises(linking.LinkError, match="still running"):
+        linking.resolve(e, e.pairs[pair.name], "claude")
+
+
+def test_link_a_codex_thread_with_nothing_to_copy_creates_nothing(homes):
+    x = CodexRollout(THREAD)
+    x.start("aborted")
+    x._line("event_msg", {"type": "turn_aborted", "turn_id": "aborted", "reason": "interrupted"})
+    write_rollout(homes.codex, THREAD, x.records)
+    with pytest.raises(linking.LinkError, match="nothing to copy"):
+        linking.link(engine(), claude=None, codex=THREAD, name=None, cwd=CWD)
+    assert engine().pairs == {}
+    assert (
+        not list((homes.claude / "projects").rglob("*.jsonl"))
+        if (homes.claude / "projects").exists()
+        else True
+    )
+
+
+def test_a_legacy_thread_takes_its_first_claude_turn_in_one_pass(homes):
+    claude = Claude(homes.claude)
+    claude.turn("first", "done")
+    codex = CodexThread(homes.codex, homes.bin)
+    text = codex.path.read_text().replace('"history_mode":"paginated"', '"history_mode":"legacy"')
+    codex.path.write_text(text)
+    e = engine()
+    linking.link(e, claude=SESSION, codex=THREAD, name="old", cwd=CWD)
+    claude.turn("second", "ok")
+    outcome, _ = sync("old")
+    assert outcome.state == "synced", outcome.text
+
+
+def test_a_source_rewritten_while_linking_blocks_the_new_pair(homes, monkeypatch):
+    from duologue.codex import threads
+
+    claude = Claude(homes.claude)
+    claude.turn("build it", "built")
+    real = threads.finish
+
+    def rewrite_then_finish(*args):
+        real(*args)
+        data = claude.path.read_bytes()
+        claude.path.write_bytes(data.replace(b"build it", b"BUILD IT"))
+
+    monkeypatch.setattr(threads, "finish", rewrite_then_finish)
+    p, _ = linking.link(engine(), claude=SESSION, codex=None, name="moved", cwd=CWD)
+    assert (
+        engine().pairs["moved"].blocked
+        and "changed while duologue copied" in engine().pairs["moved"].blocked
+    )

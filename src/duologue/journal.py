@@ -8,6 +8,7 @@ works out from the file whether the write is missing, cut off or complete, inste
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -89,13 +90,25 @@ def tail_state(path: Path, intent: Intent) -> str:
         return "partial"
     if written.startswith(intent.data):
         return "followed"
-    first = intent.data.split(b"\n", 1)[0]
-    n = min(len(first), len(written))
-    if intent.before and written[:n] != first[:n]:
-        # The file before base is as it was, and what follows base differs from our first line:
-        # our write never landed there, or was taken back before an app wrote its own.
+    if intent.before and _displaced(path, intent):
+        # The file before base is as it was, and a whole line of another writer's follows it:
+        # our write never landed there, or was taken back before the app wrote its own.
         return "absent"
     return "changed"
+
+
+def _displaced(path: Path, intent: Intent) -> bool:
+    """Whether the line at ``base`` is a whole JSON line that is not ours."""
+    ours = intent.data.split(b"\n", 1)[0] + b"\n"
+    with open(path, "rb") as fh:
+        fh.seek(intent.base)
+        line = fh.readline()
+    if not line.endswith(b"\n") or line == ours:
+        return False
+    try:
+        return isinstance(json.loads(line), dict)
+    except ValueError:
+        return False  # our cut-off start with another writer's bytes glued on
 
 
 def prefix_hash(path: Path, length: int) -> str:

@@ -43,7 +43,18 @@ def command() -> list[str]:
 
 
 def environment(env: Mapping[str, str]) -> dict[str, str]:
-    return {k: env[k] for k in KEPT_ENV if env.get(k)}
+    """The variables the service keeps, folders made absolute: the service does not start
+    where the installing shell was."""
+    out = {k: env[k] for k in KEPT_ENV if env.get(k)}
+    for k in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "CODEX_SQLITE_HOME"):
+        if k in out:
+            out[k] = os.path.abspath(os.path.expanduser(out[k]))
+    return out
+
+
+def _systemd_value(text: str) -> str:
+    """``text`` for a double-quoted systemd setting: backslashes, quotes and % escaped."""
+    return text.replace("\\", "\\\\").replace('"', '\\"').replace("%", "%%")
 
 
 def launchd_files(home: Path, log_dir: Path, env: Mapping[str, str]) -> list[ServiceFile]:
@@ -70,12 +81,12 @@ def systemd_files(home: Path, env: Mapping[str, str], log_dir: Path) -> list[Ser
         "",
         "[Service]",
         "Type=oneshot",
-        f"ExecStart={shlex.join(command())}",
+        f"ExecStart={shlex.join(command()).replace('%', '%%')}",
         "UMask=0077",
-        f"StandardOutput=append:{log_dir / LOG}",
-        f"StandardError=append:{log_dir / LOG}",
+        f"StandardOutput=append:{_systemd_value(str(Path(log_dir).absolute() / LOG))}",
+        f"StandardError=append:{_systemd_value(str(Path(log_dir).absolute() / LOG))}",
     ]
-    lines += [f'Environment="{k}={v}"' for k, v in environment(env).items()]
+    lines += [f'Environment="{_systemd_value(f"{k}={v}")}"' for k, v in environment(env).items()]
     timer = [
         "[Unit]",
         "Description=Run duologue sync every 30 seconds",
@@ -122,7 +133,10 @@ class Service:
             f.path.write_bytes(f.content)
         self.log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         fd = os.open(self.log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-        os.close(fd)
+        try:
+            os.fchmod(fd, 0o600)  # also a log an older install left readable
+        finally:
+            os.close(fd)
         if self.platform == "darwin":
             target = f"gui/{os.getuid()}"
             self._call(["launchctl", "bootout", f"{target}/{LABEL}"], check=False)

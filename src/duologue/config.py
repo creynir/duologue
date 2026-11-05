@@ -17,6 +17,7 @@ optional::
 
 from __future__ import annotations
 
+import math
 import os
 import tomllib
 from collections.abc import Mapping
@@ -117,6 +118,7 @@ def _read(path: Path) -> dict:
             isinstance(value, bool) and bool not in _TYPES[key]
         ):
             raise ConfigError(f"{path}: {key} has the wrong type")
-    if data.get("quiet_seconds", 0) < 0 or data.get("copy_budget", 1) <= 0:
+    quiet = data.get("quiet_seconds", 0)
+    if not math.isfinite(quiet) or quiet < 0 or data.get("copy_budget", 1) <= 0:
         raise ConfigError(f"{path}: quiet_seconds must be 0 or more, copy_budget above 0")
     return data

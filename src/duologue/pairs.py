@@ -111,9 +111,16 @@ class Store:
             data = json.loads(self.path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             return {}
-        if data.get("version") != STATE_VERSION:
-            raise ValueError(f"{self.path}: state version {data.get('version')} is not supported")
-        return {p["name"]: Pair.from_dict(p) for p in data.get("pairs", [])}
+        if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
+            version = data.get("version") if isinstance(data, dict) else None
+            raise ValueError(f"{self.path}: state version {version} is not supported")
+        pairs = data.get("pairs")
+        if not isinstance(pairs, list) or not all(isinstance(p, dict) for p in pairs):
+            raise ValueError(f"{self.path}: the pairs are not a list of objects")
+        try:
+            return {p["name"]: Pair.from_dict(p) for p in pairs}
+        except (KeyError, TypeError) as e:
+            raise ValueError(f"{self.path}: a pair is not readable ({e})") from e
 
     def save(self, pairs: dict[str, Pair]) -> None:
         data = {"version": STATE_VERSION, "pairs": [p.to_dict() for p in pairs.values()]}
@@ -175,6 +182,7 @@ class ActivityLog:
                 os.replace(self.path, self.path.with_name(self.path.name + ".1"))
         line = {"time": now_iso(), "pair": pair, "event": event, "text": text}
         fd = os.open(self.path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.fchmod(fd, 0o600)  # also a log created with a looser mode
         with os.fdopen(fd, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(line, ensure_ascii=False) + "\n")
 

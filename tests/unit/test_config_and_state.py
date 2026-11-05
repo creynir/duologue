@@ -39,6 +39,8 @@ def test_the_apps_variables_then_the_config_file(tmp_path: Path):
         "allow_untested_codex = 1\n",
         "notify = [1]\n",
         "not toml = =\n",
+        "quiet_seconds = nan\n",
+        "quiet_seconds = inf\n",
     ],
 )
 def test_a_bad_config_file_is_reported(tmp_path: Path, text: str):
@@ -69,8 +71,17 @@ def test_pair_states():
     assert p.state == "held"
 
 
-def test_an_unknown_state_version_is_refused(tmp_path: Path):
-    (tmp_path / "pairs.json").write_text(json.dumps({"version": 99, "pairs": []}))
+@pytest.mark.parametrize(
+    "doc",
+    [
+        {"version": 99, "pairs": []},
+        [],
+        {"version": 1, "pairs": None},
+        {"version": 1, "pairs": [{}]},
+    ],
+)
+def test_an_unreadable_state_file_is_refused(tmp_path: Path, doc):
+    (tmp_path / "pairs.json").write_text(json.dumps(doc))
     with pytest.raises(ValueError):
         Store(tmp_path / "pairs.json").load()
 
@@ -95,6 +106,9 @@ def test_activity_log(tmp_path: Path, monkeypatch):
     log.write("c", "sync", "rotated")
     assert (tmp_path / "log.jsonl.1").exists()
     assert [e["pair"] for e in log.tail()][-1] == "c"
+    log.path.chmod(0o644)
+    log.write("d", "sync", "tightened")
+    assert oct(log.path.stat().st_mode & 0o777) == "0o600"
 
 
 # --------------------------------------------------------------------------------------- gate
@@ -139,6 +153,15 @@ def test_launchd_agent(tmp_path: Path):
     assert plist["StartInterval"] == 30
     assert plist["EnvironmentVariables"] == {"PATH": "/opt/bin:/usr/bin", "CODEX_HOME": "/x"}
     assert plist["Umask"] == 0o077
+
+
+def test_systemd_values_are_escaped_and_folders_absolute(tmp_path: Path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    env = {"PATH": 'a"b\\c%d', "DUOLOGUE_HOME": "rel"}
+    service, _ = systemd_files(tmp_path, env, tmp_path / "duo")
+    text = service.content.decode()
+    assert 'Environment="PATH=a\\"b\\\\c%%d"' in text
+    assert f'Environment="DUOLOGUE_HOME={tmp_path / "rel"}"' in text
 
 
 def test_systemd_timer(tmp_path: Path):

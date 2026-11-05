@@ -157,7 +157,7 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 
 ## Steal list (from studying prior art)
 
-Ranked, each with its source. Items 1 to 5 and 7 to 9 are in 0.1; item 6 in part.
+Ranked, each with its source. Items 1 to 5, 7 and 9 are in 0.1; items 6 and 8 in part.
 
 1. **Rewrite detection** (Maxaccurate/claude-codex-sync). Store `sha256(file[:offset])` next to every
    cursor. On mismatch, block the pair and never auto-resync it.
@@ -183,7 +183,9 @@ Ranked, each with its source. Items 1 to 5 and 7 to 9 are in 0.1; item 6 in part
    recorded)" (tandem).
 8. **Pre-flight structure check** before `thread/resume` and `claude --resume`. Every parentUuid must
    resolve, there must be no unanswered `tool_use`, roles must alternate, and ordinals must be
-   contiguous (tandem).
+   contiguous (tandem). In 0.1: records for Claude are checked before every write. On the Codex
+   side, ordinals are contiguous by construction and Codex's index is checked after the write;
+   a separate pre-flight check of the lines is still to do.
 9. **Version and format gate.** Pin the hash of Codex's v2 `ThreadItem` schema
    (`codex app-server generate-json-schema`) and keep a version floor and ceiling. On drift, stop
    writing and alert. Fail closed only on unknown record types that carry a message (tandem, ORG2).

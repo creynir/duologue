@@ -181,6 +181,9 @@ def append_turns(
     if not lines:
         size = path.stat().st_size
         return Appended(path, size, size, (), False)
+    if expect_size is not None and path.stat().st_size != expect_size:
+        # Checked before converting a legacy thread: the conversion rewrites the file itself.
+        raise Wait("the Codex thread changed while duologue prepared its turns")
     if not ends_with_newline(path):
         raise Wait("Codex is writing to the thread")
     if _is_held(codex, thread_id):
@@ -205,7 +208,7 @@ def append_turns(
         )
     data = encode(lines, index.next_ordinal or 0)
     with _writer(codex, thread_id):
-        if path.stat().st_size != size or expect_size not in (None, size):
+        if path.stat().st_size != size:
             raise Wait("the Codex thread changed while duologue prepared its turns")
         intent = Intent("codex", path, size, data, turns, prefix_hash(path, size))
         journal.begin(intent)
@@ -313,7 +316,7 @@ def create_thread(
     if provider is None:
         raise Blocked("Codex's config.toml could not be read, so its model provider is unknown")
     created_ms = int(time.time() * 1000) if created_ms is None else created_ms
-    thread_id = require_id(thread_id, "thread id") if thread_id else uuid7(created_ms)
+    thread_id = uuid7(created_ms) if thread_id is None else require_id(thread_id, "thread id")
     lines = list(build(thread_id))
     meta = {
         "session_id": thread_id,
