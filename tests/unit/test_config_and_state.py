@@ -124,7 +124,8 @@ def test_activity_log(tmp_path: Path, monkeypatch):
     assert other.read_text() == "not the log" and log.path.stat().st_nlink == 1
     log.path.unlink()
     os.mkfifo(log.path)  # a named pipe: opening it to write would wait for a reader
-    done = threading.Thread(target=log.write, args=("g", "sync", "after the pipe"))
+    # daemon: a regression that blocks fails this test instead of holding pytest open
+    done = threading.Thread(target=log.write, args=("g", "sync", "after the pipe"), daemon=True)
     done.start()
     done.join(5)
     assert not done.is_alive() and log.path.is_file()
