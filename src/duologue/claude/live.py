@@ -18,6 +18,7 @@ from pathlib import Path
 
 REGISTRY = "sessions"
 RESUME_FLAGS = ("--resume", "-r", "--session-id")
+# ps cuts command lines to the terminal's width, 80 columns when piped; -ww lifts the limit.
 UNKNOWN = -1  # the process list could not be read: the session may be open
 
 
@@ -47,7 +48,7 @@ def _is_claude(pid: int) -> bool:
     """Whether ``pid`` is still a Claude Code process (a stale entry's pid can be reused)."""
     try:
         out = subprocess.run(
-            ["ps", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=10
+            ["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=10
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return True  # cannot tell: assume the session is open
@@ -57,7 +58,7 @@ def _is_claude(pid: int) -> bool:
 def _resumed(session_id: str) -> int | None:
     try:
         r = subprocess.run(
-            ["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=10
+            ["ps", "-A", "-ww", "-o", "pid=,args="], capture_output=True, text=True, timeout=10
         )
     except (OSError, subprocess.SubprocessError):
         return UNKNOWN
