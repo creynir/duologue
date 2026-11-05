@@ -1,6 +1,7 @@
 import json
 import os
 import plistlib
+import threading
 from pathlib import Path
 
 import pytest
@@ -121,6 +122,12 @@ def test_activity_log(tmp_path: Path, monkeypatch):
     os.link(other, log.path)  # a hard link: writing through it would change the other file
     log.write("f", "sync", "after the hard link")
     assert other.read_text() == "not the log" and log.path.stat().st_nlink == 1
+    log.path.unlink()
+    os.mkfifo(log.path)  # a named pipe: opening it to write would wait for a reader
+    done = threading.Thread(target=log.write, args=("g", "sync", "after the pipe"))
+    done.start()
+    done.join(5)
+    assert not done.is_alive() and log.path.is_file()
 
 
 # --------------------------------------------------------------------------------------- gate

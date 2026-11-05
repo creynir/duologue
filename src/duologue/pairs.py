@@ -174,14 +174,15 @@ def open_private(path: Path) -> int:
     """Open ``path`` for appending as an owner-only file of this user. A symbolic or hard link
     planted in its place, or anything but such a file, is replaced, never written through (so
     no other file is changed)."""
-    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
+    # O_NONBLOCK: a named pipe planted there must not hang the open before it can be refused.
+    flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW | os.O_NONBLOCK
     for _ in range(2):
         try:
             fd = os.open(path, flags, 0o600)
         except OSError:
-            if not os.path.islink(path):
+            if stat.S_ISREG(os.lstat(path).st_mode):
                 raise
-            os.unlink(path)
+            os.unlink(path)  # a link, or a pipe nobody reads
             continue
         st = os.fstat(fd)
         if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid():
