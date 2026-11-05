@@ -52,6 +52,7 @@ def append_records(
     if there:
         if len(there) == len(ids):
             start, stop = _record_range(path, ids)
+            _same_records(path, start, stop, records)
             return Written(path, start, stop, ids, False)
         raise Blocked(f"{len(there)} of the {len(ids)} records are already in the Claude session")
     if records[0].get("parentUuid") != end.parent_uuid:
@@ -236,6 +237,14 @@ def _record_range(path: Path, ids: Iterable[str]) -> tuple[int, int]:
     if start is None or end is None:
         raise Blocked("the records already in the Claude session are not whole")
     return start, end
+
+
+def _same_records(path: Path, start: int, stop: int, records: list[dict]) -> None:
+    """A retry finds its records by uuid; their messages must be the ones it would write."""
+    there = {ln.record.get("uuid"): ln.record for ln in iter_lines(path, start, stop)}
+    for r in records:
+        if there.get(r["uuid"], {}).get("message") != r.get("message"):
+            raise Blocked("the Claude session holds records with duologue's ids but other content")
 
 
 def _verify(path: Path, intent: Intent) -> None:

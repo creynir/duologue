@@ -1,3 +1,4 @@
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -54,7 +55,7 @@ def test_a_new_file_never_made_is_absent(tmp_path: Path):
 
 def test_intent_end_and_digest(intent: Intent):
     assert intent.end == 14
-    assert len(intent.digest) == 64
+    assert intent.digest == hashlib.sha256(b"two\nthree\n").hexdigest()
 
 
 def test_memory_journal_keeps_the_last_intent(intent: Intent):

@@ -272,6 +272,15 @@ def test_append_twice_writes_once(tmp_path: Path):
     assert not again.written and path.stat().st_size == size
 
 
+def test_a_retry_whose_records_differ_blocks(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    append_records(path, records, journal=MemoryJournal())
+    records[-1]["message"]["content"] = [{"type": "text", "text": "something else"}]
+    with pytest.raises(Blocked, match="other content"):
+        append_records(path, records, journal=MemoryJournal())
+
+
 def test_append_nothing(tmp_path: Path):
     path = write(tmp_path, a_session().records)
     assert not append_records(path, [], journal=MemoryJournal()).written

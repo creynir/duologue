@@ -68,8 +68,12 @@ class AppServer:
         )
         self._lines: queue.Queue[str | None] = queue.Queue()
         self._stderr: collections.deque[str] = collections.deque(maxlen=20)
-        threading.Thread(target=self._pump, daemon=True).start()
-        threading.Thread(target=self._drain, daemon=True).start()
+        self._readers = [
+            threading.Thread(target=self._pump, daemon=True),
+            threading.Thread(target=self._drain, daemon=True),
+        ]
+        for reader in self._readers:
+            reader.start()
         self._next_id = 0
         try:
             self.request(
@@ -159,6 +163,12 @@ class AppServer:
             except subprocess.TimeoutExpired:
                 self._proc.kill()
                 self._proc.wait()
+        for reader in self._readers:  # they end with the process's output
+            reader.join(5)
+        for stream in (self._proc.stdout, self._proc.stderr):
+            with contextlib.suppress(OSError, ValueError):
+                if stream is not None:
+                    stream.close()
 
     def __enter__(self) -> AppServer:
         return self

@@ -213,6 +213,15 @@ def migrate(thread_id: str) -> str:
     path = rollout(thread_id)
     if path is None:
         return "not_found"
+    held = LOCKS / f"{thread_id}.lock"
+    if held.exists():  # Codex skips a thread another writer has loaded
+        fd = os.open(held, os.O_RDWR)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            return "skipped_busy"
+        finally:
+            os.close(fd)
     lines = [json.loads(x) for x in path.read_text().splitlines() if x.strip()]
     meta = lines[0].get("payload") or {}
     if meta.get("history_mode") == "paginated":

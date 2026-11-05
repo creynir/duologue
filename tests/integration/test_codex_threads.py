@@ -183,6 +183,12 @@ def test_a_legacy_thread_is_converted_first(codex, tmp_path):
     assert list(codex.index(THREAD).turns) == ["turn-1", *done.turns]
 
 
+def test_a_legacy_thread_open_elsewhere_is_not_converted(codex, tmp_path, holder):
+    path = write_rollout(codex.home, THREAD, codex_turn("turn-1"), history_mode="legacy")
+    assert codex.migrate(THREAD) == "skipped_busy"
+    assert '"history_mode":"legacy"' in path.read_text().splitlines()[0]
+
+
 def test_a_missing_thread_blocks(codex, tmp_path):
     with pytest.raises(Blocked, match="no rollout file"):
         append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())

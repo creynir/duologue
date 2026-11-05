@@ -43,9 +43,10 @@ def find_rollout(codex_home: Path, thread_id: str, sqlite: Path | None = None) -
         if base.is_dir():
             found += base.rglob(f"rollout-*-{thread_id}.jsonl")
             found += base.rglob(f"rollout-*-{thread_id}.jsonl.zst")
-    stamped = [(_mtime(p), p) for p in found]
-    stamped = [(t, p) for t, p in stamped if t is not None]  # Codex may move one meanwhile
-    return max(stamped)[1] if stamped else None
+    # A readable copy wins over a compressed one, then the newest; Codex may move one meanwhile.
+    stamped = [(not is_compressed(p), _mtime(p), p) for p in found]
+    stamped = [(plain, t, p) for plain, t, p in stamped if t is not None]
+    return max(stamped)[2] if stamped else None
 
 
 def _mtime(path: Path) -> float | None:

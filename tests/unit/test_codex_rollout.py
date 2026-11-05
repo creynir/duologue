@@ -49,6 +49,15 @@ def test_find_rollout_in_the_archive_and_compressed(tmp_path: Path):
     assert find_rollout(tmp_path, THREAD) == path
 
 
+def test_find_rollout_prefers_a_readable_copy_to_a_compressed_one(tmp_path: Path):
+    path = write_rollout(tmp_path, THREAD, one_turn())
+    zst = path.with_name(path.name + ".zst")
+    zst.write_bytes(b"")
+    later = time.time() + 60
+    os.utime(zst, (later, later))
+    assert find_rollout(tmp_path, THREAD) == path
+
+
 def test_find_rollout_prefers_the_path_codex_records(tmp_path: Path):
     write_rollout(tmp_path, THREAD, one_turn())
     elsewhere = tmp_path / "elsewhere.jsonl"

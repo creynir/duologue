@@ -61,6 +61,9 @@ class WriterLock:
             except BlockingIOError:
                 os.close(fd)
                 return False
+            except BaseException:
+                os.close(fd)
+                raise
             self._fd = fd
         return True
 
