@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import json
-import os
 import stat
 import sys
 from pathlib import Path
@@ -58,7 +57,3 @@ def write_rollout(
         lines.append(dict(r, ordinal=n) if history_mode == "paginated" else r)
     path.write_text("".join(json.dumps(x, separators=(",", ":")) + "\n" for x in lines))
     return path
-
-
-def environment_without(*names: str) -> dict[str, str]:
-    return {k: v for k, v in os.environ.items() if k not in names}
