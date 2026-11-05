@@ -19,6 +19,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 
 from duologue.translate.common import (
+    LOCAL_COMMAND,
     MARK,
     epoch_ms,
     is_note,
@@ -62,6 +63,8 @@ def conversation(records: Iterable[dict]) -> list[dict]:
         # into its first message: none of it travels back, or that message would arrive twice.
         if _has_note((r.get("message") or {}).get("content")):
             continue
+        if _is_local_command(r):  # app UI, not conversation: never shown to the other model
+            continue
         out.append(r)
     return out
 
@@ -72,6 +75,8 @@ def is_user_input(record: dict) -> bool:
         return False
     if record.get("isMeta") or record.get("isCompactSummary"):
         return False
+    if _is_local_command(record):
+        return False
     content = (record.get("message") or {}).get("content")
     if isinstance(content, str):
         return bool(content.strip()) and not is_note(content)
@@ -79,6 +84,14 @@ def is_user_input(record: dict) -> bool:
         kinds = {b.get("type") for b in content if isinstance(b, dict)}
         return "tool_result" not in kinds and "text" in kinds and not _has_note(content)
     return False
+
+
+def _is_local_command(record: dict) -> bool:
+    if record.get("type") != "user":
+        return False
+    content = (record.get("message") or {}).get("content")
+    text = content if isinstance(content, str) else text_of(content)
+    return text.lstrip().startswith(LOCAL_COMMAND)
 
 
 def has_content(records: Iterable[dict]) -> bool:

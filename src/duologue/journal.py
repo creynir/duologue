@@ -61,7 +61,8 @@ class MemoryJournal:
 def tail_state(path: Path, intent: Intent) -> str:
     """Where an interrupted write stands in ``path``:
 
-    - ``"absent"``: nothing of it is there (for a new file: the file is not there);
+    - ``"absent"``: nothing of it is there (for a new file: the file is not there; with a
+      ``before`` digest that still matches, another writer's line may follow ``base``);
     - ``"partial"``: a cut-off start of it ends the file;
     - ``"complete"``: all of it, and the file ends with it;
     - ``"followed"``: all of it, and an app wrote more after it;
@@ -88,6 +89,12 @@ def tail_state(path: Path, intent: Intent) -> str:
         return "partial"
     if written.startswith(intent.data):
         return "followed"
+    first = intent.data.split(b"\n", 1)[0]
+    n = min(len(first), len(written))
+    if intent.before and written[:n] != first[:n]:
+        # The file before base is as it was, and what follows base differs from our first line:
+        # our write never landed there, or was taken back before an app wrote its own.
+        return "absent"
     return "changed"
 
 

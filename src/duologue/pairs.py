@@ -52,6 +52,7 @@ class Pending:
     ids: list[str]
     claude: dict  # the cursors to set once the write is confirmed (end and anchor)
     codex: dict
+    before: str = ""  # sha256 of the file's first ``base`` bytes
 
 
 @dataclass
@@ -70,6 +71,7 @@ class Pair:
     last_sync: str | None = None
     copied: dict = field(default_factory=lambda: {"to_codex": 0, "to_claude": 0})  # turns
     seen: list = field(default_factory=list)  # file sizes and mtimes when last up to date
+    checked: dict = field(default_factory=dict)  # side -> file stamp its cursor last matched
 
     @property
     def key(self) -> str:
@@ -119,7 +121,7 @@ class Store:
 
 
 def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
     try:
@@ -143,7 +145,7 @@ def write_atomic(path: Path, data: bytes, mode: int = 0o600) -> None:
 def exclusive(lock_file: Path, wait: float = 60.0) -> Iterator[None]:
     """One duologue command at a time changes the state: the timer's pass and a command typed
     meanwhile take turns."""
-    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     fd = os.open(lock_file, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         deadline = time.monotonic() + wait
@@ -167,7 +169,7 @@ class ActivityLog:
         self.path = Path(path)
 
     def write(self, pair: str | None, event: str, text: str) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         with contextlib.suppress(FileNotFoundError):
             if self.path.stat().st_size > LOG_LIMIT:
                 os.replace(self.path, self.path.with_name(self.path.name + ".1"))

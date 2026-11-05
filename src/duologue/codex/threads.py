@@ -160,11 +160,19 @@ def encode(lines: Sequence[RolloutLine], first_ordinal: int) -> bytes:
 
 # ------------------------------------------------------------------------------------- append
 def append_turns(
-    codex: Codex, thread_id: str, lines: Sequence[RolloutLine], *, journal: Journal
+    codex: Codex,
+    thread_id: str,
+    lines: Sequence[RolloutLine],
+    *,
+    journal: Journal,
+    expect_size: int | None = None,
 ) -> Appended:
     """Append ``lines`` (whole turns from the translator) to the thread and have Codex index
     them. Raises :class:`Wait` when the thread is busy and :class:`Blocked` when it needs a
-    person; see the module docstring for what an exception after the write means."""
+    person; see the module docstring for what an exception after the write means.
+
+    ``expect_size`` is the size the caller read the rollout at: when the file has grown since
+    (a turn finished meanwhile), nothing is written, so the caller can look at it first."""
     require_id(thread_id, "thread id")
     turns = turn_ids(lines)
     if len(set(turns)) != len(turns):
@@ -197,7 +205,7 @@ def append_turns(
         )
     data = encode(lines, index.next_ordinal or 0)
     with _writer(codex, thread_id):
-        if path.stat().st_size != size:
+        if path.stat().st_size != size or expect_size not in (None, size):
             raise Wait("the Codex thread changed while duologue prepared its turns")
         intent = Intent("codex", path, size, data, turns, prefix_hash(path, size))
         journal.begin(intent)
@@ -295,14 +303,17 @@ def create_thread(
     journal: Journal,
     source: str = "vscode",
     created_ms: int | None = None,
+    thread_id: str | None = None,
 ) -> tuple[str, Appended]:
     """Create a paginated thread holding the turns ``build(thread_id)`` returns, and have Codex
-    index it. ``source`` is how the thread is listed; the Codex app lists ``vscode`` threads."""
+    index it. ``source`` is how the thread is listed; the Codex app lists ``vscode`` threads.
+    ``thread_id`` (a UUIDv7, see :func:`~duologue.codex.rollout.uuid7`) lets the caller record
+    the thread before it exists."""
     provider = model_provider(codex.home)
     if provider is None:
         raise Blocked("Codex's config.toml could not be read, so its model provider is unknown")
     created_ms = int(time.time() * 1000) if created_ms is None else created_ms
-    thread_id = uuid7(created_ms)
+    thread_id = require_id(thread_id, "thread id") if thread_id else uuid7(created_ms)
     lines = list(build(thread_id))
     meta = {
         "session_id": thread_id,

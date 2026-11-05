@@ -128,6 +128,22 @@ def pair(homes):
     return SimpleNamespace(claude=claude, codex=codex, name=p.name)
 
 
+def prompts(records: list[dict]) -> list[str]:
+    """The prompts in Claude records: the user's text blocks, without duologue's notes."""
+    out = []
+    for r in records:
+        if r.get("type") != "user":
+            continue
+        content = r["message"]["content"]
+        blocks = content if isinstance(content, list) else [{"type": "text", "text": content}]
+        out += [
+            b["text"]
+            for b in blocks
+            if b.get("type") == "text" and not b["text"].startswith(f"[{MARK}")
+        ]
+    return out
+
+
 def sync(name: str, force: bool = True):
     e = engine()
     return e.sync(e.pairs[name], force=force), e.pairs[name]
@@ -413,3 +429,281 @@ def test_a_missing_side_blocks(pair):
     outcome, p = sync(pair.name)
     assert outcome.state == "blocked" and "not on this machine" in outcome.text
     assert p.blocked
+
+
+# ------------------------------------------------------------- what counts as new content
+def test_bookkeeping_records_never_block_or_count_as_content(pair):
+    # Claude Code 2.1.318 writes api-request-blob records (a "message", no uuid) and, on every
+    # resume, titles and other bookkeeping: none of it is conversation.
+    with open(pair.claude.path, "ab") as fh:
+        fh.write(
+            encode(
+                [
+                    {"type": "api-request-blob", "hash": "h", "message": {"role": "system"}},
+                    {"type": "custom-title", "customTitle": "t", "sessionId": SESSION},
+                    {"type": "last-prompt", "lastPrompt": "x", "sessionId": SESSION},
+                ]
+            )
+        )
+    pair.codex.turn("from codex", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "Codex turn" in outcome.text  # no conflict, no block
+
+
+def test_local_slash_commands_are_not_prompts(pair):
+    pair.claude.t.user("<command-name>/cost</command-name>")
+    pair.claude.t.user("<local-command-stdout>Total cost: $0.00</local-command-stdout>")
+    pair.claude.save()
+    turns = pair.codex.turn_ids()
+    assert sync(pair.name)[0].state == "idle"  # nothing for Codex
+    assert pair.codex.turn_ids() == turns
+    pair.codex.turn("from codex", "ok")
+    assert sync(pair.name)[0].state == "synced"  # and no false conflict
+
+
+# ---------------------------------------------------------------- the unforced timer path
+def test_an_unforced_pass_still_notices_new_turns(pair):
+    assert sync(pair.name, force=False)[0].state == "idle"
+    pair.claude.turn("second", "ok")
+    assert sync(pair.name, force=False)[0].state == "synced"
+    pair.codex.turn("from codex", "ok")
+    assert sync(pair.name, force=False)[0].state == "synced"
+    assert sync(pair.name, force=False)[0].state == "idle"
+
+
+def test_a_finished_claude_turn_waits_for_the_quiet_time(pair, homes):
+    config_file = homes.duo / "config.toml"
+    config_file.write_text(
+        config_file.read_text().replace("quiet_seconds = 0", "quiet_seconds = 3600")
+    )
+    pair.claude.turn("second", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "just ended" in outcome.text
+
+
+def test_a_finished_turn_travels_while_claude_stays_open(pair, claude_running):
+    pair.claude.turn("second", "ok")  # Claude Code still runs, but its turn has ended
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+
+
+# ------------------------------------------------------------------ only finished turns
+def test_only_finished_codex_turns_travel(pair):
+    first = pair.codex._turn("finished one", "done")
+    second = pair.codex._turn("still running", "later")
+    ordinal = pair.codex.codex.index(THREAD).next_ordinal
+    with open(pair.codex.path, "a") as fh:
+        for k, r in enumerate(first + second[:2]):  # the second turn has started, not ended
+            fh.write(json.dumps(dict(r, ordinal=ordinal + k), separators=(",", ":")) + "\n")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn" in outcome.text
+    transcript = json.dumps(pair.claude.records())
+    assert "finished one" in transcript and "still running" not in transcript
+    with open(pair.codex.path, "a") as fh:
+        for k, r in enumerate(second[2:]):
+            fh.write(json.dumps(dict(r, ordinal=ordinal + 7 + k), separators=(",", ":")) + "\n")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn" in outcome.text
+    asked = prompts(pair.claude.records())
+    assert asked.count("still running") == 1 and asked.count("finished one") == 1
+
+
+# ----------------------------------------------------------------- crashes and recovery
+class Crash(BaseException):
+    """What a killed process looks like to the code: nothing catches it."""
+
+
+def crash_in(monkeypatch, module, name):
+    def boom(*args, **kwargs):
+        raise Crash
+
+    monkeypatch.setattr(module, name, boom)
+
+
+def test_a_crash_before_the_codex_bytes_land_is_undone_then_copied_once(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    real = threads._write
+    crash_in(monkeypatch, threads, "_write")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    assert engine().pairs[pair.name].pending is not None  # durable before the write
+    monkeypatch.setattr(threads, "_write", real)
+    before = len(pair.codex.turn_ids())
+    outcome, p = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    assert len(pair.codex.turn_ids()) == before + 1 and p.pending is None
+    assert any("was undone" in x["text"] for x in ActivityLog(engine().config.log_file).tail(5))
+
+
+def test_a_crash_after_the_claude_bytes_land_is_confirmed_and_never_echoed(pair, monkeypatch):
+    from duologue.claude import sessions
+
+    pair.codex.turn("from codex", "ok")
+    real = sessions._verify
+    crash_in(monkeypatch, sessions, "_verify")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    monkeypatch.setattr(sessions, "_verify", real)
+    turns = pair.codex.turn_ids()
+    outcome, p = sync(pair.name)
+    assert p.pending is None and outcome.state == "idle", outcome.text
+    assert pair.codex.turn_ids() == turns  # duologue's own records did not travel back
+    assert prompts(pair.claude.records()).count("from codex") == 1
+
+
+def test_a_lost_journal_is_settled_by_the_ids_it_wrote(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    real = threads.finish
+
+    def finish_then_crash(*args):
+        real(*args)
+        raise Crash
+
+    monkeypatch.setattr(threads, "finish", finish_then_crash)
+    with pytest.raises(Crash):
+        sync(pair.name)
+    monkeypatch.setattr(threads, "finish", real)
+    e = engine()
+    e.journal_file(e.pairs[pair.name]).unlink()  # stopped just as it forgot the bytes
+    outcome, p = sync(pair.name)
+    assert p.pending is None and outcome.state == "idle", outcome.text
+
+
+def test_a_damaged_journal_blocks_and_release_takes_the_files_as_they_are(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    real = threads._write
+    crash_in(monkeypatch, threads, "_write")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    monkeypatch.setattr(threads, "_write", real)
+    e = engine()
+    e.journal_file(e.pairs[pair.name]).write_bytes(b"garbage")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked" and "missing or damaged" in outcome.text
+    e = engine()
+    said = linking.release(e, e.pairs[pair.name])
+    assert "taken as it stands" in said
+    assert engine().pairs[pair.name].pending is None
+    pair.claude.turn("third", "ok")
+    assert sync(pair.name)[0].state != "blocked"
+
+
+def test_claude_opening_the_session_during_a_write_is_undone_and_retried(pair, monkeypatch):
+    pair.codex.turn("from codex", "ok")
+    answers = iter([None, None, 4242])  # free before the write, open right after it
+    monkeypatch.setattr("duologue.engine.live_pid", lambda *a: next(answers, None))
+    outcome, p = sync(pair.name)
+    assert outcome.state == "waiting" and "opened the session" in outcome.text
+    pair.claude.turn("typed meanwhile", "ok")  # Claude writes where duologue's records were
+    monkeypatch.setattr("duologue.engine.live_pid", lambda *a: None)
+    outcome, p = sync(pair.name)
+    assert p.pending is None and outcome.state in ("conflict", "synced"), outcome.text
+
+
+# -------------------------------------------------------------------- rewrites, again
+def test_a_codex_rewrite_after_syncs_replays_nothing(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"  # the cursor's anchor is now a synced turn
+    text = pair.codex.path.read_text()
+    pair.codex.path.write_text(text.replace('"cwd":"/work/project"', '"cwd":"/work/project/."', 1))
+    pair.codex.turn("two", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn" in outcome.text
+    asked = prompts(pair.claude.records())
+    assert asked.count("one") == 1 and asked.count("two") == 1
+
+
+def test_a_codex_rewrite_that_loses_the_synced_turn_blocks(pair):
+    pair.codex.turn("one", "ok")
+    sync(pair.name)
+    lines = pair.codex.path.read_text().splitlines()
+    pair.codex.path.write_text("\n".join(lines[:3]) + "\n")  # the synced turns are gone
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked" and "changed before" in outcome.text
+
+
+# --------------------------------------------------------------------- linking, again
+def test_linking_during_a_running_claude_turn_copies_that_turn_later(homes, claude_running):
+    claude = Claude(homes.claude)
+    claude.turn("first", "done")
+    claude.t.user("in progress")
+    claude.save()
+    CodexThread(homes.codex, homes.bin)
+    e = engine()
+    p, _ = linking.link(e, claude=SESSION, codex=THREAD, name="x", cwd=CWD)
+    claude.t.assistant("now done")
+    claude.save()
+    claude_running.stdin.close()
+    claude_running.wait(10)
+    outcome, _ = sync("x")
+    assert outcome.state == "synced"
+    rollout = Codex(homes.codex, homes.bin).rollout(THREAD).read_text()
+    assert "in progress" in rollout and "now done" in rollout
+
+
+def test_link_a_large_codex_thread_keeps_the_newest_turns_with_a_note(homes):
+    codex = CodexThread(homes.codex, homes.bin)
+    for n in range(4):
+        codex.turn(f"step {n} " + "y" * 400, "ok")
+    with open(homes.duo / "config.toml", "a") as fh:
+        fh.write("copy_budget = 1500\n")
+    e = engine()
+    p, said = linking.link(e, claude=None, codex=THREAD, name="big", cwd=CWD)
+    assert "older turn(s) left out" in said
+    text = find_transcript(homes.claude, p.claude).read_text()
+    assert "earlier turn(s) are not copied here" in text and "step 3" in text
+    assert "step 0" not in text
+
+
+def test_link_last_picks_the_newest_in_the_folder(homes):
+    import os
+    import time
+
+    old = (
+        homes.claude
+        / "projects"
+        / project_folder(CWD)
+        / "00000000-0000-4000-8000-000000000001.jsonl"
+    )
+    Claude(homes.claude).turn("hi", "hello")
+    old.write_text(Claude(homes.claude).path.read_text())
+    past = time.time() - 600
+    os.utime(old, (past, past))
+    e = engine()
+    assert linking.find_claude(e, "last", CWD) == SESSION
+
+
+def test_an_interrupted_link_is_finished_by_the_next_sync(homes, monkeypatch):
+    from duologue.codex import threads
+
+    claude = Claude(homes.claude)
+    claude.turn("build it", "built")
+    real = threads.finish
+    crash_in(monkeypatch, threads, "finish")
+    with pytest.raises(Crash):
+        linking.link(engine(), claude=SESSION, codex=None, name="half", cwd=CWD)
+    monkeypatch.setattr(threads, "finish", real)
+    p = engine().pairs["half"]
+    assert p.pending is not None  # recorded before the thread was written
+    outcome, p = sync("half")
+    assert p.pending is None and outcome.state == "idle", outcome.text
+    assert len(Codex(homes.codex, homes.bin).index(p.codex).turns) == 1
+    with pytest.raises(linking.LinkError, match="already linked"):
+        linking.link(engine(), claude=SESSION, codex=None, name=None, cwd=CWD)
+
+
+def test_the_format_alert_goes_out_once(pair, homes, monkeypatch):
+    sent = homes.duo / "sent.txt"
+    with open(homes.duo / "config.toml", "a") as fh:
+        fh.write(f'notify = ["/bin/sh", "-c", "echo \\"$0\\" >> {sent}"]\n')
+    monkeypatch.setenv("FAKE_CODEX_SCHEMA", "changed")
+    pair.claude.turn("second", "ok")
+    for _ in range(3):  # three service passes: three processes, one alert
+        assert sync(pair.name)[0].state == "waiting"
+    assert sent.read_text().count("has not been tested") == 1

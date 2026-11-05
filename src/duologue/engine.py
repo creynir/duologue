@@ -30,13 +30,14 @@ from pathlib import Path
 
 from duologue.claude import sessions as claude_sessions
 from duologue.claude.live import live_pid
-from duologue.claude.transcript import find_transcript, settled, tail
+from duologue.claude.transcript import find_transcript, is_typed, settled, tail
+from duologue.codex import lock
 from duologue.codex import threads as codex_threads
 from duologue.codex.rollout import is_compressed, session_meta, turn_ends
-from duologue.codex.rpc import AppServerError
+from duologue.codex.rpc import AppServerError, daemon_running
 from duologue.codex.threads import Codex
 from duologue.config import Config
-from duologue.gate import CodexFormat, codex_format
+from duologue.gate import CodexFormat, cached_format
 from duologue.journal import Blocked, Intent, Wait, prefix_hash
 from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import ActivityLog, Cursor, Pair, Pending, Store, now_iso, write_atomic
@@ -48,7 +49,7 @@ CONFLICT = (
     "you wrote in both Claude and Codex since the last sync, so nothing was copied; keep one "
     'side\'s new turns with: duologue resolve "{name}" --keep claude (or --keep codex)'
 )
-KNOWN_RECORD_TYPES = ("user", "assistant")  # the only record types that carry a message
+KNOWN_RECORD_TYPES = ("user", "assistant")  # the only chain records that carry a message
 TRANSIENT = (AppServerError, OSError, TimeoutError, sqlite3.Error, subprocess.SubprocessError)
 
 
@@ -70,7 +71,8 @@ class Engine:
 
     # -------------------------------------------------------------------------------- a pass
     def sync(self, pair: Pair, force: bool = False) -> Outcome:
-        """One pass over ``pair``; saves the state and reports what happened."""
+        """One pass over ``pair``; saves the state and reports what happened. Nothing that goes
+        wrong with one pair stops the pass over the others."""
         if pair.hold:
             return Outcome("held", f"on hold: {pair.hold}")
         if pair.blocked:
@@ -84,7 +86,7 @@ class Engine:
         except Blocked as e:
             self.block(pair, str(e))
             outcome = Outcome("blocked", str(e))
-        except TRANSIENT as e:
+        except Exception as e:  # noqa: BLE001 - one pair's failure must not end the pass
             outcome = Outcome("error", f"{type(e).__name__}: {e}")
             self.log.write(pair.name, "error", outcome.text)
         if outcome.state != "idle":
@@ -100,36 +102,45 @@ class Engine:
         seen = [_stamp(cpath), _stamp(xpath)]
         if not force and pair.seen == seen:
             return Outcome("idle", "up to date")
-        ccur = self.claude_cursor(pair, cpath)
-        xcur = self.codex_cursor(pair, xpath)
-        clines = read_lines(cpath, ccur.end)
-        xall = read_lines(xpath, xcur.end)
+        ccur = self.claude_cursor(pair, cpath, seen[0])
+        xcur = self.codex_cursor(pair, xpath, seen[1])
+        csize, xsize = seen[0][1], seen[1][1]  # what this pass reads; a write expects them
+        clines = read_lines(cpath, ccur.end, csize)
+        xall = read_lines(xpath, xcur.end, xsize)
         ends = turn_ends(xall)
         xlines = [ln for ln in xall if ln.end <= ends[-1][1]] if ends else []
         _check_record_types(clines)
-        claude_new = has_content(ln.record for ln in clines)
-        codex_steps = self.codex_steps(pair, xlines)
-        if claude_new and codex_steps:
-            pair.conflict = True
-            text = CONFLICT.format(name=pair.name)
-            self.log.write(pair.name, "conflict", text)
-            self.notify(f'duologue: "{pair.name}": {text}')
-            return Outcome("conflict", text)
-        if claude_new:
-            return self.to_codex(pair, cpath, clines)
-        if codex_steps:
-            return self.to_claude(pair, cpath, xlines, codex_steps)
+        if has_content(ln.record for ln in clines):
+            if self.codex_steps(pair, xlines):
+                pair.conflict = True
+                text = CONFLICT.format(name=pair.name)
+                self.log.write(pair.name, "conflict", text)
+                self.notify(f'duologue: "{_printable(pair.name)}": {text}')
+                return Outcome("conflict", text)
+            return self.to_codex(pair, cpath, clines, xsize)
+        if xlines:
+            live = self.claude_live(pair)
+            if live() is not None:  # before translating: a waiting pass should cost nothing
+                raise Wait(
+                    "the Claude session is open; Codex's turns are copied to it once it closes"
+                )
+            steps = self.codex_steps(pair, xlines)
+            if steps:
+                return self.to_claude(pair, cpath, xlines, steps, csize, live)
         pair.seen = seen
         return Outcome("idle", "up to date")
 
     # ---------------------------------------------------------------------------- directions
-    def to_codex(self, pair: Pair, cpath: Path, clines: list[Line]) -> Outcome:
+    def to_codex(self, pair: Pair, cpath: Path, clines: list[Line], xsize: int) -> Outcome:
         if not settled(clines) and not self.claude_stopped(pair, cpath):
             raise Wait("Claude is still working on its turn")
         if time.time() - cpath.stat().st_mtime < self.config.quiet_seconds:
             raise Wait("Claude's turn just ended; it is copied once the session is quiet")
+        if lock.is_held(self.codex.home, pair.codex) and not daemon_running(self.codex.home):
+            raise Wait("the thread is open in Codex")  # checked first: it is the cheap check
         self.codex_gate()
-        cwd = tail(iter_lines(cpath)).cwd or session_meta(self.codex_path(pair)).get("cwd", "")
+        cwd = next((ln.record["cwd"] for ln in reversed(clines) if ln.record.get("cwd")), "")
+        cwd = cwd or session_meta(self.codex_path(pair)).get("cwd", "")
         lines = claude_to_codex(
             [ln.record for ln in clines],
             thread_id=pair.codex,
@@ -137,9 +148,14 @@ class Engine:
             outputs=self.outputs,
             default_cwd=cwd,
         )
-        after_claude = {"end": clines[-1].end, "anchor": _last_uuid(clines)}
+        after_claude = {
+            "end": clines[-1].end,
+            "anchor": _last_uuid(clines) or pair.claude_cursor.anchor,
+        }
         journal = PairJournal(self, pair, claude=after_claude, codex=None)
-        done = codex_threads.append_turns(self.codex, pair.codex, lines, journal=journal)
+        done = codex_threads.append_turns(
+            self.codex, pair.codex, lines, journal=journal, expect_size=xsize
+        )
         self.confirm(pair, after_claude, {"end": done.end, "anchor": done.turns[-1]})
         pair.copied["to_codex"] += len(done.turns)
         text = f"copied {len(done.turns)} Claude turn(s) to Codex"
@@ -147,11 +163,14 @@ class Engine:
         return Outcome("synced", text)
 
     def to_claude(
-        self, pair: Pair, cpath: Path, xlines: list[Line], steps: list[ClaudeStep]
+        self,
+        pair: Pair,
+        cpath: Path,
+        xlines: list[Line],
+        steps: list[ClaudeStep],
+        csize: int,
+        live,
     ) -> Outcome:
-        live = self.claude_live(pair)
-        if live() is not None:
-            raise Wait("the Claude session is open; Codex's turns are copied to it once it closes")
         t = tail(iter_lines(cpath))
         records = claude_records(
             steps,
@@ -168,7 +187,9 @@ class Engine:
         turns = [turn for turn, _ in turn_ends(xlines)]
         after_codex = {"end": xlines[-1].end, "anchor": turns[-1] if turns else None}
         journal = PairJournal(self, pair, claude=None, codex=after_codex)
-        done = claude_sessions.append_records(cpath, records, journal=journal, live=live)
+        done = claude_sessions.append_records(
+            cpath, records, journal=journal, live=live, expect_size=csize
+        )
         self.confirm(pair, {"end": done.end, "anchor": done.uuids[-1]}, after_codex)
         pair.copied["to_claude"] += len(turns)
         text = f"copied {len(turns)} Codex turn(s) to Claude"
@@ -176,21 +197,21 @@ class Engine:
         return Outcome("synced", text)
 
     # ------------------------------------------------------------------------------- cursors
-    def claude_cursor(self, pair: Pair, cpath: Path) -> Cursor:
+    def claude_cursor(self, pair: Pair, cpath: Path, stamp: list | None = None) -> Cursor:
         cur = pair.claude_cursor
-        if _matches(cpath, cur):
+        if self._still_matches("claude", pair, cpath, cur, stamp):
             return cur
         raise Blocked(
             "the Claude transcript changed before the point already synced; check it, then "
             "run duologue release to sync on from where it stands"
         )
 
-    def codex_cursor(self, pair: Pair, xpath: Path) -> Cursor:
+    def codex_cursor(self, pair: Pair, xpath: Path, stamp: list | None = None) -> Cursor:
         cur = pair.codex_cursor
-        if _matches(xpath, cur):
+        if self._still_matches("codex", pair, xpath, cur, stamp):
             return cur
         if cur.anchor:  # Codex rewrites a whole thread when it converts it: find the turn again
-            hits = [end for turn, end in turn_ends(read_lines(xpath)) if turn == cur.anchor]
+            hits = [end for turn, end in turn_ends(iter_lines(xpath)) if turn == cur.anchor]
             if hits:
                 found = Cursor(hits[-1], prefix_hash(xpath, hits[-1]), cur.anchor)
                 pair.codex_cursor = found
@@ -205,19 +226,33 @@ class Engine:
             "duologue release to sync on from where it stands"
         )
 
+    def _still_matches(
+        self, side: str, pair: Pair, path: Path, cur: Cursor, stamp: list | None
+    ) -> bool:
+        """Whether the file still holds what the cursor hashed. A side whose file is unchanged
+        since its cursor last matched is not hashed again."""
+        if stamp is not None and pair.checked.get(side) == stamp:
+            return True
+        if not _matches(path, cur):
+            return False
+        if stamp is not None:
+            pair.checked[side] = stamp
+        return True
+
     def confirm(self, pair: Pair, claude: dict | None, codex: dict | None) -> None:
-        """Move the cursors past a confirmed write, and forget its intent."""
+        """Move the cursors past a confirmed write, forget its intent, and save."""
         cpath, xpath = self.paths(pair)
-        if claude is not None:
+        if claude:
             pair.claude_cursor = Cursor(
                 claude["end"], prefix_hash(cpath, claude["end"]), claude["anchor"]
             )
-        if codex is not None:
+        if codex:
             pair.codex_cursor = Cursor(
                 codex["end"], prefix_hash(xpath, codex["end"]), codex["anchor"]
             )
-        self.forget_pending(pair)
+        pair.checked = {}
         pair.last_sync = now_iso()
+        self.forget_pending(pair)
 
     def settle(self, pair: Pair) -> None:
         """Settle an append an earlier pass did not confirm."""
@@ -226,25 +261,74 @@ class Engine:
         try:
             data = self.journal_file(pair).read_bytes()
         except FileNotFoundError:
-            raise Blocked("the journal of an interrupted write is missing") from None
-        if hashlib.sha256(data).hexdigest() != p.sha256:
-            raise Blocked("the journal of an interrupted write does not match its record")
-        intent = Intent(p.side, Path(p.path), p.base, data, tuple(p.ids))
+            data = None
+        if data is None or hashlib.sha256(data).hexdigest() != p.sha256:
+            # Its bytes are gone (duologue stopped just as it finished): the ids tell.
+            if self._ids_present(pair, p):
+                self.confirm(pair, p.claude, p.codex)
+                return
+            raise Blocked("the record of an interrupted write is missing or damaged")
+        path = Path(p.path)
+        if p.side == "claude":  # EnterWorktree moves a transcript: follow it
+            path = find_transcript(self.config.claude_home, pair.claude) or path
+        intent = Intent(p.side, path, p.base, data, tuple(p.ids), p.before)
         if p.side == "codex":
             done = codex_threads.recover(self.codex, pair.codex, intent)
         else:
-            done = claude_sessions.recover(Path(p.path), intent)
+            done = claude_sessions.recover(path, intent)
         if done:
-            self.confirm(pair, p.claude or None, p.codex or None)
+            self.confirm(pair, p.claude, p.codex)
             self.log.write(pair.name, "recovered", f"an interrupted write to {p.side} is complete")
-        else:
-            self.forget_pending(pair)
-            self.log.write(pair.name, "recovered", f"an interrupted write to {p.side} was undone")
-        self.save()
+            return
+        self.forget_pending(pair)
+        self.log.write(pair.name, "recovered", f"an interrupted write to {p.side} was undone")
+        if p.base == 0:  # a side `link` was creating: nothing of it was ever written
+            raise Blocked(
+                f"creating the {p.side.capitalize()} side was interrupted before anything was "
+                "written; unlink this pair and link again"
+            )
+
+    def accept_pending(self, pair: Pair) -> None:
+        """A person checked an interrupted write and releases the pair: take each side as it is
+        now. A cursor the write would have reached is kept when its file still reaches it."""
+        p = pair.pending
+        if p is None:
+            return
+        cpath, xpath = self.paths(pair)
+        for target, path, start in (
+            (p.claude, cpath, claude_start),
+            (p.codex, xpath, codex_start),
+        ):
+            if not target:
+                continue
+            if target["end"] <= path.stat().st_size:
+                cur = Cursor(target["end"], prefix_hash(path, target["end"]), target["anchor"])
+            else:
+                cur = start(path)
+            if path == cpath:
+                pair.claude_cursor = cur
+            else:
+                pair.codex_cursor = cur
+        self.log.write(pair.name, "release", "an interrupted write was accepted as it stands")
+        pair.checked = {}
+        self.forget_pending(pair)
 
     def forget_pending(self, pair: Pair) -> None:
+        """Drop the intent: save the state first, then remove its bytes, so a stop between the
+        two never leaves a record pointing at bytes that are gone."""
         pair.pending = None
+        self.save()
         self.journal_file(pair).unlink(missing_ok=True)
+
+    def _ids_present(self, pair: Pair, p: Pending) -> bool:
+        if p.side == "codex":
+            index = self.codex.index(pair.codex)
+            return index.holds(tuple(p.ids), p.base + p.length)
+        cpath = find_transcript(self.config.claude_home, pair.claude)
+        if cpath is None:
+            return False
+        have = {ln.record.get("uuid") for ln in iter_lines(cpath)}
+        return all(u in have for u in p.ids)
 
     # ------------------------------------------------------------------------------- helpers
     def paths(self, pair: Pair) -> tuple[Path, Path]:
@@ -281,9 +365,13 @@ class Engine:
         return quiet and live_pid(self.config.claude_home, pair.claude) is None
 
     def codex_gate(self) -> None:
+        """Refuse to write to a Codex whose item format is untested. The result is kept per
+        Codex version across runs, and its alert is sent once."""
         if self._format is None:
-            self._format = codex_format(self.codex, self.config.allow_untested_codex)
-            if self._format.problem:
+            self._format, first_time = cached_format(
+                self.codex, self.config.allow_untested_codex, self.config.home / "gate.json"
+            )
+            if self._format.problem and first_time:
                 self.notify(f"duologue: {self._format.problem}")
         if self._format.problem:
             raise Wait(self._format.problem)
@@ -295,7 +383,7 @@ class Engine:
     def block(self, pair: Pair, reason: str) -> None:
         pair.blocked = reason
         self.log.write(pair.name, "blocked", reason)
-        self.notify(f'duologue: "{pair.name}" stopped syncing: {reason}')
+        self.notify(f'duologue: "{_printable(pair.name)}" stopped syncing: {reason}')
 
     def notify(self, text: str) -> None:
         if not self.config.notify:
@@ -329,8 +417,48 @@ class PairJournal:
             ids=list(intent.ids),
             claude=written if intent.side == "claude" else (self.claude or {}),
             codex=written if intent.side == "codex" else (self.codex or {}),
+            before=intent.before,
         )
         self.engine.save()
+
+
+# ------------------------------------------------------------------------- starting points
+def claude_start(cpath: Path) -> Cursor:
+    """Where syncing a Claude session starts: its end, or the start of a turn Claude is still
+    working on (that turn is copied once it ends)."""
+    end = anchor = None
+    last_prompt_start = None
+    previous = 0
+    lines = 0
+    for ln in iter_lines(cpath):
+        lines += 1
+        if is_typed(ln.record):
+            last_prompt_start = (previous, anchor)
+        if ln.record.get("uuid"):
+            anchor = ln.record["uuid"]
+        previous = ln.end
+    end = previous
+    if lines and not settled(iter_lines(cpath)) and last_prompt_start is not None:
+        end, anchor = last_prompt_start
+    return Cursor(end, prefix_hash(cpath, end), anchor)
+
+
+def codex_start(xpath: Path) -> Cursor:
+    """Where syncing a Codex thread starts: after its last finished turn."""
+    ends = turn_ends(iter_lines(xpath))
+    if not ends:
+        return Cursor(0, hashlib.sha256(b"").hexdigest(), None)
+    turn, end = ends[-1]
+    return Cursor(end, prefix_hash(xpath, end), turn)
+
+
+def end_cursor(path: Path) -> Cursor:
+    """A cursor at the end of the whole lines of ``path``."""
+    end, anchor = 0, None
+    for ln in iter_lines(path):
+        end = ln.end
+        anchor = ln.record.get("uuid") or anchor
+    return Cursor(end, prefix_hash(path, end), anchor)
 
 
 # ---------------------------------------------------------------------------------- helpers
@@ -344,11 +472,12 @@ def _matches(path: Path, cur: Cursor) -> bool:
 
 
 def _check_record_types(lines: Sequence[Line]) -> None:
-    """Fail closed on a record type duologue does not know that carries a message: Claude Code
-    changed its format, and copying would silently drop what it says."""
+    """Fail closed on a chain record of a type duologue does not know that carries a message:
+    Claude Code changed its format, and copying would silently drop what it says. Records
+    without a uuid (``api-request-blob`` and other bookkeeping) are never conversation."""
     for ln in lines:
         kind = ln.record.get("type")
-        if "message" in ln.record and kind not in KNOWN_RECORD_TYPES:
+        if ln.record.get("uuid") and "message" in ln.record and kind not in KNOWN_RECORD_TYPES:
             raise Blocked(f"the Claude transcript has a {kind!r} record duologue does not know")
 
 
@@ -357,3 +486,8 @@ def _last_uuid(lines: Sequence[Line]) -> str | None:
         if ln.record.get("uuid"):
             return ln.record["uuid"]
     return None
+
+
+def _printable(text: str) -> str:
+    """``text`` without control characters, safe to print or hand to a notifier."""
+    return "".join(ch if ch.isprintable() else " " for ch in text)

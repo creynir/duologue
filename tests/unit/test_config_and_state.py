@@ -138,12 +138,15 @@ def test_launchd_agent(tmp_path: Path):
     assert plist["ProgramArguments"][-3:] == ["duologue", "sync", "--quiet"]
     assert plist["StartInterval"] == 30
     assert plist["EnvironmentVariables"] == {"PATH": "/opt/bin:/usr/bin", "CODEX_HOME": "/x"}
+    assert plist["Umask"] == 0o077
 
 
 def test_systemd_timer(tmp_path: Path):
-    service, timer = systemd_files(tmp_path, {"PATH": "/usr/bin"})
+    service, timer = systemd_files(tmp_path, {"PATH": "/usr/bin"}, tmp_path / "duo")
     assert service.path.name == "duologue.service" and timer.path.name == "duologue.timer"
     assert b"Type=oneshot" in service.content and b'Environment="PATH=/usr/bin"' in service.content
+    assert f"StandardOutput=append:{tmp_path / 'duo' / 'service.log'}".encode() in service.content
+    assert b"UMask=0077" in service.content
     assert b"OnUnitActiveSec=30" in timer.content
 
 
@@ -165,6 +168,7 @@ def test_install_and_uninstall(tmp_path: Path, platform: str):
     assert service.status() == "not installed"
     written = service.install()
     assert all(Path(p).exists() for p in written)
+    assert oct(service.log_file.stat().st_mode & 0o777) == "0o600"
     assert service.status() == "installed and running"
     first = calls.argv[0][0]
     assert first == ("launchctl" if platform == "darwin" else "systemctl")

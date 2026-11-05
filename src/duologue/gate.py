@@ -89,6 +89,32 @@ def _refs(node: object):
             yield from _refs(value)
 
 
+def cached_format(codex: Codex, allow_untested: bool, cache: Path) -> tuple[CodexFormat, bool]:
+    """The format check, run once per Codex version: the background sync starts a process
+    every 30 seconds, and reading the schema starts Codex twice. Also whether this is the
+    first time this result was seen (so its alert goes out once)."""
+    version = codex.version()
+    try:
+        saved = json.loads(Path(cache).read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        saved = {}
+    key = {"bin": codex.bin, "version": version, "allow": allow_untested}
+    if version and saved.get("key") == key:
+        r = saved.get("result") or {}
+        return CodexFormat(
+            version, r.get("fingerprint"), bool(r.get("known")), r.get("problem")
+        ), False
+    found = codex_format(codex, allow_untested)
+    if found.version:
+        result = {"fingerprint": found.fingerprint, "known": found.known, "problem": found.problem}
+        try:
+            Path(cache).parent.mkdir(parents=True, exist_ok=True)
+            Path(cache).write_text(json.dumps({"key": key, "result": result}), encoding="utf-8")
+        except OSError:
+            pass
+    return found, True
+
+
 def codex_format(codex: Codex, allow_untested: bool = False) -> CodexFormat:
     version = codex.version()
     if version is None:

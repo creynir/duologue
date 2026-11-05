@@ -68,18 +68,22 @@ note telling the model where the older ones are.
 
 `duologue status` says what each pair is doing.
 
-- **Waiting** clears by itself. Typical causes: the Claude session is open, a Codex app has the
-  thread loaded, a turn is running, or Codex compressed a thread that has been idle for a week.
+- **Waiting** clears by itself once the app lets go: the Claude session is open, a Codex app has
+  the thread loaded, or a turn is running. Two waits need you: Codex compressed a thread that
+  has been idle for a week (open it in Codex), and a Codex whose item format duologue has not
+  been tested with (update duologue; `notify` tells you once).
 - **Conflict.** You wrote in both apps since the last sync. Nothing is copied until you keep
   one side's new turns: `duologue resolve <pair> --keep claude` (or `codex`). The other side's
   new turns stay where they are.
 - **Blocked** needs you. A file changed before the point already synced, or an app did not take
-  a write the way it should. Check the conversation, then run `duologue release <pair>`.
+  a write the way it should. Check the conversation, then run `duologue release <pair>`: the
+  pair syncs on from where each side stands.
 
 ## Safety
 
-- **Write-ahead journal.** Every write is recorded before it happens. After a crash, the next run
-  works out from the file whether the write is missing, cut off or complete.
+- **Write-ahead journal.** Every write, including the side `link` creates, is recorded before
+  it happens. After a crash, the next run works out from the file whether the write is
+  missing, cut off or complete.
 - **Rewrite detection.** Each cursor keeps a hash of the file up to it, so a file rewritten under
   duologue stops the pair instead of being guessed at.
 - **Undo only its own bytes.** When an app does not take a write, duologue removes only what it
@@ -100,7 +104,7 @@ note telling the model where the older ones are.
 | `log` | Recent activity |
 | `doctor` | Check both apps, their versions, Codex's item format and every pair |
 | `unlink` | Stop syncing a pair; both conversations stay as they are |
-| `service` | `install`, `uninstall` or `status` of the background sync (launchd or `systemd --user`) |
+| `service` | `install`, `uninstall` or `status` of the background sync (launchd or `systemd --user`); its output goes to `~/.duologue/service.log` |
 
 ## Configuration
 

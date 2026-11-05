@@ -130,6 +130,37 @@ class World:
         return [i["type"] for turn in page["data"] for i in turn["items"]]
 
 
+def codex_model_texts(body: dict) -> list[str]:
+    """Every text the Codex model was given in one request."""
+    return [
+        c.get("text", "")
+        for item in body.get("input") or []
+        if item.get("type") == "message"
+        for c in item.get("content") or []
+        if isinstance(c, dict)
+    ]
+
+
+def claude_calls(body: dict) -> list[tuple[dict, dict | None]]:
+    """(tool_use, its tool_result) pairs in one Claude request, matched by id."""
+    blocks = [
+        b
+        for m in body.get("messages") or []
+        if isinstance(m.get("content"), list)
+        for b in m["content"]
+        if isinstance(b, dict)
+    ]
+    results = {b.get("tool_use_id"): b for b in blocks if b.get("type") == "tool_result"}
+    return [(b, results.get(b.get("id"))) for b in blocks if b.get("type") == "tool_use"]
+
+
+def result_text(result: dict | None) -> str:
+    content = (result or {}).get("content")
+    if isinstance(content, list):
+        return "\n".join(c.get("text", "") for c in content if isinstance(c, dict))
+    return str(content or "")
+
+
 @pytest.fixture
 def world(tmp_path: Path):
     mock = MockModels().start()
@@ -159,19 +190,33 @@ def test_one_conversation_in_both_apps(world: World):
     # A Claude turn with a real tool call reaches Codex as Codex's own items...
     world.claude("run the claude probe", "--resume", session)
     assert "copied 1 Claude turn(s) to Codex" in world.duologue("sync")
-    assert world.codex_items(thread)[-3:] == ["agentMessage", "commandExecution", "agentMessage"]
-    # ...and Codex's model is shown it on its next turn.
+    assert world.codex_items(thread)[-4:] == [
+        "userMessage",
+        "agentMessage",
+        "commandExecution",
+        "agentMessage",
+    ]
+    # ...and Codex's model is shown the command and what it printed on its next turn.
     world.codex("resume", thread, "what did claude run")
-    shown = json.dumps(world.mock.seen("responses")[-1]["input"])
-    assert "[Claude ran Bash] echo probe-from-claude" in shown and "probe-from-claude" in shown
+    notes = [
+        t
+        for t in codex_model_texts(world.mock.seen("responses")[-1])
+        if t.startswith("[Claude ran Bash] echo probe-from-claude")
+    ]
+    assert len(notes) == 1 and notes[0].rstrip().endswith("\nprobe-from-claude")
 
     # A Codex turn with a real command reaches Claude as tool calls, and Claude resumes with it.
     world.codex("resume", thread, "run the codex probe")
     assert "copied 2 Codex turn(s) to Claude" in world.duologue("sync")
     world.claude("what did codex run", "--resume", session)
-    shown = json.dumps(world.mock.seen("messages")[-1]["messages"])
-    assert "echo probe-from-codex" in shown and "continued in Codex" in shown
-    assert '"tool_use"' in shown and '"tool_result"' in shown
+    request = world.mock.seen("messages")[-1]
+    calls = [
+        (use, result)
+        for use, result in claude_calls(request)
+        if use.get("input", {}).get("command") == "echo probe-from-codex"
+    ]
+    assert len(calls) == 1 and "probe-from-codex" in result_text(calls[0][1])
+    assert "continued in Codex" in json.dumps(request["messages"])
 
     # That Claude turn goes back to Codex once, and then nothing is left to copy.
     assert "copied 1 Claude turn(s) to Codex" in world.duologue("sync")
@@ -195,8 +240,13 @@ def test_a_codex_thread_gets_a_new_claude_session(world: World):
     out = world.duologue("link", "--codex", thread)
     session = re.search(r"created Claude session (" + ID.pattern + ")", out).group(1)
     assert world.claude("what did codex run", "--resume", session) == session
-    shown = json.dumps(world.mock.seen("messages")[-1]["messages"])
-    assert "echo probe-from-codex" in shown and "continued in Codex" in shown
+    request = world.mock.seen("messages")[-1]
+    commands = [use["input"].get("command") for use, _ in claude_calls(request)]
+    assert commands == ["echo probe-from-codex"]
+    assert "continued in Codex" in json.dumps(request["messages"])
+    # The session goes on in Claude, and that turn reaches the Codex thread: real Claude Code
+    # writes bookkeeping records (api-request-blob) on the way, which must not stop the pair.
+    assert "copied 1 Claude turn(s) to Codex" in world.duologue("sync")
 
 
 def test_doctor_knows_this_codex(world: World):

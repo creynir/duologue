@@ -12,7 +12,8 @@ from collections.abc import Iterator, Sequence
 
 from duologue import __version__, config, gate, linking
 from duologue.codex.rpc import daemon_running
-from duologue.engine import Engine
+from duologue.engine import TRANSIENT, Engine, _printable
+from duologue.journal import Blocked, Wait
 from duologue.linking import LinkError
 from duologue.pairs import ActivityLog, Busy, Store, exclusive
 from duologue.service import Service
@@ -80,8 +81,14 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     try:
         return HANDLERS[args.command](args)
-    except (LinkError, config.ConfigError, Busy, ValueError, RuntimeError) as e:
+    except Wait as e:
+        print(f"duologue {args.command}: not now: {e}", file=sys.stderr)
+        return FAILED
+    except (LinkError, config.ConfigError, Busy, Blocked, ValueError, RuntimeError) as e:
         print(f"duologue {args.command}: {e}", file=sys.stderr)
+        return FAILED
+    except TRANSIENT as e:
+        print(f"duologue {args.command}: {type(e).__name__}: {e}", file=sys.stderr)
         return FAILED
 
 
@@ -167,10 +174,19 @@ def cmd_resolve(args) -> int:
 
 
 def cmd_log(args) -> int:
-    cfg = config.load()
-    for entry in ActivityLog(cfg.log_file).tail(args.n, args.pair):
-        who = f'"{entry["pair"]}" ' if entry.get("pair") else ""
-        print(f"{entry['time']}  {who}{entry['event']}: {entry['text']}")
+    name = args.pair
+    if name is not None:
+        with engine(lock=False) as e:  # a start of the name or an id, as elsewhere
+            try:
+                name = linking.find_pair(e, name).name
+            except LinkError:
+                pass  # an unlinked pair's entries are still in the log
+        cfg = e.config
+    else:
+        cfg = config.load()
+    for entry in ActivityLog(cfg.log_file).tail(args.n, name):
+        who = f'"{_printable(entry["pair"])}" ' if entry.get("pair") else ""
+        print(f"{entry['time']}  {who}{entry['event']}: {_printable(entry['text'])}")
     return 0
 
 
@@ -233,7 +249,7 @@ def cmd_service(args) -> int:
     if args.action == "install":
         for path in service.install():
             print(f"wrote {path}")
-        print("duologue now syncs every 30 seconds; its output goes to", cfg.home / "service.log")
+        print(f"duologue now syncs every 30 seconds; its output goes to {service.log_file}")
     elif args.action == "uninstall":
         removed = service.uninstall()
         print("removed " + ", ".join(removed) if removed else "the service was not installed")

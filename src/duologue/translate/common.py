@@ -29,6 +29,10 @@ CODEX_INJECTED = (
     "<recommended_plugins>",
     "<external_codex_apps",
 )
+# User records Claude Code writes for local slash commands (/model, /cost, /exit...): what the
+# user ran in the app, not a prompt, and never answered by the model.
+LOCAL_COMMAND = ("<command-name>", "<local-command-stdout>", "<local-command-stderr>")
+
 # Codex's own importer marks the history it imported with this line.
 CODEX_IMPORT_SENTINEL = "<EXTERNAL SESSION IMPORTED>"
 

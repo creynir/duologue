@@ -53,9 +53,15 @@ class OutputStore:
             # A changed or shortened name could match another ref's: the digest keeps them apart.
             name = name[:64] + "-" + hashlib.sha256(ref.encode()).hexdigest()[:12]
         path = self.directory / f"{name}.txt"
+        text = clean(text)
+        try:
+            if path.read_text(encoding="utf-8") == text:
+                return path  # already kept: every pass would otherwise write it again
+        except (FileNotFoundError, UnicodeDecodeError):
+            pass
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
-            fh.write(clean(text))
+            fh.write(text)
         os.replace(tmp, path)
         return path

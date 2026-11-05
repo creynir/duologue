@@ -75,3 +75,23 @@ def test_doctor(linked, capsys):
     assert 'pair "work": linked' in out
     assert "Claude Code not found" in out  # the homes point claude_bin at nothing
     assert code == 1
+
+
+def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):
+    claude, _ = linked
+    other = "5e550000-0000-4000-8000-0000000000aa"
+    claude.path.with_name(f"{other}.jsonl").write_bytes(claude.path.read_bytes())
+    monkeypatch.setenv("FAKE_CODEX_SCHEMA", "changed")
+    assert main(["link", "--claude", other]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("duologue link: not now: Codex 0.166.0") and "Traceback" not in err
+
+
+def test_a_block_is_one_line_not_a_traceback(linked, capsys):
+    claude, _ = linked
+    claude.path.unlink()
+    assert main(["sync"]) == 1
+    assert "not on this machine" in capsys.readouterr().out
+    assert main(["release", "work"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("duologue release: the Claude session") and "Traceback" not in err

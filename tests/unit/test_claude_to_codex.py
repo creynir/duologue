@@ -370,3 +370,42 @@ def test_an_agent_quoting_the_mark_is_not_a_note(store):
 def test_is_user_input(content, extra, expected):
     record = {"type": "user", "uuid": "u", "message": {"role": "user", "content": content}, **extra}
     assert is_user_input(record) is expected
+
+
+# ------------------------------------------------------------------------------ has_content
+def test_has_content_counts_prompts_text_and_tool_calls_only():
+    from duologue.translate.claude_to_codex import has_content
+
+    c = ClaudeTranscript()
+    assert not has_content([])
+    bookkeeping = [
+        {"type": "custom-title", "customTitle": "t"},
+        {"type": "api-request-blob", "message": {"role": "system"}},
+        {"type": "attachment", "uuid": "a"},
+    ]
+    assert not has_content(bookkeeping)
+    c.user("<command-name>/cost</command-name>")
+    c.user("<local-command-stdout>Total cost: $0.00</local-command-stdout>")
+    c.user("caveat", isMeta=True)
+    c.user(f"[{MARK}: a note duologue wrote]")
+    assert not has_content(c.records)
+    c.assistant([{"type": "thinking", "thinking": "hm", "signature": "s"}])
+    assert not has_content(c.records)
+    assert has_content([*c.records, ClaudeTranscript().user("a real prompt")])
+    d = ClaudeTranscript()
+    d.assistant("an answer")
+    assert has_content(d.records)
+
+
+def test_local_commands_never_reach_codex():
+    c = ClaudeTranscript()
+    c.user("<command-name>/model</command-name>")
+    c.user("<local-command-stdout>Set model to opus</local-command-stdout>")
+    c.user("real question")
+    c.assistant("real answer")
+    lines = claude_to_codex(
+        c.records, thread_id="t", key="k", outputs=OutputStore("/tmp/unused"), default_cwd=CWD
+    )
+    text = json.dumps([ln.payload for ln in lines])
+    assert "command-name" not in text and "local-command" not in text
+    assert "real question" in text

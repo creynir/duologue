@@ -8,33 +8,35 @@ that fit the copy budget, with a note saying where the older ones are.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import os
 import re
 import subprocess
+import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeVar
 
 from duologue.claude import sessions as claude_sessions
-from duologue.claude.transcript import (
-    PROJECTS,
-    find_transcript,
-    is_message,
-    project_folder,
-    settled,
-)
+from duologue.claude.transcript import PROJECTS, find_transcript, is_message, project_folder
 from duologue.codex import threads as codex_threads
-from duologue.codex.rollout import ARCHIVED, SESSIONS, session_meta, turn_ends
-from duologue.engine import Engine
+from duologue.codex.rollout import SESSIONS, is_compressed, session_meta, turn_ends, uuid7
+from duologue.engine import (
+    Engine,
+    PairJournal,
+    _printable,
+    claude_start,
+    codex_start,
+    end_cursor,
+)
 from duologue.ids import UUID as ID
-from duologue.journal import MemoryJournal, prefix_hash
-from duologue.jsonl import Line, read_lines
+from duologue.journal import Blocked, Wait, prefix_hash
+from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import Cursor, Pair
 from duologue.translate.claude_to_codex import (
     RolloutLine,
     claude_to_codex,
+    conversation,
     is_user_input,
     note_turn,
 )
@@ -71,12 +73,9 @@ def find_claude(engine: Engine, value: str, cwd: str) -> str:
 def find_codex(engine: Engine, value: str, cwd: str) -> str:
     """A Codex thread id: ``value`` itself, or with ``last`` the newest thread started in
     ``cwd``."""
-    if value == LAST:
-        home = Path(engine.config.codex_home)
-        found = []
-        for folder in (SESSIONS, ARCHIVED):
-            if (home / folder).is_dir():
-                found += (home / folder).rglob("rollout-*.jsonl")
+    if value == LAST:  # an archived or compressed thread is not one the user is working in
+        folder = Path(engine.config.codex_home) / SESSIONS
+        found = [p for p in folder.rglob("rollout-*.jsonl") if not is_compressed(p)]
         found.sort(key=lambda p: p.stat().st_mtime, reverse=True)
         want = os.path.realpath(cwd)
         for path in found[:SCAN_LIMIT]:
@@ -114,8 +113,8 @@ def link(
         pair = Pair(
             name=_unique(engine, name or _claude_title(engine, claude)), claude=claude, codex=codex
         )
-        pair.claude_cursor = _claude_start(find_transcript(engine.config.claude_home, claude))
-        pair.codex_cursor = _codex_start(engine.codex_path(pair))
+        pair.claude_cursor = claude_start(find_transcript(engine.config.claude_home, claude))
+        pair.codex_cursor = codex_start(engine.codex_path(pair))
         done = "linked; turns from now on are copied both ways"
     elif claude:
         pair, done = _codex_from_claude(engine, claude, name)
@@ -130,21 +129,25 @@ def link(
 def _codex_from_claude(engine: Engine, claude: str, name: str | None) -> tuple[Pair, str]:
     engine.codex_gate()
     cpath = find_transcript(engine.config.claude_home, claude)
-    start = _claude_start(cpath)
-    lines = read_lines(cpath, 0, start.end)
-    records = [ln.record for ln in lines]
+    start = claude_start(cpath)
+    records = [ln.record for ln in read_lines(cpath, 0, start.end)]
     cwd = next((r["cwd"] for r in reversed(records) if r.get("cwd")), None) or os.getcwd()
-    budget, outputs, kept = engine.config.copy_budget, engine.outputs, {}
+    thread_id = uuid7()
+    pair = Pair(
+        name=_unique(engine, name or _claude_title(engine, claude)), claude=claude, codex=thread_id
+    )
+    pair.claude_cursor = start
+    key, kept = pair.key, {}
 
-    def build(thread_id: str) -> list[RolloutLine]:
-        out = claude_to_codex(
-            records,
-            thread_id=thread_id,
-            key=f"{claude}/{thread_id}",
-            outputs=outputs,
-            default_cwd=cwd,
+    def build(tid: str) -> list[RolloutLine]:
+        def translate(turn: list[dict]) -> list[RolloutLine]:
+            return claude_to_codex(
+                turn, thread_id=tid, key=key, outputs=engine.outputs, default_cwd=cwd
+            )
+
+        turns, dropped = newest_lazily(
+            _claude_turns(records), translate, _model_size, engine.config.copy_budget
         )
-        turns, dropped = newest(_codex_turns(out), _model_size, budget)
         kept["turns"], kept["dropped"] = len(turns), dropped
         if not turns:
             raise LinkError("the Claude session has nothing to copy yet")
@@ -154,49 +157,51 @@ def _codex_from_claude(engine: Engine, claude: str, name: str | None) -> tuple[P
                 f"this thread continues a Claude Code session; its {dropped} earlier turn(s) "
                 f"are not copied here. They are in {cpath}"
             )
-            lines = (
-                note_turn(
-                    note, thread_id=thread_id, key=f"{claude}/{thread_id}", ms=lines[0].ms - 1
-                )
-                + lines
-            )
+            lines = note_turn(note, thread_id=tid, key=key, ms=lines[0].ms - 1) + lines
         return lines
 
-    codex, made = codex_threads.create_thread(
-        engine.codex,
-        cwd=cwd,
-        build=build,
-        journal=MemoryJournal(),
-        source=engine.config.codex_source,
+    after_claude = {"end": start.end, "anchor": start.anchor}
+    made = _create(
+        engine,
+        pair,
+        PairJournal(engine, pair, claude=after_claude, codex=None),
+        lambda journal: codex_threads.create_thread(
+            engine.codex,
+            cwd=cwd,
+            build=build,
+            journal=journal,
+            source=engine.config.codex_source,
+            thread_id=thread_id,
+        )[1],
     )
-    pair = Pair(
-        name=_unique(engine, name or _claude_title(engine, claude)), claude=claude, codex=codex
-    )
-    pair.claude_cursor = start
-    pair.codex_cursor = Cursor(made.end, prefix_hash(made.path, made.end), made.turns[-1])
-    done = f"created Codex thread {codex} with {kept['turns']} turn(s) from Claude"
+    engine.confirm(pair, after_claude, {"end": made.end, "anchor": made.turns[-1]})
+    done = f"created Codex thread {thread_id} with {kept['turns']} turn(s) from Claude"
     if kept["dropped"]:
         done += f" ({kept['dropped']} older turn(s) left out: over the copy budget)"
     return pair, done
 
 
 def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pair, str]:
-    xpath = engine.codex.rollout(codex)
-    lines = read_lines(engine.codex_path(Pair(name="", claude="", codex=codex)))
+    xpath = engine.codex_path(Pair(name="", claude="", codex=codex))
+    lines = read_lines(xpath)
     ends = turn_ends(lines)
     if not ends:
         raise LinkError("the Codex thread has no finished turn to copy yet")
     finished = [ln for ln in lines if ln.end <= ends[-1][1]]
     groups = _rollout_turns(finished)
     cwd = session_meta(xpath).get("cwd") or os.getcwd()
-    title = _unique(engine, name or _codex_title(finished))
+    session_id = str(uuid.uuid4())
+    pair = Pair(
+        name=_unique(engine, name or _codex_title(finished)), claude=session_id, codex=codex
+    )
     version = claude_version(engine.config.claude_bin)
-    budget, outputs, kept = engine.config.copy_budget, engine.outputs, {}
+    key, kept = pair.key, {}
 
-    def build(session_id: str) -> list[dict]:
-        key = f"{session_id}/{codex}"
-        per_turn = [codex_to_claude_steps(g, key=key, outputs=outputs) for g in groups]
-        turns, dropped = newest([t for t in per_turn if t], _steps_size, budget)
+    def build(sid: str) -> list[dict]:
+        def translate(group: list[dict]) -> list[ClaudeStep]:
+            return codex_to_claude_steps(group, key=key, outputs=engine.outputs)
+
+        turns, dropped = newest_lazily(groups, translate, _steps_size, engine.config.copy_budget)
         kept["turns"], kept["dropped"] = len(turns), dropped
         if not turns:
             raise LinkError("the Codex thread has nothing to copy yet")
@@ -208,7 +213,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
             )
         return claude_records(
             [s for t in turns for s in t],
-            session_id=session_id,
+            session_id=sid,
             parent_uuid=None,
             parent_type=None,
             model="<synthetic>",
@@ -217,22 +222,55 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
             lead_extra=extra,
         )
 
-    claude, made = claude_sessions.create_session(
-        engine.config.claude_home, cwd=cwd, build=build, journal=MemoryJournal(), title=title
+    after_codex = {"end": ends[-1][1], "anchor": ends[-1][0]}
+    made = _create(
+        engine,
+        pair,
+        PairJournal(engine, pair, claude=None, codex=after_codex),
+        lambda journal: claude_sessions.create_session(
+            engine.config.claude_home,
+            cwd=cwd,
+            build=build,
+            journal=journal,
+            title=pair.name,
+            session_id=session_id,
+        )[1],
     )
-    pair = Pair(name=title, claude=claude, codex=codex)
-    pair.claude_cursor = Cursor(made.end, prefix_hash(made.path, made.end), made.uuids[-1])
-    pair.codex_cursor = Cursor(ends[-1][1], prefix_hash(xpath, ends[-1][1]), ends[-1][0])
-    done = f"created Claude session {claude} with {kept['turns']} turn(s) from Codex"
+    engine.confirm(pair, {"end": made.end, "anchor": made.uuids[-1]}, after_codex)
+    done = f"created Claude session {session_id} with {kept['turns']} turn(s) from Codex"
     if kept["dropped"]:
         done += f" ({kept['dropped']} older turn(s) left out: over the copy budget)"
     return pair, done
 
 
+def _create(engine: Engine, pair: Pair, journal: PairJournal, create):
+    """Create the missing side with the pair recorded first, so an interrupted create is
+    settled by the next sync like any other write. If nothing was written, the pair goes."""
+    engine.pairs[pair.name] = pair
+    try:
+        return create(journal)
+    except BaseException as e:
+        p = pair.pending
+        if p is None or not Path(p.path).exists():
+            engine.forget_pending(pair)
+            engine.pairs.pop(pair.name, None)
+            engine.save()
+            if isinstance(e, (Wait, Blocked)):
+                raise LinkError(str(e)) from e
+            raise
+        engine.save()
+        if isinstance(e, Exception):
+            raise LinkError(
+                f"creating the other side was interrupted ({e}); duologue sync finishes it"
+            ) from e
+        raise
+
+
 # ---------------------------------------------------------------------------- the other verbs
 def release(engine: Engine, pair: Pair) -> str:
-    """Take a pair off hold, or unblock it. A side rewritten under duologue syncs on from where
-    it stands now: the cursor moves to its anchor if that is still there, else to the end."""
+    """Take a pair off hold, or unblock it. A write that was never confirmed is settled, or,
+    when that is what blocked the pair, accepted as it stands; a side rewritten under duologue
+    syncs on from where it stands now (its anchor if that is still there, else its end)."""
     said = []
     if pair.hold:
         pair.hold = None
@@ -240,6 +278,12 @@ def release(engine: Engine, pair: Pair) -> str:
     if pair.blocked:
         pair.blocked = None
         said.append("unblocked")
+        if pair.pending:
+            try:
+                engine.settle(pair)
+            except Blocked:
+                engine.accept_pending(pair)
+                said.append("the interrupted write was taken as it stands")
         cpath, xpath = engine.paths(pair)
         if not _cursor_matches(cpath, pair.claude_cursor):
             pair.claude_cursor = _reanchor_claude(cpath, pair.claude_cursor)
@@ -247,7 +291,7 @@ def release(engine: Engine, pair: Pair) -> str:
         if not _cursor_matches(xpath, pair.codex_cursor):
             pair.codex_cursor = _reanchor_codex(xpath, pair.codex_cursor)
             said.append("the Codex side syncs on from where it stands")
-    pair.seen = []
+    pair.seen, pair.checked = [], {}
     text = "; ".join(said) or "nothing to release"
     engine.save()
     engine.log.write(pair.name, "release", text)
@@ -257,22 +301,23 @@ def release(engine: Engine, pair: Pair) -> str:
 def resolve(engine: Engine, pair: Pair, keep: str) -> str:
     """End a conflict by keeping one side's new turns; the other side's new turns are not
     copied (they stay in that app)."""
+    if keep not in ("claude", "codex"):
+        raise LinkError("keep claude or codex")
     if not pair.conflict:
         return "there is no conflict to resolve"
     cpath, xpath = engine.paths(pair)
     if keep == "claude":
-        lines = read_lines(xpath, pair.codex_cursor.end)
-        ends = turn_ends(lines)
+        cur = engine.codex_cursor(pair, xpath)  # finds the synced turn again after a rewrite
+        ends = turn_ends(iter_lines(xpath, cur.end))
         if ends:
             pair.codex_cursor = Cursor(ends[-1][1], prefix_hash(xpath, ends[-1][1]), ends[-1][0])
         text = "keeping Claude's new turns; Codex's new turns stay in Codex only"
-    elif keep == "codex":
-        pair.claude_cursor = _claude_start(cpath)
-        text = "keeping Codex's new turns; Claude's new turns stay in Claude only"
     else:
-        raise LinkError("keep claude or codex")
+        engine.claude_cursor(pair, cpath)
+        pair.claude_cursor = end_cursor(cpath)  # all of Claude's new records, answered or not
+        text = "keeping Codex's new turns; Claude's new turns stay in Claude only"
     pair.conflict = False
-    pair.seen = []
+    pair.seen, pair.checked = [], {}
     engine.save()
     engine.log.write(pair.name, "resolve", text)
     return text
@@ -310,13 +355,25 @@ def find_pair(engine: Engine, ref: str) -> Pair:
 def newest(groups: Sequence[T], size: Callable[[T], int], budget: int) -> tuple[list[T], int]:
     """The newest groups whose sizes add up to at most ``budget`` (at least one), and how many
     older ones are left out."""
-    kept: list[T] = []
+    return newest_lazily(groups, lambda g: g, size, budget)
+
+
+U = TypeVar("U")
+
+
+def newest_lazily(
+    groups: Sequence[T], make: Callable[[T], U], size: Callable[[U], int], budget: int
+) -> tuple[list[U], int]:
+    """Like :func:`newest`, making each group only when it is reached, newest first: groups
+    over the budget are never made (translating writes long outputs to files)."""
+    kept: list[U] = []
     total = 0
     for g in reversed(groups):
-        s = size(g)
+        made = make(g)
+        s = size(made)
         if kept and total + s > budget:
             break
-        kept.append(g)
+        kept.append(made)
         total += s
     kept.reverse()
     return kept, len(groups) - len(kept)
@@ -333,14 +390,15 @@ def claude_version(claude_bin: str) -> str:
     return match.group(0) if match else ""
 
 
-def _codex_turns(lines: list[RolloutLine]) -> list[list[RolloutLine]]:
-    turns: list[list[RolloutLine]] = []
-    for ln in lines:
-        if ln.type == "event_msg" and ln.payload.get("type") == "task_started":
-            turns.append([])
-        if turns:
-            turns[-1].append(ln)
-    return turns
+def _claude_turns(records: list[dict]) -> list[list[dict]]:
+    """Claude records split where the user typed, each part one Codex turn (records before the
+    first prompt make a part of their own)."""
+    parts: list[list[dict]] = []
+    for r in conversation(records):
+        if is_user_input(r) or not parts:
+            parts.append([])
+        parts[-1].append(r)
+    return parts
 
 
 def _rollout_turns(lines: list[Line]) -> list[list[dict]]:
@@ -369,52 +427,26 @@ def _steps_size(steps: list[ClaudeStep]) -> int:
     return sum(len(json.dumps(s.blocks, ensure_ascii=False)) for s in steps)
 
 
-def _claude_start(cpath: Path) -> Cursor:
-    """Where syncing a linked Claude session starts: its end, or the start of a turn Claude is
-    still working on (that turn is copied once it ends)."""
-    lines = read_lines(cpath)
-    end = lines[-1].end if lines else 0
-    if not settled(lines):
-        for i in range(len(lines) - 1, -1, -1):
-            if is_user_input(lines[i].record):
-                end = lines[i - 1].end if i else 0
-                break
-    anchor = next(
-        (ln.record["uuid"] for ln in reversed(lines) if ln.end <= end and ln.record.get("uuid")),
-        None,
-    )
-    return Cursor(end, prefix_hash(cpath, end), anchor)
-
-
-def _codex_start(xpath: Path) -> Cursor:
-    """Where syncing a linked Codex thread starts: after its last finished turn."""
-    ends = turn_ends(read_lines(xpath))
-    if not ends:
-        return Cursor(0, hashlib.sha256(b"").hexdigest(), None)
-    turn, end = ends[-1]
-    return Cursor(end, prefix_hash(xpath, end), turn)
-
-
 def _cursor_matches(path: Path, cur: Cursor) -> bool:
     return path.stat().st_size >= cur.end and prefix_hash(path, cur.end) == cur.digest
 
 
 def _reanchor_claude(cpath: Path, cur: Cursor) -> Cursor:
-    for ln in read_lines(cpath):
+    for ln in iter_lines(cpath):
         if cur.anchor and ln.record.get("uuid") == cur.anchor:
             return Cursor(ln.end, prefix_hash(cpath, ln.end), cur.anchor)
-    return _claude_start(cpath)
+    return claude_start(cpath)
 
 
 def _reanchor_codex(xpath: Path, cur: Cursor) -> Cursor:
-    for turn, end in reversed(turn_ends(read_lines(xpath))):
+    for turn, end in reversed(turn_ends(iter_lines(xpath))):
         if cur.anchor and turn == cur.anchor:
             return Cursor(end, prefix_hash(xpath, end), turn)
-    return _codex_start(xpath)
+    return codex_start(xpath)
 
 
 def _unique(engine: Engine, name: str) -> str:
-    name = " ".join(name.split())[:80] or "conversation"
+    name = " ".join(_printable(name).split())[:80] or "conversation"
     if name not in engine.pairs:
         return name
     n = 2
@@ -425,7 +457,7 @@ def _unique(engine: Engine, name: str) -> str:
 
 def _claude_title(engine: Engine, claude: str) -> str:
     title, first = None, None
-    for ln in read_lines(find_transcript(engine.config.claude_home, claude)):
+    for ln in iter_lines(find_transcript(engine.config.claude_home, claude)):
         r = ln.record
         if r.get("type") == "custom-title" and r.get("customTitle"):
             title = r["customTitle"]

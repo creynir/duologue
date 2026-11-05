@@ -20,7 +20,15 @@ from pathlib import Path
 LABEL = "duologue.sync"
 UNIT = "duologue"
 INTERVAL = 30  # seconds between passes
-KEPT_ENV = ("PATH", "DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "LANG")
+KEPT_ENV = (
+    "PATH",
+    "DUOLOGUE_HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "CODEX_SQLITE_HOME",
+    "LANG",
+)
+LOG = "service.log"
 
 
 @dataclass(frozen=True)
@@ -45,15 +53,16 @@ def launchd_files(home: Path, log_dir: Path, env: Mapping[str, str]) -> list[Ser
         "StartInterval": INTERVAL,
         "RunAtLoad": True,
         "EnvironmentVariables": environment(env),
-        "StandardOutPath": str(log_dir / "service.log"),
-        "StandardErrorPath": str(log_dir / "service.log"),
+        "StandardOutPath": str(log_dir / LOG),
+        "StandardErrorPath": str(log_dir / LOG),
         "ProcessType": "Background",
+        "Umask": 0o077,  # the log and everything duologue writes stay private to the user
     }
     path = home / "Library" / "LaunchAgents" / f"{LABEL}.plist"
     return [ServiceFile(path, plistlib.dumps(plist))]
 
 
-def systemd_files(home: Path, env: Mapping[str, str]) -> list[ServiceFile]:
+def systemd_files(home: Path, env: Mapping[str, str], log_dir: Path) -> list[ServiceFile]:
     folder = home / ".config" / "systemd" / "user"
     lines = [
         "[Unit]",
@@ -62,6 +71,9 @@ def systemd_files(home: Path, env: Mapping[str, str]) -> list[ServiceFile]:
         "[Service]",
         "Type=oneshot",
         f"ExecStart={shlex.join(command())}",
+        "UMask=0077",
+        f"StandardOutput=append:{log_dir / LOG}",
+        f"StandardError=append:{log_dir / LOG}",
     ]
     lines += [f'Environment="{k}={v}"' for k, v in environment(env).items()]
     timer = [
@@ -96,15 +108,21 @@ class Service:
         if self.platform == "darwin":
             return launchd_files(self.home, self.log_dir, self.env)
         if self.platform.startswith("linux"):
-            return systemd_files(self.home, self.env)
+            return systemd_files(self.home, self.env, self.log_dir)
         raise RuntimeError(f"no background service for {self.platform}; run duologue sync yourself")
+
+    @property
+    def log_file(self) -> Path:
+        return self.log_dir / LOG
 
     def install(self) -> list[str]:
         files = self.files()
         for f in files:
             f.path.parent.mkdir(parents=True, exist_ok=True)
             f.path.write_bytes(f.content)
-        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        fd = os.open(self.log_file, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        os.close(fd)
         if self.platform == "darwin":
             target = f"gui/{os.getuid()}"
             self._call(["launchctl", "bootout", f"{target}/{LABEL}"], check=False)

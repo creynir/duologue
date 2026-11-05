@@ -19,6 +19,7 @@ from pathlib import Path
 
 from duologue.ids import require_id
 from duologue.jsonl import Line
+from duologue.translate.common import LOCAL_COMMAND
 
 PROJECTS = "projects"
 CHAIN_TYPES = ("user", "assistant", "attachment", "system")
@@ -26,8 +27,6 @@ MESSAGE_TYPES = ("user", "assistant")
 # Stop reasons that end Claude's turn. "tool_use" and "pause_turn" mean it goes on.
 FINAL_STOPS = ("end_turn", "stop_sequence", "max_tokens", "refusal")
 SYNTHETIC_MODEL = "<synthetic>"
-# User records Claude Code writes for local slash commands (/model, /cost...): no answer follows.
-LOCAL_COMMAND = ("<command-name>", "<local-command-stdout>", "<local-command-stderr>")
 
 
 def find_transcript(claude_home: Path, session_id: str) -> Path | None:
