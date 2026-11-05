@@ -47,6 +47,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["tests"]
 addopts = ["--strict-markers", "-m", "not e2e"]
 markers = [
     "integration: hermetic homes, a fake Codex app-server and mock model servers; runs in CI",
