@@ -51,7 +51,7 @@ pythonpath = ["tests"]
 addopts = ["--strict-markers", "-m", "not e2e"]
 markers = [
     "integration: hermetic homes, a fake Codex app-server and mock model servers; runs in CI",
-    "e2e: real Claude Code and Codex CLIs on throwaway sessions; never in CI, run with -m e2e",
+    "e2e: the real Claude Code and Codex CLIs against local model stand-ins; run with -m e2e",
 ]
 
 [tool.ruff]
