@@ -12,6 +12,7 @@ from duologue.claude import live
 from duologue.claude.sessions import append_records, check_structure, create_session, recover
 from duologue.claude.transcript import (
     find_transcript,
+    is_typed,
     new_transcript_path,
     project_folder,
     settled,
@@ -145,6 +146,20 @@ def test_settled_skips_compaction_and_local_commands(tmp_path: Path):
     c.user("<command-name>/cost</command-name>")
     c.user("<local-command-stdout>Total cost: $0.00</local-command-stdout>")
     c.user("caveat", isMeta=True)
+    assert settled(read_lines(write(tmp_path, c.records)))
+
+
+def test_a_queued_message_waits_for_its_answer(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant("done")
+    assert settled(read_lines(write(tmp_path, c.records)))
+    c.queued("one more thing")
+    assert not settled(read_lines(write(tmp_path, c.records)))
+    assert is_typed(c.records[-1])
+    c.assistant("done too")
+    assert settled(read_lines(write(tmp_path, c.records)))
+    c.queued("<task-notification>x</task-notification>", mode="task-notification", human=False)
     assert settled(read_lines(write(tmp_path, c.records)))
 
 

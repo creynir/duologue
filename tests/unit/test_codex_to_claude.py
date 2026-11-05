@@ -10,6 +10,7 @@ from duologue.translate.codex_to_claude import (
     ClaudeStep,
     claude_records,
     codex_to_claude_steps,
+    parse_unified_diff,
 )
 from duologue.translate.common import MARK
 from duologue.translate.outputs import OutputStore
@@ -174,19 +175,150 @@ def test_an_mcp_call_keeps_its_server_and_tool_and_shows_errors(store):
     assert result["content"] == 'partial\n{"message": "timeout"}'
 
 
-def test_a_file_change_becomes_an_apply_patch_call(store):
+def file_change(store, changes, status="completed"):
     x = CodexRollout()
     x.start("t")
     x.user_says("fix it", "u")
+    x.item({"type": "FileChange", "id": "f", "changes": changes, "status": status})
+    steps = steps_of(x, store)
+    (use,), (result,) = tool_uses(steps), tool_results(steps)
+    (shown,) = [s.tool_use_result for s in steps if s.tool_use_result]
+    return use, result, shown
+
+
+def test_a_one_hunk_change_becomes_claudes_own_edit(store):
+    diff = "@@ -3,3 +3,3 @@\n def f():\n-    return 1\n+    return 2\n \n"
+    change = {"type": "update", "unified_diff": diff, "move_path": None}
+    use, result, shown = file_change(store, {"/w/a.py": change})
+
+    old, new = "def f():\n    return 1\n", "def f():\n    return 2\n"
+    assert use["name"] == "Edit"
+    assert use["input"] == {"file_path": "/w/a.py", "old_string": old, "new_string": new}
+    assert result["is_error"] is False
+    assert shown == {
+        "filePath": "/w/a.py",
+        "oldString": old,
+        "newString": new,
+        "originalFile": None,
+        "replaceAll": False,
+        "structuredPatch": [
+            {
+                "oldStart": 3,
+                "oldLines": 3,
+                "newStart": 3,
+                "newLines": 3,
+                "lines": [" def f():", "-    return 1", "+    return 2", " "],
+            }
+        ],
+        "userModified": False,
+    }
+
+
+def test_a_new_file_becomes_claudes_own_write(store):
+    change = {"type": "add", "content": "print('hi')\n"}
+    use, _, shown = file_change(store, {"/w/new.py": change})
+
+    assert use["name"] == "Write"
+    assert use["input"] == {"file_path": "/w/new.py", "content": "print('hi')\n"}
+    assert shown == {
+        "type": "create",
+        "filePath": "/w/new.py",
+        "content": "print('hi')\n",
+        "structuredPatch": [],
+        "originalFile": None,
+        "userModified": False,
+    }
+
+
+def test_a_failed_edit_stays_an_error(store):
     diff = "@@ -1 +1 @@\n-a\n+b\n"
     change = {"type": "update", "unified_diff": diff, "move_path": None}
-    x.item(
-        {"type": "FileChange", "id": "f", "changes": {"/w/a.txt": change}, "status": "completed"}
-    )
-    (use,) = tool_uses(steps_of(x, store))
+    use, result, _ = file_change(store, {"/w/a.txt": change}, status="failed")
+
+    assert use["name"] == "Edit" and result["is_error"] is True
+
+
+@pytest.mark.parametrize(
+    "changes",
+    [
+        pytest.param(
+            {
+                "/w/a.txt": {"type": "update", "unified_diff": "@@ -1 +1 @@\n-a\n+b\n"},
+                "/w/b.txt": {"type": "add", "content": "c\n"},
+            },
+            id="two files",
+        ),
+        pytest.param(
+            {
+                "/w/a.txt": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-a\n+b\n@@ -9 +9 @@\n-c\n+d\n",
+                }
+            },
+            id="two hunks",
+        ),
+        pytest.param({"/w/a.txt": {"type": "delete", "content": "a\n"}}, id="a delete"),
+        pytest.param(
+            {
+                "/w/a.txt": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-a\n+b\n",
+                    "move_path": "/w/b.txt",
+                }
+            },
+            id="a move",
+        ),
+        pytest.param(
+            {"/w/a.txt": {"type": "update", "unified_diff": "@@ -0,0 +1 @@\n+a\n"}},
+            id="an insertion with no context",
+        ),
+        pytest.param(
+            {"/w/a.txt": {"type": "update", "unified_diff": "@@ -1,2 +1,2 @@\n-a\n"}},
+            id="a cut-off diff",
+        ),
+    ],
+)
+def test_other_file_changes_stay_one_apply_patch_call(store, changes):
+    x = CodexRollout()
+    x.start("t")
+    x.user_says("fix it", "u")
+    x.item({"type": "FileChange", "id": "f", "changes": changes, "status": "completed"})
+    steps = steps_of(x, store)
+    (use,) = tool_uses(steps)
 
     assert use["name"] == "mcp__codex__apply_patch"
-    assert use["input"]["patch"] == f"*** update /w/a.txt\n{diff}"
+    for path, change in changes.items():
+        assert f"*** {change['type']} {path}\n" in use["input"]["patch"]
+    assert not any(s.tool_use_result for s in steps)
+
+
+def test_a_large_change_stays_a_patch(tmp_path):
+    small = OutputStore(tmp_path / "outputs", ui_limit=10)
+    change = {"type": "add", "content": "x" * 11}
+    x = CodexRollout()
+    x.start("t")
+    x.user_says("fix it", "u")
+    x.item({"type": "FileChange", "id": "f", "changes": {"/w/a": change}, "status": "completed"})
+    (use,) = tool_uses(steps_of(x, small))
+
+    assert use["name"] == "mcp__codex__apply_patch"
+
+
+def test_a_removed_line_that_looks_like_a_header_is_counted_as_removed():
+    diff = "--- a/q.sql\n+++ b/q.sql\n@@ -1,2 +1,1 @@\n--- old note\n select 1\n"
+    (hunk,) = parse_unified_diff(diff)
+
+    assert hunk["lines"] == ["--- old note", " select 1"]
+    assert hunk["oldLines"] == 2 and hunk["newLines"] == 1
+
+
+def test_a_missing_newline_marker_is_kept_in_the_hunk_but_not_the_strings(store):
+    diff = "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+    change = {"type": "update", "unified_diff": diff}
+    use, _, shown = file_change(store, {"/w/a.txt": change})
+
+    assert use["input"]["old_string"] == "a" and use["input"]["new_string"] == "b"
+    assert len(shown["structuredPatch"][0]["lines"]) == 4
 
 
 def test_reasoning_is_dropped_and_other_items_keep_their_kind(store):

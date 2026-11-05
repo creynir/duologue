@@ -417,3 +417,66 @@ def test_a_tool_call_alone_is_content():
     c = ClaudeTranscript()
     c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
     assert has_content(c.records)
+
+
+# ------------------------------------------------------------------------- queued messages
+def test_a_message_typed_while_claude_worked_joins_the_running_turn(store):
+    t = ClaudeTranscript()
+    t.user("refactor it")
+    t.call("Bash", {"command": "ls"}, "a.py")
+    t.queued("and keep the old name as an alias")
+    t.assistant("Done, with the alias.")
+    lines = translate(t.records, store)
+
+    assert len(events(lines, "task_started")) == len(events(lines, "task_complete")) == 1
+    said = [i["content"][0]["text"] for i in items(lines) if i["type"] == "UserMessage"]
+    assert said == ["refactor it", "and keep the old name as an alias"]
+    model_saw = [
+        ln.payload["content"][0]["text"]
+        for ln in lines
+        if ln.type == "response_item" and ln.payload.get("role") == "user"
+    ]
+    assert model_saw == said
+
+
+def test_a_queued_message_in_blocks_is_carried_as_text(store):
+    t = ClaudeTranscript()
+    t.user("start")
+    t.queued([{"type": "text", "text": "also this"}])
+    t.assistant("ok")
+    said = [i["content"][0]["text"] for i in items(translate(t.records, store))]
+
+    assert "also this" in said
+
+
+def test_a_queued_message_with_no_turn_running_opens_one(store):
+    t = ClaudeTranscript()
+    t.queued("a fresh request")
+    t.assistant("on it")
+    lines = translate(t.records, store)
+
+    assert len(events(lines, "task_started")) == 1
+    assert items(lines)[0]["content"][0]["text"] == "a fresh request"
+
+
+@pytest.mark.parametrize(
+    "mode, human", [("task-notification", False), ("task-notification", True), ("prompt", False)]
+)
+def test_queued_commands_that_are_not_the_user_are_left_out(store, mode, human):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("start")
+    t.queued("<task-notification>done</task-notification>", mode=mode, human=human)
+    t.assistant("ok")
+
+    assert "task-notification" not in json.dumps([ln.payload for ln in translate(t.records, store)])
+    assert not has_content(t.records[1:2])
+
+
+def test_a_queued_message_is_content():
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.queued("one more thing")
+    assert has_content(t.records)

@@ -48,11 +48,40 @@ class RolloutLine:
     payload: dict
 
 
+def queued_prompt(record: dict) -> dict | None:
+    """A message the user typed while Claude was busy, as a user record. Claude Code stores it
+    as an ``attachment`` of type ``queued_command`` (``commandMode`` "prompt", a human origin)
+    and folds it into the running turn; other queued commands (task notifications) are not the
+    user's."""
+    if record.get("type") != "attachment" or record.get("isSidechain"):
+        return None
+    a = record.get("attachment")
+    if not isinstance(a, dict) or a.get("type") != "queued_command":
+        return None
+    if a.get("commandMode") != "prompt":
+        return None
+    origin = a.get("origin")
+    if not (a.get("humanTurn") or (isinstance(origin, dict) and origin.get("kind") == "human")):
+        return None
+    prompt = a.get("prompt")
+    blocks = [{"type": "text", "text": prompt}] if isinstance(prompt, str) else prompt
+    if not isinstance(blocks, list) or not text_of(blocks).strip():
+        return None
+    return {
+        **record,
+        "type": "user",
+        "message": {"role": "user", "content": blocks},
+        "queued": True,
+    }
+
+
 def conversation(records: Iterable[dict]) -> list[dict]:
     """The records that carry the conversation: user and assistant messages on the main thread,
-    without meta records, compaction summaries or duologue's own notes."""
+    and messages queued while Claude was busy, without meta records, compaction summaries or
+    duologue's own notes."""
     out = []
     for r in records:
+        r = queued_prompt(r) or r
         if r.get("type") not in ("user", "assistant") or r.get("isSidechain"):
             continue
         if not r.get("uuid"):  # every id duologue derives starts from the source record's uuid
@@ -178,7 +207,11 @@ class _Translator:
         for r, ms in zip(records, _timestamps(records, self.now_ms), strict=True):
             content = (r.get("message") or {}).get("content")
             if r.get("type") == "user":
-                if is_user_input(r):
+                if r.get("queued") and self.turn:
+                    # Typed while Claude worked: Claude took it into the running turn, as Codex
+                    # takes a message sent mid-turn.
+                    self._user_message(ms, r["uuid"], text_of(content))
+                elif is_user_input(r):
                     if self.turn:
                         self._end(ms)
                     self._start(ms, r["uuid"])
