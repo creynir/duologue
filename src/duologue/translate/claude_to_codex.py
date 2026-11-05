@@ -398,28 +398,57 @@ def _shell_command(name: str, inp: dict, cwd: str) -> tuple[str, list[str], list
         return cmd, ["/bin/bash", "-lc", cmd], [{"type": "unknown", "cmd": cmd}]
     if name == "Read":
         path = inp.get("file_path") or ""
-        argv = ["cat", "-n", path]
-        cmd = shlex.join(argv)
+        # Read's offset is the first line it shows (1-based), limit how many lines.
+        first = _count(inp.get("offset")) or 1
+        cmd, argv = _windowed(["cat", "-n", path], first, _count(inp.get("limit")))
         parsed = {"type": "read", "cmd": cmd, "name": os.path.basename(path), "path": path}
         return cmd, argv, [parsed]
     query, path = inp.get("pattern") or "", inp.get("path") or cwd
     if name == "Grep":
-        argv = ["rg", *_grep_flags(inp), "--", query, path]
-        cmd = shlex.join(argv)
+        # Grep's offset is how many result lines it skips, head_limit how many it keeps.
+        rg = ["rg", *_grep_flags(inp), "--", query, path]
+        first = _count(inp.get("offset")) + 1
+        cmd, argv = _windowed(rg, first, _count(inp.get("head_limit")))
         return cmd, argv, [{"type": "search", "cmd": cmd, "query": query, "path": path}]
     argv = ["rg", "--files", "--glob", query, path]
     cmd = shlex.join(argv)
     return cmd, argv, [{"type": "list_files", "cmd": cmd, "path": path}]
 
 
+def _windowed(argv: list[str], first: int, count: int) -> tuple[str, list[str]]:
+    """``argv`` as (display command, argv), showing only lines ``first`` to ``first + count - 1``
+    of its output (to the end when ``count`` is 0) through ``sed``; ``argv`` itself when that is
+    all of it."""
+    command = shlex.join(argv)
+    if first <= 1 and not count:
+        return command, argv
+    last = str(first + count - 1) if count else "$"
+    command = f"{command} | sed -n {shlex.quote(f'{first},{last}p')}"
+    return command, ["/bin/bash", "-lc", command]
+
+
+def _count(value: object) -> int:
+    """A non-negative whole number from a tool input; 0 when it is missing or not one."""
+    try:
+        return max(0, int(value))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _grep_flags(inp: dict) -> list[str]:
     """The ``rg`` flags for a Claude Grep call. Grep lists matching files unless told otherwise."""
     mode = inp.get("output_mode") or "files_with_matches"
     flags = {"files_with_matches": ["-l"], "count": ["-c"]}.get(mode, [])
-    if mode == "content" and inp.get("-n"):
-        flags.append("-n")
+    if mode == "content":
+        if inp.get("-n"):
+            flags.append("-n")
+        for context in ("-A", "-B", "-C"):
+            if _count(inp.get(context)):
+                flags += [context, str(_count(inp[context]))]
     if inp.get("-i"):
         flags.append("-i")
+    if inp.get("multiline"):
+        flags += ["-U", "--multiline-dotall"]
     if inp.get("glob"):
         flags += ["--glob", str(inp["glob"])]
     if inp.get("type"):

@@ -157,6 +157,12 @@ def test_a_failed_tool_shows_as_failed(store):
             {"type": "search", "query": "x", "path": CWD},
         ),
         (
+            "Grep",
+            {"pattern": "a.b", "output_mode": "content", "-C": 2, "multiline": True},
+            ["rg", "-C", "2", "-U", "--multiline-dotall", "--", "a.b", CWD],
+            {"type": "search", "query": "a.b", "path": CWD},
+        ),
+        (
             "Glob",
             {"pattern": "*.py"},
             ["rg", "--files", "--glob", "*.py", CWD],
@@ -171,6 +177,28 @@ def test_read_grep_and_glob_show_as_the_commands_that_do_the_same(store, name, i
     assert cmd["command"] == argv
     assert parsed.items() <= cmd["parsed_cmd"][0].items()
     assert cmd["parsed_cmd"][0]["cmd"] == shlex.join(argv)
+
+
+@pytest.mark.parametrize(
+    ("name", "inp", "shown"),
+    [
+        ("Read", {"file_path": "/a.py", "offset": 10, "limit": 5}, "cat -n /a.py | sed -n 10,14p"),
+        ("Read", {"file_path": "/a.py", "offset": 10}, "cat -n /a.py | sed -n '10,$p'"),
+        ("Read", {"file_path": "/a.py", "limit": 5}, "cat -n /a.py | sed -n 1,5p"),
+        (
+            "Grep",
+            {"pattern": "x", "path": "src", "offset": 3, "head_limit": 2},
+            "rg -l -- x src | sed -n 4,5p",
+        ),
+        ("Grep", {"pattern": "x", "path": "src", "head_limit": 2}, "rg -l -- x src | sed -n 1,2p"),
+    ],
+)
+def test_a_partial_read_or_search_shows_only_the_lines_it_returned(store, name, inp, shown):
+    lines = translate(one_call(name, inp, "result"), store)
+
+    (cmd,) = [i for i in items(lines) if i["type"] == "CommandExecution"]
+    assert cmd["command"] == ["/bin/bash", "-lc", shown]
+    assert cmd["parsed_cmd"][0]["cmd"] == shown
 
 
 def test_edit_becomes_a_file_change_with_a_diff(store):
