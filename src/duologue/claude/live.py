@@ -44,7 +44,7 @@ def _registered(registry: Path, session_id: str) -> int | None:
 def _resumed(session_id: str) -> int | None:
     try:
         out = subprocess.run(
-            ["ps", "-axo", "pid=,args="], capture_output=True, text=True, timeout=10
+            ["ps", "-A", "-o", "pid=,args="], capture_output=True, text=True, timeout=10
         ).stdout
     except (OSError, subprocess.SubprocessError):
         return None
