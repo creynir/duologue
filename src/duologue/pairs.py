@@ -11,6 +11,7 @@ import contextlib
 import fcntl
 import json
 import os
+import stat
 import time
 from collections.abc import Iterator
 from dataclasses import asdict, dataclass, field
@@ -170,18 +171,25 @@ def exclusive(lock_file: Path, wait: float = 60.0) -> Iterator[None]:
 
 
 def open_private(path: Path) -> int:
-    """Open ``path`` for appending as an owner-only file. A link planted in its place is
-    removed, never followed (so no other file's mode is changed)."""
+    """Open ``path`` for appending as an owner-only file of this user. A symbolic or hard link
+    planted in its place, or anything but such a file, is replaced, never written through (so
+    no other file is changed)."""
     flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_NOFOLLOW
-    try:
-        fd = os.open(path, flags, 0o600)
-    except OSError:
-        if not os.path.islink(path):
-            raise
+    for _ in range(2):
+        try:
+            fd = os.open(path, flags, 0o600)
+        except OSError:
+            if not os.path.islink(path):
+                raise
+            os.unlink(path)
+            continue
+        st = os.fstat(fd)
+        if stat.S_ISREG(st.st_mode) and st.st_nlink == 1 and st.st_uid == os.getuid():
+            os.fchmod(fd, 0o600)  # also a file created with a looser mode
+            return fd
+        os.close(fd)
         os.unlink(path)
-        fd = os.open(path, flags, 0o600)
-    os.fchmod(fd, 0o600)  # also a file created with a looser mode
-    return fd
+    raise OSError(f"{path}: could not be opened as a private file")
 
 
 class ActivityLog:

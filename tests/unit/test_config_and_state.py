@@ -1,4 +1,5 @@
 import json
+import os
 import plistlib
 from pathlib import Path
 
@@ -116,6 +117,10 @@ def test_activity_log(tmp_path: Path, monkeypatch):
     log.path.symlink_to(other)  # a link planted where the log goes is replaced, not followed
     log.write("e", "sync", "after the link")
     assert not log.path.is_symlink() and oct(other.stat().st_mode & 0o777) == "0o644"
+    log.path.unlink()
+    os.link(other, log.path)  # a hard link: writing through it would change the other file
+    log.write("f", "sync", "after the hard link")
+    assert other.read_text() == "not the log" and log.path.stat().st_nlink == 1
 
 
 # --------------------------------------------------------------------------------------- gate
