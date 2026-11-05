@@ -61,8 +61,11 @@ def ends_with_newline(path: Path) -> bool:
 
 
 def clean(text: str) -> str:
-    """``text`` with lone surrogates replaced by U+FFFD, so it encodes as UTF-8."""
-    return LONE_SURROGATE.sub("�", text)
+    """``text`` with surrogate pairs joined into the characters they stand for and lone
+    surrogates replaced by U+FFFD, so it encodes as UTF-8."""
+    if not LONE_SURROGATE.search(text):
+        return text
+    return text.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
 
 
 def dumps(record: dict, compact: bool = False) -> str:

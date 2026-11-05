@@ -72,8 +72,7 @@ def append_records(
     if live is not None and live() is not None:
         # Claude opened the session meanwhile: its next message would leave these records on
         # a side branch. Take them out while they are still the last thing in the file.
-        if tail_state(path, intent) == "complete":
-            os.truncate(path, intent.base)
+        if _take_back(path, intent):
             raise Wait("Claude opened the session while duologue wrote; it tries again later")
         raise Blocked("Claude opened the session while duologue wrote to it; check the session")
     _verify(path, intent)
@@ -212,6 +211,22 @@ def _append(path: Path, intent: Intent) -> None:
             if tail_state(path, intent) == "partial":
                 os.truncate(path, intent.base)
             raise
+
+
+def _take_back(path: Path, intent: Intent) -> bool:
+    """Truncate duologue's just-written records if the file still ends exactly with them. The
+    size and the bytes are checked on the same open handle right before the truncate, so a
+    record Claude appends is never cut (Claude Code holds no lock duologue could take; this
+    leaves only the instant between the last read and the truncate)."""
+    with open(path, "r+b") as fh:
+        fh.seek(intent.base)
+        if fh.read(len(intent.data) + 1) != intent.data:
+            return False
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() != intent.end:
+            return False
+        fh.truncate(intent.base)
+    return True
 
 
 def _take_out(path: Path, intent: Intent) -> None:

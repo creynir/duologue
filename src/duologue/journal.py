@@ -14,8 +14,9 @@ from typing import Protocol
 
 
 class Wait(Exception):
-    """The other app is busy with the conversation; a later pass tries again. Raised after a
-    write's intent was recorded, it leaves that intent to settle with ``recover`` first."""
+    """The other app is busy with the conversation; a later pass tries again. When it is
+    raised after a write's intent was recorded (``Journal.begin``), that intent is left to settle
+    with ``recover`` first."""
 
 
 class Blocked(Exception):

@@ -265,7 +265,17 @@ def daemon() -> None:
     server, guard = Server(), threading.Lock()
     path = control_socket()
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.unlink(missing_ok=True)  # a socket file a stopped daemon left behind
+    if path.exists():  # a socket file a stopped daemon left behind; a live one stays
+        probe = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        try:
+            probe.connect(str(path))
+        except OSError:
+            path.unlink()
+        else:
+            print("another daemon is listening", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            probe.close()
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(path))
     listener.listen()

@@ -142,8 +142,9 @@ def model_provider(codex_home: Path) -> str | None:
     profiles = config.get("profiles")
     if isinstance(profile, str) and isinstance(profiles, dict):
         chosen = profiles.get(profile)
-        if isinstance(chosen, dict) and isinstance(chosen.get("model_provider"), str):
-            return chosen["model_provider"]
+        value = chosen.get("model_provider") if isinstance(chosen, dict) else None
+        if isinstance(value, str) and value:
+            return value
     value = config.get("model_provider")
     return value if isinstance(value, str) and value else "openai"
 

@@ -135,6 +135,10 @@ def test_model_provider(tmp_path: Path):
         'model_provider = "local"\nprofile = "work"\n[profiles.work]\nmodel_provider = "azure"\n'
     )
     assert model_provider(tmp_path) == "azure"
+    (tmp_path / "config.toml").write_text(
+        'model_provider = "local"\nprofile = "work"\n[profiles.work]\nmodel_provider = ""\n'
+    )
+    assert model_provider(tmp_path) == "local"
     (tmp_path / "config.toml").write_text("not toml = = \n")
     assert model_provider(tmp_path) is None
 

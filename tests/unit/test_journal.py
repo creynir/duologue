@@ -86,3 +86,12 @@ def test_reading_from_inside_a_line_is_refused(tmp_path: Path):
     assert [ln.record for ln in read_lines(path, 9)] == [{"b": 2}]
     with pytest.raises(ValueError):
         read_lines(path, 3)
+
+
+def test_clean_joins_surrogate_pairs_and_replaces_lone_ones():
+    from duologue.jsonl import clean
+
+    assert clean("plain") == "plain"
+    assert clean("\ud83d\ude00 ok") == "\U0001f600 ok"  # a pair: the emoji it stands for
+    assert clean("cut \ud83d") == "cut \ufffd"
+    assert clean("\ude00 then \ud83d\ude00") == "\ufffd then \U0001f600"

@@ -249,10 +249,12 @@ def two_turns(tmp_path: Path, thread_id: str = THREAD):
 
 def test_a_partly_indexed_write_blocks_and_stays(codex, thread, tmp_path, monkeypatch):
     monkeypatch.setenv("FAKE_CODEX_INDEX_TURNS", "1")
-    before = thread.stat().st_size
+    before = thread.read_bytes()
+    journal = MemoryJournal()
     with pytest.raises(Blocked, match="indexed 1 of the 2"):
-        append_turns(codex, THREAD, two_turns(tmp_path), journal=MemoryJournal())
-    assert thread.stat().st_size > before  # Codex indexed part of it: nothing is taken out
+        append_turns(codex, THREAD, two_turns(tmp_path), journal=journal)
+    # Codex indexed part of it: nothing is taken out, and nothing before it changed.
+    assert thread.read_bytes() == before + journal.intent.data
 
 
 def test_a_write_whose_last_line_codex_did_not_index_blocks(codex, thread, tmp_path, monkeypatch):

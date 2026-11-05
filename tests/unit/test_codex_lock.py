@@ -111,7 +111,10 @@ def test_release_gives_up_the_lock_even_when_coordination_times_out(tmp_path: Pa
 
 @pytest.mark.parametrize("bad", ["*", "../../outside/x", "not-a-uuid"])
 def test_a_malformed_thread_id_names_no_lock_file(tmp_path: Path, bad: str):
+    home = tmp_path / "codex"
+    home.mkdir()
     with pytest.raises(ValueError):
-        WriterLock(tmp_path, bad)
+        WriterLock(home, bad)
     with pytest.raises(ValueError):
-        is_held(tmp_path, bad)
+        is_held(home, bad)
+    assert list(tmp_path.rglob("*.lock")) == []  # no lock file, inside the home or outside it

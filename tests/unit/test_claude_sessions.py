@@ -392,6 +392,26 @@ def test_a_claude_that_opens_the_session_during_the_write_gets_it_back_untouched
     assert path.stat().st_size == size
 
 
+def test_a_record_claude_writes_after_duologue_is_never_taken_back(tmp_path: Path, monkeypatch):
+    from duologue.claude import sessions
+
+    path = write(tmp_path, a_session().records)
+    records = records_after(read_lines(path))
+    claude_record = b'{"type": "user", "uuid": "c1a0de00-0000-4000-8000-0000000000ee"}\n'
+    real = sessions._take_back
+
+    def claude_writes_first(p, intent):
+        with open(p, "ab") as fh:  # Claude appends between the live check and the take-back
+            fh.write(claude_record)
+        return real(p, intent)
+
+    monkeypatch.setattr(sessions, "_take_back", claude_writes_first)
+    answers = iter([None, 4242])
+    with pytest.raises(Blocked, match="opened the session"):
+        append_records(path, records, journal=MemoryJournal(), live=lambda: next(answers))
+    assert path.read_bytes().endswith(claude_record)
+
+
 def test_a_transcript_that_moved_on_waits(tmp_path: Path):
     c = a_session()
     path = write(tmp_path, c.records)
