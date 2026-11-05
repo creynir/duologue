@@ -23,6 +23,7 @@ from duologue.journal import Blocked, Intent, Journal, Wait, prefix_hash, tail_s
 from duologue.jsonl import encode, ends_with_newline, iter_lines, read_lines
 
 THINKING = ("thinking", "redacted_thinking")
+TRAILERS = ("last-prompt",)  # bookkeeping lines that may follow the records, outside the chain
 
 Live = Callable[[], "int | None"]  # the pid of a Claude Code that has the session, or None
 
@@ -49,22 +50,27 @@ def append_records(
     """Append ``records`` to the transcript at ``path``. Raises :class:`Wait` when Claude has the
     session open or the transcript moved on since the records were built (or since the caller
     read it at ``expect_size``), and :class:`Blocked` when the records fail the structure check
-    or only some of them are there."""
-    ids = tuple(str(r.get("uuid")) for r in records)
+    or only some of them are there. ``records`` may end with a ``last-prompt`` line."""
+    chain = [r for r in records if r.get("type") not in TRAILERS]
+    ids = tuple(str(r.get("uuid")) for r in chain)
     size = path.stat().st_size
-    if not records:
+    if not chain:
         return Written(path, size, size, (), False)
     end = tail(iter_lines(path))
     there = [u for u in ids if u in end.uuids]
     if there:
         if len(there) == len(ids):
             start, stop = _record_range(path, ids)
-            _same_records(path, start, stop, records)
+            _same_records(path, start, stop, chain)
             return Written(path, start, stop, ids, False)
         raise Blocked(f"{len(there)} of the {len(ids)} records are already in the Claude session")
-    if records[0].get("parentUuid") != end.parent_uuid or expect_size not in (None, size):
+    if chain[0].get("parentUuid") != end.parent_uuid or expect_size not in (None, size):
         raise Wait("the Claude transcript moved on; duologue builds its records again")
-    problems = check_structure(end, records)
+    problems = check_structure(end, chain)
+    if records[: len(chain)] != chain:
+        problems.append("a last-prompt line comes before the end")
+    else:
+        problems += _check_trailers(chain, records[len(chain) :])
     if problems:
         raise Blocked("the records for the Claude session fail the structure check: " + problems[0])
     if not ends_with_newline(path):
@@ -197,6 +203,20 @@ def check_structure(end: Tail, new: list[dict]) -> list[str]:
     if calls:
         problems.append("the last tool call has no result")
     return problems
+
+
+def _check_trailers(chain: list[dict], trailers: list[dict]) -> list[str]:
+    """A ``last-prompt`` line after the records names the last of them and their session."""
+    if len(trailers) > 1:
+        return ["more than one last-prompt line"]
+    for t in trailers:
+        if t.get("leafUuid") != chain[-1].get("uuid"):
+            return ["the last-prompt line does not name the last record"]
+        if t.get("sessionId") != chain[-1].get("sessionId"):
+            return ["the last-prompt line names another session"]
+        if not isinstance(t.get("lastPrompt"), str):
+            return ["the last-prompt line has no prompt"]
+    return []
 
 
 def _not_live(live: Live | None) -> None:

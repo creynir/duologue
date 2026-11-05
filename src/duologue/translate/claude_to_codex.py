@@ -21,6 +21,7 @@ from dataclasses import dataclass
 from duologue.translate.common import (
     LOCAL_COMMAND,
     MARK,
+    ORIGIN,
     epoch_ms,
     is_note,
     stable_id,
@@ -75,14 +76,17 @@ def queued_prompt(record: dict) -> dict | None:
     }
 
 
-def conversation(records: Iterable[dict]) -> list[dict]:
+def conversation(records: Iterable[dict], skip_ours: bool = False) -> list[dict]:
     """The records that carry the conversation: user and assistant messages on the main thread,
     and messages queued while Claude was busy, without meta records, compaction summaries or
-    duologue's own notes."""
+    duologue's own notes. ``skip_ours`` also leaves out every record duologue wrote from Codex:
+    a sync pass never sends those back (a history copy for a new pair does)."""
     out = []
     for r in records:
         r = queued_prompt(r) or r
         if r.get("type") not in ("user", "assistant") or r.get("isSidechain"):
+            continue
+        if skip_ours and r.get(ORIGIN):
             continue
         if not r.get("uuid"):  # every id duologue derives starts from the source record's uuid
             continue
@@ -123,10 +127,10 @@ def _is_local_command(record: dict) -> bool:
     return text.lstrip().startswith(LOCAL_COMMAND)
 
 
-def has_content(records: Iterable[dict]) -> bool:
+def has_content(records: Iterable[dict], skip_ours: bool = False) -> bool:
     """Whether the records hold something Codex would get: a message the user typed, text or a
     tool call. Thinking alone, bookkeeping and duologue's own notes do not count."""
-    for r in conversation(records):
+    for r in conversation(records, skip_ours):
         if r.get("type") == "user":
             if is_user_input(r):
                 return True
@@ -157,14 +161,17 @@ def claude_to_codex(
     outputs: OutputStore,
     default_cwd: str,
     now_ms: int | None = None,
+    skip_ours: bool = False,
 ) -> list[RolloutLine]:
     """Translate new Claude records into Codex rollout lines.
 
     ``key`` identifies the pair; ids derive from it and from the source records, so translating
     the same records again gives the same lines. ``default_cwd`` is used for records that do not
     name their folder. ``now_ms`` stamps lines whose source has no timestamp at all.
+    ``skip_ours`` leaves out records duologue wrote from Codex (see :func:`conversation`).
     """
-    return _Translator(thread_id, key, outputs, default_cwd, now_ms).run(conversation(records))
+    records = conversation(records, skip_ours)
+    return _Translator(thread_id, key, outputs, default_cwd, now_ms).run(records)
 
 
 def note_turn(text: str, *, thread_id: str, key: str, ms: int) -> list[RolloutLine]:

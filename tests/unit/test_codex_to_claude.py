@@ -11,6 +11,7 @@ from duologue.translate.codex_to_claude import (
     claude_records,
     codex_to_claude_steps,
     parse_unified_diff,
+    undone_turns,
 )
 from duologue.translate.common import MARK
 from duologue.translate.outputs import OutputStore
@@ -479,3 +480,132 @@ def test_steps_without_keys_still_get_stable_ids():
     steps = [ClaudeStep("assistant", [{"type": "text", "text": "hi"}], None, None)]
 
     assert records_of(steps) == records_of(steps)
+
+
+# ------------------------------------------------------------------------------- rollbacks
+def rollback(x: CodexRollout, n: int) -> None:
+    x.records.append(
+        {
+            "timestamp": "2026-11-04T15:00:00.000Z",
+            "type": "event_msg",
+            "payload": {"type": "thread_rolled_back", "num_turns": n},
+        }
+    )
+
+
+def a_turn(x: CodexRollout, name: str) -> None:
+    x.start(name)
+    x.user_says(name, f"{name}-u")
+    x.agent_says("ok", f"{name}-a")
+    x.complete("ok")
+
+
+def said(steps) -> list[str]:
+    return [s.blocks[0]["text"] for s in steps if s.role == "user"]
+
+
+@pytest.mark.parametrize(
+    "plan, kept, undone",
+    [
+        (["a", "b", 1, "c"], ["a", "c"], 0),
+        (["a", 2, "b"], ["b"], 1),
+        ([3, "a"], ["a"], 3),
+        (["a", "b", 1, 1, "c"], ["c"], 0),
+        (["a", 0, "b"], ["a", "b"], 0),
+        (["a", "b", 1], ["a"], 0),
+    ],
+)
+def test_turns_codex_rolled_back_are_left_out_and_counted(store, plan, kept, undone):
+    x = CodexRollout()
+    for step in plan:
+        rollback(x, step) if isinstance(step, int) else a_turn(x, step)
+
+    assert said(steps_of(x, store)) == kept
+    assert undone_turns(x.records) == undone
+
+
+def test_a_rollback_ends_the_turn_it_falls_in(store):
+    x = CodexRollout()
+    a_turn(x, "a")
+    x.start("b")
+    x.user_says("b", "b-u")
+    rollback(x, 1)  # Codex closes the open turn "b", then drops it
+    a_turn(x, "c")
+
+    assert said(steps_of(x, store)) == ["a", "c"]
+
+
+def test_setup_lines_before_the_first_turn_are_not_a_turn():
+    x = CodexRollout()
+    x.records.append({"timestamp": "t", "type": "session_meta", "payload": {"id": "th-1"}})
+    rollback(x, 1)
+
+    assert undone_turns(x.records) == 1
+
+
+# ------------------------------------------------------------------------------ echo guard
+def test_a_sync_never_sends_back_the_turns_duologue_wrote(store):
+    from builders import ClaudeTranscript
+
+    from duologue.translate.claude_to_codex import claude_to_codex
+
+    c = ClaudeTranscript()
+    c.user("from claude")
+    c.assistant("ok")
+    ours = claude_to_codex(
+        c.records, thread_id="th-1", key="pair-1", outputs=store, default_cwd="/w"
+    )
+    x = CodexRollout()
+    x.records += [
+        {"timestamp": "2026-11-04T14:00:00.000Z", "type": ln.type, "payload": ln.payload}
+        for ln in ours
+    ]
+    a_turn(x, "native")
+
+    assert said(steps_of(x, store)) == ["from claude", "native"]  # a history copy keeps them
+    kept = codex_to_claude_steps(x.records, key="pair-1", outputs=store, skip_ours=True)
+    assert said(kept) == ["native"]
+
+
+def test_every_record_names_its_origin_and_the_list_shows_the_last_prompt(store):
+    x = CodexRollout()
+    a_turn(x, "first")
+    x.start("t2")
+    x.user_says("second\n  line " + "x" * 300, "t2-u")
+    x.agent_says("ok", "t2-a")
+    x.complete("ok")
+    rs = claude_records(
+        steps_of(x, store),
+        session_id=SESSION,
+        parent_uuid="parent-0",
+        parent_type="assistant",
+        model="m",
+        version="2.1.303",
+        cwd="/w",
+        now_ms=START_MS,
+        last_prompt=True,
+    )
+    *chain, last = rs
+
+    assert all(r["duologueSource"] == "codex" for r in chain)
+    assert last["type"] == "last-prompt" and set(last) == {
+        "type",
+        "lastPrompt",
+        "leafUuid",
+        "sessionId",
+    }
+    assert last["leafUuid"] == chain[-1]["uuid"] and last["sessionId"] == SESSION
+    assert last["lastPrompt"].startswith("second line xxx") and last["lastPrompt"].endswith(
+        "\u2026"
+    )
+    assert len(last["lastPrompt"]) == 201
+
+
+def test_no_last_prompt_without_a_typed_message(store):
+    x = CodexRollout()
+    x.start("t")
+    x.agent_says("on my own", "a")
+    x.complete("on my own")
+    rs = records_of(steps_of(x, store))
+
+    assert all(r["type"] != "last-prompt" for r in rs)

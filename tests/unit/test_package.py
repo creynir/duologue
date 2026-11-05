@@ -24,3 +24,15 @@ def test_python_dash_m_runs_the_cli():
     )
     assert result.returncode == 0
     assert result.stdout.strip() == f"duologue {duologue.__version__}"
+
+
+def test_derived_ids_are_told_apart_from_the_apps_own():
+    import uuid
+
+    from duologue.codex.rollout import uuid7
+    from duologue.translate.common import is_derived_id, stable_id
+
+    assert is_derived_id(str(stable_id("claude-turn", "k", "u")))
+    assert not is_derived_id(uuid7(1_793_800_800_000))
+    assert not is_derived_id(str(uuid.uuid4()))
+    assert not is_derived_id("turn-1") and not is_derived_id(None)

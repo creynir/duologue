@@ -28,7 +28,8 @@ TURN_ENDS = ("task_complete", "turn_aborted")
 def find_rollout(codex_home: Path, thread_id: str, sqlite: Path | None = None) -> Path | None:
     """The thread's rollout: the path Codex's state database (in ``sqlite``, default the home)
     records, when the file is there, else the newest file named for the thread under
-    ``sessions/`` or ``archived_sessions/``."""
+    ``sessions/`` or ``archived_sessions/``. A thread rewound in Codex continues in a file named
+    for the thread and a new rollout (``rollout-<time>-<thread>_<rollout>.jsonl``)."""
     require_id(thread_id, "thread id")
     home = Path(codex_home)
     recorded = _recorded_path(Path(sqlite or home), thread_id)
@@ -38,8 +39,9 @@ def find_rollout(codex_home: Path, thread_id: str, sqlite: Path | None = None) -
     for folder in (SESSIONS, ARCHIVED):
         base = home / folder
         if base.is_dir():
-            found += base.rglob(f"rollout-*-{thread_id}.jsonl")
-            found += base.rglob(f"rollout-*-{thread_id}.jsonl.zst")
+            for name in (thread_id, f"{thread_id}_*"):
+                found += base.rglob(f"rollout-*-{name}.jsonl")
+                found += base.rglob(f"rollout-*-{name}.jsonl.zst")
     # A readable copy wins over a compressed one, then the newest; Codex may move one meanwhile.
     stamped = [(not is_compressed(p), _mtime(p), p) for p in found]
     stamped = [(plain, t, p) for plain, t, p in stamped if t is not None]

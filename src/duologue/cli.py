@@ -11,6 +11,7 @@ import sys
 from collections.abc import Iterator, Sequence
 
 from duologue import __version__, config, gate, linking
+from duologue.codex.rollout import is_compressed
 from duologue.codex.rpc import daemon_running
 from duologue.engine import TRANSIENT, Engine, _printable
 from duologue.journal import Blocked, Wait
@@ -236,11 +237,65 @@ def cmd_doctor(args) -> int:
             )
             if p.pending:
                 report(False, f'pair "{p.name}": a write to {p.pending.side} is not confirmed yet')
+            for ok, text in _pair_files(e, p):
+                if ok is None:
+                    print(f'    pair "{p.name}": {text}')
+                else:
+                    report(ok, f'pair "{p.name}": {text}')
     try:
         print(f"    background service: {Service(cfg.home).status()}")
     except RuntimeError as err:
         print(f"    background service: {err}")
     return FAILED if problems else 0
+
+
+# Claude Code (2.1.318) loads a transcript larger than this only from its last compaction on.
+CLAUDE_FULL_LOAD = 5 * 1024 * 1024
+
+
+def _pair_files(e, p) -> list[tuple[bool | None, str]]:
+    """What doctor says about a pair's two files: problems (False) and notes (None)."""
+    out: list[tuple[bool | None, str]] = []
+    try:
+        size = e.claude_path(p).stat().st_size
+    except (Blocked, OSError):
+        size = None  # the pair's status already says so
+    if size is not None and size > CLAUDE_FULL_LOAD:
+        out.append(
+            (
+                None,
+                f"the Claude transcript is {size / 2**20:.1f} MiB; above 5 MiB Claude Code loads "
+                "it from its last compaction on",
+            )
+        )
+    try:
+        xpath = e.codex_file(p)
+        size = xpath.stat().st_size
+    except (Blocked, OSError):
+        return out
+    if is_compressed(xpath):
+        out.append((None, "Codex keeps the thread compressed while it is idle"))
+        return out
+    index = e.codex.index(p.codex)
+    if index.next_offset is None:
+        out.append((None, "Codex has not indexed the thread yet"))
+    elif index.next_offset > size:
+        out.append(
+            (
+                False,
+                f"Codex's index of the thread ends at byte {index.next_offset}, past the end of "
+                f"its file ({size} bytes)",
+            )
+        )
+    elif index.next_offset < size:
+        out.append(
+            (
+                None,
+                f"Codex has indexed {index.next_offset} of the thread's {size} bytes; it catches "
+                "up when the thread is next opened",
+            )
+        )
+    return out
 
 
 def cmd_service(args) -> int:

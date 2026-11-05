@@ -42,7 +42,13 @@ from duologue.journal import Blocked, Intent, Wait, prefix_hash, tail_state
 from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import ActivityLog, Cursor, Pair, Pending, Store, now_iso, write_atomic
 from duologue.translate.claude_to_codex import claude_to_codex, has_content
-from duologue.translate.codex_to_claude import ClaudeStep, claude_records, codex_to_claude_steps
+from duologue.translate.codex_to_claude import (
+    UNDONE_NOTE,
+    ClaudeStep,
+    claude_records,
+    codex_to_claude_steps,
+    undone_turns,
+)
 from duologue.translate.outputs import OutputStore
 
 CONFLICT = (
@@ -98,20 +104,31 @@ class Engine:
     def _sync(self, pair: Pair, force: bool) -> Outcome:
         if pair.pending:
             self.settle(pair)
-        cpath, xpath = self.paths(pair)
+        cpath, xpath = self.claude_path(pair), self.codex_file(pair)
         seen = [_stamp(cpath), _stamp(xpath)]
         if not force and pair.seen == seen:
             return Outcome("idle", "up to date")
         ccur = self.claude_cursor(pair, cpath, seen[0])
-        xcur = self.codex_cursor(pair, xpath, seen[1])
-        csize, xsize = seen[0][1], seen[1][1]  # what this pass reads; a write expects them
+        csize = seen[0][1]  # what this pass reads; a write expects it
         clines = read_lines(cpath, ccur.end, csize)
+        _check_record_types(clines)
+        claude_new = has_content((ln.record for ln in clines), skip_ours=True)
+        if is_compressed(xpath):
+            # Codex compresses a thread once it has been idle a while: nothing new on its side.
+            if not claude_new:
+                pair.seen = seen
+                return Outcome("idle", "up to date")
+            self.ready_for_codex(pair, cpath, clines)
+            xpath = self.expand(pair)
+            seen[1] = _stamp(xpath)
+        xcur = self.codex_cursor(pair, xpath, seen[1])
+        xsize = seen[1][1]
         xall = read_lines(xpath, xcur.end, xsize)
         ends = turn_ends(xall)
         xlines = [ln for ln in xall if ln.end <= ends[-1][1]] if ends else []
-        _check_record_types(clines)
-        if has_content(ln.record for ln in clines):
-            if self.codex_steps(pair, xlines):
+        steps, undone = self.codex_part(pair, xlines)
+        if claude_new:
+            if steps or undone:
                 pair.conflict = True
                 text = CONFLICT.format(name=pair.name)
                 self.log.write(pair.name, "conflict", text)
@@ -124,21 +141,14 @@ class Engine:
                 raise Wait(
                     "the Claude session is open; Codex's turns are copied to it once it closes"
                 )
-            steps = self.codex_steps(pair, xlines)
             if steps:
-                return self.to_claude(pair, cpath, xlines, steps, csize, live)
+                return self.to_claude(pair, cpath, xlines, steps, csize, live, undone)
         pair.seen = seen
         return Outcome("idle", "up to date")
 
     # ---------------------------------------------------------------------------- directions
     def to_codex(self, pair: Pair, cpath: Path, clines: list[Line], xsize: int) -> Outcome:
-        if not settled(clines) and not self.claude_stopped(pair, cpath):
-            raise Wait("Claude is still working on its turn")
-        if time.time() - cpath.stat().st_mtime < self.config.quiet_seconds:
-            raise Wait("Claude's turn just ended; it is copied once the session is quiet")
-        if lock.is_held(self.codex.home, pair.codex) and not daemon_running(self.codex.home):
-            raise Wait("the thread is open in Codex")  # checked first: it is the cheap check
-        self.codex_gate()
+        self.ready_for_codex(pair, cpath, clines)
         cwd = next((ln.record["cwd"] for ln in reversed(clines) if ln.record.get("cwd")), "")
         cwd = cwd or session_meta(self.codex_path(pair)).get("cwd", "")
         lines = claude_to_codex(
@@ -147,6 +157,7 @@ class Engine:
             key=pair.key,
             outputs=self.outputs,
             default_cwd=cwd,
+            skip_ours=True,
         )
         after_claude = {
             "end": clines[-1].end,
@@ -170,6 +181,7 @@ class Engine:
         steps: list[ClaudeStep],
         csize: int,
         live,
+        undone: int = 0,
     ) -> Outcome:
         t = tail(iter_lines(cpath))
         records = claude_records(
@@ -183,6 +195,8 @@ class Engine:
             git_branch=t.git_branch,
             dangling=t.dangling,
             source_assistant=t.last_assistant,
+            lead_extra=UNDONE_NOTE.format(n=undone) if undone else "",
+            last_prompt=True,
         )
         turns = [turn for turn, _ in turn_ends(xlines)]
         after_codex = {"end": xlines[-1].end, "anchor": turns[-1] if turns else None}
@@ -221,6 +235,11 @@ class Engine:
                     f"Codex rewrote the thread; synced point found again after turn {cur.anchor}",
                 )
                 return found
+        if session_meta(xpath).get("history_base"):
+            raise Blocked(
+                "the Codex thread was rewound in Codex (it now continues in a new file); check "
+                "both sides, then run duologue release to sync on from where they stand"
+            )
         raise Blocked(
             "the Codex thread changed before the point already synced; check it, then run "
             "duologue release to sync on from where it stands"
@@ -353,27 +372,58 @@ class Engine:
 
     # ------------------------------------------------------------------------------- helpers
     def paths(self, pair: Pair) -> tuple[Path, Path]:
+        return self.claude_path(pair), self.codex_path(pair)
+
+    def claude_path(self, pair: Pair) -> Path:
         cpath = find_transcript(self.config.claude_home, pair.claude)
         if cpath is None:
             raise Blocked(f"the Claude session {pair.claude} is not on this machine any more")
-        return cpath, self.codex_path(pair)
+        return cpath
 
-    def codex_path(self, pair: Pair) -> Path:
+    def codex_file(self, pair: Pair) -> Path:
+        """The thread's rollout, which may be compressed."""
         xpath = self.codex.rollout(pair.codex)
         if xpath is None:
             raise Blocked(f"the Codex thread {pair.codex} is not on this machine any more")
+        return xpath
+
+    def codex_path(self, pair: Pair) -> Path:
+        """The thread's rollout, readable."""
+        xpath = self.codex_file(pair)
         if is_compressed(xpath):
             raise Wait(
                 "Codex compressed the idle thread; it syncs again once it is opened in Codex"
             )
         return xpath
 
-    def codex_steps(self, pair: Pair, xlines: list[Line]) -> list[ClaudeStep]:
+    def expand(self, pair: Pair) -> Path:
+        """Have Codex write a compressed thread out again (it does when a thread is resumed), so
+        Claude's turns can be added to it."""
+        codex_threads.resume(self.codex, pair.codex)
+        xpath = self.codex_file(pair)
+        if is_compressed(xpath):
+            raise Wait("Codex compressed the idle thread and did not write it out again")
+        self.log.write(pair.name, "expand", "Codex wrote the compressed thread out again")
+        return xpath
+
+    def codex_part(self, pair: Pair, xlines: list[Line]) -> tuple[list[ClaudeStep], int]:
+        """The steps for Codex's new turns (never the ones duologue wrote), and how many earlier
+        turns Codex rolled back in them."""
         if not xlines:
-            return []
-        return codex_to_claude_steps(
-            [ln.record for ln in xlines], key=pair.key, outputs=self.outputs
-        )
+            return [], 0
+        records = [ln.record for ln in xlines]
+        steps = codex_to_claude_steps(records, key=pair.key, outputs=self.outputs, skip_ours=True)
+        return steps, undone_turns(records)
+
+    def ready_for_codex(self, pair: Pair, cpath: Path, clines: list[Line]) -> None:
+        """Wait unless Claude's turn is over and quiet, and the thread may be written."""
+        if not settled(clines) and not self.claude_stopped(pair, cpath):
+            raise Wait("Claude is still working on its turn")
+        if time.time() - cpath.stat().st_mtime < self.config.quiet_seconds:
+            raise Wait("Claude's turn just ended; it is copied once the session is quiet")
+        if lock.is_held(self.codex.home, pair.codex) and not daemon_running(self.codex.home):
+            raise Wait("the thread is open in Codex")  # checked first: it is the cheap check
+        self.codex_gate()
 
     def claude_live(self, pair: Pair):
         """The check that no Claude Code has the session, for the append to run at write time."""

@@ -480,3 +480,19 @@ def test_a_queued_message_is_content():
     t = ClaudeTranscript()
     t.queued("one more thing")
     assert has_content(t.records)
+
+
+def test_a_sync_never_sends_back_the_records_duologue_wrote(store):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("from codex", duologueSource="codex")
+    t.assistant("answered in codex", duologueSource="codex")
+    assert has_content(t.records) and not has_content(t.records, skip_ours=True)
+    t.user("typed in claude")
+    t.assistant("ok")
+    lines = claude_to_codex(
+        t.records, thread_id="th-1", key="pair-1", outputs=store, default_cwd="/w", skip_ours=True
+    )
+    said = [i["content"][0]["text"] for i in items(lines) if i["type"] == "UserMessage"]
+    assert said == ["typed in claude"]

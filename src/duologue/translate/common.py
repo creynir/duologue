@@ -15,6 +15,19 @@ NOTE_PREFIX = f"[{MARK}:"  # every note duologue writes starts with this
 # Every id duologue writes derives from this namespace and the source record's id.
 NAMESPACE = uuid.UUID("33315e20-742e-4a7d-90d3-56d6e041de3a")
 
+# The field on every Claude record duologue writes, naming the side it came from.
+ORIGIN = "duologueSource"
+
+
+def is_derived_id(value: object) -> bool:
+    """Whether ``value`` is a name-based (version 5) uuid, as every id duologue derives is. Codex
+    and Claude Code make random or time-based ones."""
+    try:
+        return uuid.UUID(str(value)).version == 5
+    except ValueError:
+        return False
+
+
 # Codex injects these as user-role context. They are not the user's words.
 CODEX_INJECTED = (
     "<environment_context>",

@@ -144,6 +144,44 @@ def turn_ids(lines: Sequence[RolloutLine]) -> tuple[str, ...]:
     )
 
 
+def check_turns(lines: Sequence[RolloutLine], thread_id: str) -> list[str]:
+    """What is wrong with ``lines`` as whole turns for thread ``thread_id``, in words; empty when
+    nothing is. The rules: each turn starts with ``task_started`` and ends with a turn end of the
+    same id before the next starts; every item belongs to the open turn and the thread; turn and
+    item ids are not repeated."""
+    problems: list[str] = []
+    turn: str | None = None
+    turns: set[str] = set()
+    items: set[str] = set()
+    for n, ln in enumerate(lines):
+        where = f"line {n + 1} of {len(lines)}"
+        kind = ln.payload.get("type") if ln.type == "event_msg" else None
+        if kind == "task_started":
+            t = ln.payload.get("turn_id")
+            if turn is not None:
+                problems.append(f"{where} starts a turn before the last one ended")
+            if not t or t in turns:
+                problems.append(f"{where} starts a turn with a missing or repeated id")
+            turn = t
+            turns.add(t)
+        elif turn is None:
+            problems.append(f"{where} is outside a turn")
+        elif kind in TURN_ENDS:
+            if ln.payload.get("turn_id") != turn:
+                problems.append(f"{where} ends a turn that is not the open one")
+            turn = None
+        elif kind == "item_completed":
+            item = ln.payload.get("item") or {}
+            if ln.payload.get("turn_id") != turn or ln.payload.get("thread_id") != thread_id:
+                problems.append(f"{where} has an item of another turn or thread")
+            if not item.get("id") or item["id"] in items:
+                problems.append(f"{where} has an item with a missing or repeated id")
+            items.add(item.get("id"))
+    if turn is not None:
+        problems.append("the last turn does not end")
+    return problems
+
+
 def encode(lines: Sequence[RolloutLine], first_ordinal: int) -> bytes:
     """Rollout lines as Codex writes them: compact JSON, one per line, ordinals in sequence."""
     out = []
@@ -177,6 +215,9 @@ def append_turns(
     turns = turn_ids(lines)
     if len(set(turns)) != len(turns):
         raise Blocked("the turns to add repeat a turn id; Codex would keep only one of them")
+    problems = check_turns(lines, thread_id)
+    if problems:
+        raise Blocked("the turns for the Codex thread fail the structure check: " + problems[0])
     path = _rollout(codex, thread_id)
     if not lines:
         size = path.stat().st_size
@@ -206,6 +247,12 @@ def append_turns(
             return Appended(path, start, end, turns, False)
         raise Blocked(
             f"{len(present)} of the {len(turns)} turns to add are already in the Codex thread"
+        )
+    last = _last_ordinal(path, size)
+    if last is not None and index.next_ordinal is not None and last != index.next_ordinal - 1:
+        raise Blocked(
+            f"the Codex thread's last line is number {last}, but Codex's index expects "
+            f"{index.next_ordinal} next; the thread was left as it is"
         )
     data = encode(lines, index.next_ordinal or 0)
     with _writer(codex, thread_id):
@@ -406,6 +453,27 @@ def _caught_up(codex: Codex, thread_id: str, path: Path) -> tuple[HistoryIndex, 
             f"Codex's index of the thread ends at byte {index.next_offset}, its file at {size}"
         )
     return index, size
+
+
+def _last_ordinal(path: Path, size: int) -> int | None:
+    """The ordinal on the last line before byte ``size`` (which ends a line), or None when it has
+    none. Read from the end, so a long thread costs one small read."""
+    chunk = 1 << 16
+    with open(path, "rb") as fh:
+        while True:
+            start = max(0, size - chunk)
+            fh.seek(start)
+            data = fh.read(size - start).rstrip(b"\n")
+            cut = data.rfind(b"\n")
+            if cut >= 0 or start == 0:
+                break
+            chunk *= 4
+    try:
+        record = json.loads(data[cut + 1 :])
+    except ValueError:
+        return None
+    ordinal = record.get("ordinal") if isinstance(record, dict) else None
+    return ordinal if isinstance(ordinal, int) and not isinstance(ordinal, bool) else None
 
 
 def _turn_range(path: Path, turns: tuple[str, ...]) -> tuple[int, int]:

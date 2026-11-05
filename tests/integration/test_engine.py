@@ -69,8 +69,9 @@ class Claude:
         there = [ln.record for ln in read_lines(self.path)] if self.path.exists() else []
         known = {r.get("uuid") for r in there}
         new = [r for r in self.t.records if r["uuid"] not in known]
-        if new and there:
-            new[0] = dict(new[0], parentUuid=there[-1].get("uuid"))
+        chain = [r for r in there if r.get("uuid")]  # not a last-prompt line
+        if new and chain:
+            new[0] = dict(new[0], parentUuid=chain[-1]["uuid"])
         with open(self.path, "ab") as fh:
             fh.write(encode(new))
 
@@ -107,12 +108,21 @@ class CodexThread:
         x.complete(answer)
         return x.records
 
-    def turn(self, prompt: str, answer: str) -> None:
+    def turn(self, prompt: str, answer: str, before: tuple[dict, ...] = ()) -> None:
+        """A finished turn, after the lines ``before`` (a rollback, say)."""
+        self.add([*before, *self._turn(prompt, answer)])
+
+    def add(self, records: list[dict]) -> None:
         ordinal = self.codex.index(THREAD).next_ordinal
         with open(self.path, "a") as fh:
-            for k, r in enumerate(self._turn(prompt, answer)):
+            for k, r in enumerate(records):
                 fh.write(json.dumps(dict(r, ordinal=ordinal + k), separators=(",", ":")) + "\n")
         resume(self.codex, THREAD)
+
+    def rollback(self, n: int) -> dict:
+        """The line Codex writes when the user edits an earlier message or undoes turns."""
+        payload = {"type": "thread_rolled_back", "num_turns": n}
+        return {"timestamp": "2026-11-04T15:00:00.000Z", "type": "event_msg", "payload": payload}
 
     def turn_ids(self) -> list[str]:
         return list(self.codex.index(THREAD).turns)
@@ -182,7 +192,7 @@ def test_a_codex_turn_reaches_claude_as_tool_calls(pair):
     pair.codex.turn("from codex", "codex answered")
     outcome, p = sync(pair.name)
     assert outcome.state == "synced", outcome.text
-    added = pair.claude.records()[-5:]
+    *added, last = pair.claude.records()[-5:]
     texts = json.dumps(added, ensure_ascii=False)
     assert MARK in texts and "from codex" in texts and "codex answered" in texts
     assert any(
@@ -190,6 +200,14 @@ def test_a_codex_turn_reaches_claude_as_tool_calls(pair):
         for r in added
         for b in (r["message"]["content"] if isinstance(r["message"]["content"], list) else [])
     )
+    assert all(r["duologueSource"] == "codex" for r in added)
+    # Claude's session list shows the last prompt from the end of the file.
+    assert last == {
+        "type": "last-prompt",
+        "lastPrompt": "from codex",
+        "leafUuid": added[-1]["uuid"],
+        "sessionId": SESSION,
+    }
     assert p.copied["to_claude"] == 1
     assert sync(pair.name)[0].state == "idle"  # nothing echoes back to Codex
 
@@ -813,3 +831,134 @@ def test_release_after_codex_took_nothing_copies_the_turn_again(pair, monkeypatc
     linking.release(e, e.pairs[pair.name])
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced" and len(pair.codex.turn_ids()) == before + 1
+
+
+# ------------------------------------------------------------------ what Codex does to threads
+def compress(path: Path) -> Path:
+    """Codex compresses an idle thread's rollout (here only renamed; the fake reads it as is)."""
+    packed = path.with_name(path.name + ".zst")
+    path.rename(packed)
+    return packed
+
+
+def requests(log: Path) -> list[str]:
+    return [json.loads(x)["method"] for x in log.read_text().splitlines()] if log.exists() else []
+
+
+def test_a_compressed_thread_takes_claudes_turn_once_codex_writes_it_out(pair):
+    turns = pair.codex.turn_ids()
+    packed = compress(pair.codex.path)
+    pair.claude.turn("second", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    assert pair.codex.path.exists() and not packed.exists()
+    assert len(pair.codex.turn_ids()) == len(turns) + 1
+    assert "wrote the compressed thread out" in json.dumps(
+        ActivityLog(engine().config.log_file).tail(5)
+    )
+
+
+def test_a_compressed_thread_with_nothing_to_send_is_left_compressed(pair, tmp_path, monkeypatch):
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    packed = compress(pair.codex.path)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "idle", outcome.text
+    assert packed.exists() and "thread/resume" not in requests(log)
+
+
+def test_a_thread_rewound_in_codex_blocks_and_says_so(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    # Codex continues a rewound thread in a new file that names the history it keeps.
+    rewound = pair.codex.path.with_name(
+        pair.codex.path.name.replace(".jsonl", "_01a1ab4d-0000-7000-8000-000000000001.jsonl")
+    )
+    base = {"thread_id": THREAD, "end_ordinal_exclusive": 3}
+    meta = {"id": THREAD, "cwd": CWD, "history_mode": "paginated", "history_base": base}
+    first = {"timestamp": "2026-11-04T16:00:00.000Z", "type": "session_meta", "payload": meta}
+    rewound.write_text(json.dumps(dict(first, ordinal=3)) + "\n")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked" and "rewound in Codex" in outcome.text
+
+
+def test_a_codex_rollback_of_synced_turns_is_told_to_claude(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    pair.codex.turn("one, edited", "ok", before=(pair.codex.rollback(1),))
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    texts = json.dumps(pair.claude.records()[-6:], ensure_ascii=False)
+    assert "the last 1 turn(s) of the conversation were undone in Codex" in texts
+    assert prompts(pair.claude.records())[-1] == "one, edited"
+
+
+def test_a_codex_turn_rolled_back_before_it_synced_never_reaches_claude(pair):
+    pair.codex.turn("a mistake", "ok")
+    pair.codex.turn("what I meant", "ok", before=(pair.codex.rollback(1),))
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    asked = prompts(pair.claude.records())
+    assert "a mistake" not in asked and asked[-1] == "what I meant"
+    assert "undone" not in json.dumps(pair.claude.records()[-6:])
+
+
+def test_a_claude_turn_after_a_codex_rollback_is_a_conflict(pair):
+    pair.claude.turn("in claude", "ok")
+    started = {"type": "task_started", "turn_id": "codex-empty", "started_at": 1}
+    ended = {"type": "turn_aborted", "turn_id": "codex-empty", "reason": "interrupted"}
+    pair.codex.add(
+        [
+            pair.codex.rollback(1),
+            {"timestamp": "2026-11-04T15:00:01.000Z", "type": "event_msg", "payload": started},
+            {"timestamp": "2026-11-04T15:00:02.000Z", "type": "event_msg", "payload": ended},
+        ]
+    )
+    outcome, p = sync(pair.name)
+    assert outcome.state == "conflict" and p.conflict
+
+
+# --------------------------------------------------------------------------- echo guard
+def rewind_cursor(name: str, side: str, end: int) -> None:
+    from duologue.journal import prefix_hash
+    from duologue.pairs import Cursor
+
+    e = engine()
+    p = e.pairs[name]
+    path = e.paths(p)[0 if side == "claude" else 1]
+    setattr(p, f"{side}_cursor", Cursor(end, prefix_hash(path, end), None))
+    p.seen, p.checked = [], {}
+    e.save()
+
+
+def test_records_duologue_wrote_never_go_back_to_codex(pair):
+    size = pair.claude.path.stat().st_size
+    pair.codex.turn("from codex", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    turns = pair.codex.turn_ids()
+    rewind_cursor(pair.name, "claude", size)  # as if the cursor sat before duologue's records
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "idle", outcome.text
+    assert pair.codex.turn_ids() == turns
+
+
+def test_turns_duologue_wrote_never_go_back_to_claude(pair):
+    size = pair.codex.path.stat().st_size
+    pair.claude.turn("from claude", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    records = len(pair.claude.records())
+    rewind_cursor(pair.name, "codex", size)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "idle", outcome.text
+    assert len(pair.claude.records()) == records
+
+
+def test_a_codex_line_numbered_out_of_order_blocks_the_append(pair):
+    with open(pair.codex.path, "a") as fh:  # a line whose number goes back: the index skips it
+        fh.write(json.dumps(dict(pair.codex.rollback(0), ordinal=0)) + "\n")
+    resume(pair.codex.codex, THREAD)
+    pair.claude.turn("second", "ok")
+    size = pair.codex.path.stat().st_size
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "blocked" and "Codex's index expects" in outcome.text
+    assert pair.codex.path.stat().st_size == size

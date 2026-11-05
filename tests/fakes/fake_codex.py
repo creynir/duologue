@@ -4,7 +4,9 @@ It does what duologue relies on Codex for, the way Codex 0.166 does it, and no m
 
 - ``app-server``: JSON-RPC over stdio. ``thread/resume`` takes the thread's writer lock (held
   until the process exits or the thread is archived) and indexes the rollout's lines past the
-  checkpoint into ``thread_history_1.sqlite``; ``thread/loaded/list``, ``thread/archive``,
+  checkpoint into ``thread_history_1.sqlite``. A thread with only a compressed rollout
+  (``.jsonl.zst``; the tests write its lines uncompressed) is written out as plain ``.jsonl``
+  first, as Codex does before it appends. ``thread/loaded/list``, ``thread/archive``,
   ``thread/unarchive`` and ``thread/unsubscribe`` behave like Codex's.
 - ``migrate-rollouts --thread <id> --apply --json``: converts a legacy rollout to paginated.
 - ``app-server daemon-serve`` (fake only) runs a shared app-server on the home's control socket,
@@ -48,9 +50,17 @@ create table if not exists thread_history_projection_state (
 """
 
 
-def rollout(thread_id: str) -> Path | None:
-    found = list(HOME.glob(f"*sessions/**/rollout-*-{thread_id}.jsonl"))
+def rollout(thread_id: str, suffix: str = ".jsonl") -> Path | None:
+    found = list(HOME.glob(f"*sessions/**/rollout-*-{thread_id}{suffix}"))
+    found += HOME.glob(f"*sessions/**/rollout-*-{thread_id}_*{suffix}")  # rewound
     return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
+def expand(thread_id: str) -> None:
+    """Write a compressed rollout out as plain lines and drop the compressed copy."""
+    packed = rollout(thread_id, ".jsonl.zst")
+    if packed is not None and rollout(thread_id) is None:
+        packed.rename(packed.with_suffix(""))
 
 
 class Server:
@@ -92,6 +102,7 @@ class Server:
         if method == "initialize":
             return {"userAgent": "fake-codex"}
         if method == "thread/resume":
+            expand(tid)
             path = rollout(tid)
             if path is None:
                 raise RpcError(-32600, f"no rollout found for thread id {tid}")

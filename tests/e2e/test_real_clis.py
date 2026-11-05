@@ -249,6 +249,75 @@ def test_a_codex_thread_gets_a_new_claude_session(world: World):
     assert "copied 1 Claude turn(s) to Codex" in world.duologue("sync")
 
 
+def test_codex_file_changes_resume_in_claude_as_its_own_write_and_edit(world: World):
+    """Codex changes to one file show in Claude as Claude's own Write and Edit, with the result
+    records the Claude app draws a diff from, and Claude Code resumes the session with them. (The
+    mock Codex model has no patch tool, so the turn is added as Codex records it: duologue's
+    translation of a Claude turn that did the same, under a Codex turn id.)"""
+    from builders import ClaudeTranscript
+
+    from duologue.codex.rollout import uuid7
+    from duologue.codex.threads import append_turns
+    from duologue.journal import MemoryJournal
+    from duologue.translate.claude_to_codex import claude_to_codex
+    from duologue.translate.outputs import OutputStore
+
+    session = world.claude("hello from claude")
+    thread = world.codex("hello from codex")
+    world.duologue("link", "--claude", session, "--codex", thread, "--name", "files")
+    new, old = str(world.work / "new.txt"), str(world.work / "notes.txt")
+    t = ClaudeTranscript(cwd=str(world.work))
+    t.user("make the files")
+    t.call("Write", {"file_path": new, "content": "one\ntwo\n"}, "File created")
+    t.call("Edit", {"file_path": old, "old_string": "a\nb\nc", "new_string": "a\nB\nc"}, "Updated")
+    t.assistant("Both done.")
+    store = OutputStore(world.root / "outputs")
+    lines = claude_to_codex(
+        t.records, thread_id=thread, key="e2e", outputs=store, default_cwd=str(world.work)
+    )
+    turn = lines[0].payload["turn_id"]
+    native = json.loads(json.dumps([ln.__dict__ for ln in lines]).replace(turn, uuid7()))
+    lines = [type(lines[0])(**ln) for ln in native]
+    codex = Codex(world.root / "codex", CODEX, env=world.env())
+    append_turns(codex, thread, lines, journal=MemoryJournal())
+
+    assert "copied 1 Codex turn(s) to Claude" in world.duologue("sync")
+    world.claude("what did codex change", "--resume", session)
+    request = world.mock.seen("messages")[-1]
+    calls = {use["name"]: (use["input"], result) for use, result in claude_calls(request)}
+    assert calls["Write"][0] == {"file_path": new, "content": "one\ntwo\n"}
+    assert calls["Edit"][0]["file_path"] == old
+    assert "b" in calls["Edit"][0]["old_string"] and "B" in calls["Edit"][0]["new_string"]
+    assert all(result is not None for _, result in calls.values())
+
+
+def test_a_message_queued_while_claude_worked_reaches_codex_in_that_turn(world: World):
+    """Claude Code stores a message typed while it works as a queued_command attachment; Codex
+    indexes it as a second user message in the same turn, and its model is shown it."""
+    from builders import ClaudeTranscript
+
+    from duologue.claude.transcript import find_transcript
+    from duologue.jsonl import encode, read_lines
+
+    session = world.claude("hello from claude")
+    thread = world.codex("hello from codex")
+    world.duologue("link", "--claude", session, "--codex", thread, "--name", "queued")
+    path = find_transcript(world.root / "claude", session)
+    last = [ln.record["uuid"] for ln in read_lines(path) if ln.record.get("uuid")][-1]
+    t = ClaudeTranscript(cwd=str(world.work), session=session)
+    t.user("start the work")
+    t.queued("and add tests too")
+    t.assistant("Working on both.")
+    t.records[0]["parentUuid"] = last
+    with open(path, "ab") as fh:
+        fh.write(encode(t.records))
+
+    assert "copied 1 Claude turn(s) to Codex" in world.duologue("sync")
+    assert world.codex_items(thread)[-3:] == ["userMessage", "userMessage", "agentMessage"]
+    world.codex("resume", thread, "what did claude get")
+    assert "and add tests too" in json.dumps(world.mock.seen("responses")[-1]["input"])
+
+
 def test_doctor_knows_this_codex(world: World):
     out = world.duologue("doctor", ok=False)
     assert "item format known" in out, out

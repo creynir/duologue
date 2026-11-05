@@ -77,6 +77,27 @@ def test_doctor(linked, capsys):
     assert code == 1
 
 
+def test_doctor_looks_at_each_pairs_files(linked, capsys, monkeypatch):
+    claude, codex = linked
+    from duologue import cli
+
+    assert main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "MiB" not in out and "indexed" not in out  # nothing to say about either file
+    monkeypatch.setattr(cli, "CLAUDE_FULL_LOAD", 100)
+    with open(codex.path, "a") as fh:  # a line Codex has not indexed yet
+        fh.write(json.dumps({"timestamp": "t", "ordinal": 99, "type": "event_msg", "payload": {}}))
+        fh.write("\n")
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert 'pair "work": the Claude transcript is 0.0 MiB; above 5 MiB' in out
+    assert "it catches up when the thread is next opened" in out
+    data = codex.path.read_bytes()
+    codex.path.write_bytes(data[:200])  # shorter than what Codex indexed
+    main(["doctor"])
+    assert "past the end of its file (200 bytes)" in capsys.readouterr().out
+
+
 def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):
     claude, _ = linked
     other = "5e550000-0000-4000-8000-0000000000aa"
