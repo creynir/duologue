@@ -30,6 +30,7 @@ STOPPED_NOTE = "Codex stopped here."
 UNANSWERED_NOTE = (
     "the user's last message above was not answered in Codex. When they continue, answer it."
 )
+NOT_RECORDED = "(tool result not recorded)"
 SKIPPED_ITEMS = (
     "Reasoning",
     "ContextCompaction",
@@ -238,17 +239,22 @@ def claude_records(
     version: str,
     cwd: str,
     git_branch: str = "",
+    dangling: tuple[str, ...] = (),
     now_ms: int | None = None,
 ) -> list[dict]:
     """Transcript records for ``steps``, to append after the record ``parent_uuid`` (of type
     ``parent_type``) in session ``session_id``.
 
     ``model`` goes on every assistant record: without it ``claude --resume`` hangs. Pass the last
-    model the session used, or ``"<synthetic>"`` before Claude has run in it.
+    model the session used, or ``"<synthetic>"`` before Claude has run in it. ``dangling`` are
+    tool calls at the end of the session that never got a result (Claude stopped mid-tool); the
+    first record answers them, as Claude requires.
     """
     if not steps:
         return []
-    seq = _with_notes(list(steps), parent_type)
+    if dangling and parent_type != "assistant":
+        raise ValueError("only an assistant message can leave tool calls unanswered")
+    seq = _with_notes(list(steps), parent_type, dangling)
     messages = _alternate(seq)
     anchor = next((s.key for s in steps if s.key), session_id)
     stamps = _fill_timestamps([m.timestamp for m in messages], now_ms)
@@ -296,13 +302,20 @@ def claude_records(
     return records
 
 
-def _with_notes(seq: list[ClaudeStep], parent_type: str | None) -> list[ClaudeStep]:
-    """The lead note before the Codex part, and a closing note when it ends on the user's side."""
+def _with_notes(
+    seq: list[ClaudeStep], parent_type: str | None, dangling: tuple[str, ...] = ()
+) -> list[ClaudeStep]:
+    """The lead note before the Codex part, and a closing note when it ends on the user's side.
+    Results for ``dangling`` calls open the first user message: tool results go first."""
 
     def note(role: str, text: str) -> ClaudeStep:
         return ClaudeStep(role, [{"type": "text", "text": f"[{MARK}: {text}]"}], None, None)
 
-    lead = [{"type": "text", "text": f"[{MARK}: {LEAD_NOTE}]"}]
+    closing = [
+        {"type": "tool_result", "tool_use_id": t, "content": NOT_RECORDED, "is_error": True}
+        for t in dangling
+    ]
+    lead = closing + [{"type": "text", "text": f"[{MARK}: {LEAD_NOTE}]"}]
     if seq[0].role == "user":
         if parent_type == "user":
             seq.insert(0, note("assistant", "continued in Codex"))
