@@ -90,6 +90,46 @@ def test_a_command_becomes_bash_with_its_output(store):
     assert steps[2].tool_use_result["stdout"] == " M a.py\n"
 
 
+def test_a_long_command_output_is_capped_for_the_model_and_the_app(store):
+    long = "row\n" * 6000  # 24,000 characters
+    x = CodexRollout()
+    x.start("t")
+    x.user_says("dump it", "u")
+    x.item(
+        {
+            "type": "CommandExecution",
+            "id": "e",
+            "command": ["cat", "big"],
+            "aggregated_output": long,
+        }
+    )
+    steps = steps_of(x, store)
+
+    (saved,) = list(store.directory.iterdir())
+    assert saved.read_text() == long
+    pointer = f"[24000 characters; the full output is in {saved}; the start of it:]"
+    (result,) = tool_results(steps)
+    assert result["content"] == f"{pointer}\n{long[: store.model_limit]}"  # what the model reads
+    assert steps[2].tool_use_result["stdout"] == f"{pointer}\n{long[: store.ui_limit]}"  # the app
+
+
+def test_turns_stay_apart_with_their_own_ids(store):
+    x = CodexRollout()
+    for n in (1, 2):
+        x.start(f"turn-{n}")
+        x.user_says(f"question {n}", "u")  # Codex item ids repeat across turns
+        x.item({"type": "CommandExecution", "id": "e", "command": ["echo", str(n)], "exit_code": 0})
+        x.agent_says(f"answer {n}", "a")
+        x.complete(f"answer {n}")
+    steps = steps_of(x, store)
+
+    texts = [s.blocks[0]["text"] for s in steps if s.blocks[0]["type"] == "text"]
+    assert texts == ["question 1", "answer 1", "question 2", "answer 2"]
+    assert [u["input"]["command"] for u in tool_uses(steps)] == ["echo 1", "echo 2"]
+    assert len({u["id"] for u in tool_uses(steps)}) == 2
+    assert len({s.key for s in steps}) == len(steps)
+
+
 def test_a_plain_argv_command_is_shown_quoted(store):
     x = CodexRollout()
     x.start("t")

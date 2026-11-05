@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import time
 from collections.abc import Iterable
 from dataclasses import dataclass
@@ -20,6 +21,7 @@ from dataclasses import dataclass
 from duologue.translate.common import (
     MARK,
     epoch_ms,
+    is_note,
     stable_id,
     text_of,
     tool_result_text,
@@ -56,7 +58,9 @@ def conversation(records: Iterable[dict]) -> list[dict]:
             continue
         if r.get("isMeta") or r.get("isCompactSummary"):
             continue
-        if MARK in text_of((r.get("message") or {}).get("content")):
+        # A record with a duologue note is one duologue wrote from the other side, the note merged
+        # into its first message: none of it travels back, or that message would arrive twice.
+        if _has_note((r.get("message") or {}).get("content")):
             continue
         out.append(r)
     return out
@@ -70,10 +74,21 @@ def is_user_input(record: dict) -> bool:
         return False
     content = (record.get("message") or {}).get("content")
     if isinstance(content, str):
-        return bool(content.strip()) and MARK not in content
+        return bool(content.strip()) and not is_note(content)
     if isinstance(content, list):
         kinds = {b.get("type") for b in content if isinstance(b, dict)}
-        return "tool_result" not in kinds and "text" in kinds and MARK not in text_of(content)
+        return "tool_result" not in kinds and "text" in kinds and not _has_note(content)
+    return False
+
+
+def _has_note(content: object) -> bool:
+    if isinstance(content, str):
+        return is_note(content)
+    if isinstance(content, list):
+        return any(
+            isinstance(b, dict) and b.get("type") == "text" and is_note(b.get("text") or "")
+            for b in content
+        )
     return False
 
 
@@ -121,8 +136,7 @@ class _Translator:
                             bool(b.get("is_error")),
                         )
         ms = self.now_ms
-        for r in records:
-            ms = epoch_ms(r.get("timestamp")) or ms
+        for r, ms in zip(records, _timestamps(records, self.now_ms), strict=True):
             content = (r.get("message") or {}).get("content")
             if r.get("type") == "user":
                 if is_user_input(r):
@@ -131,9 +145,6 @@ class _Translator:
                     self._start(ms, r["uuid"])
                     self._user_message(ms, r["uuid"], text_of(content))
                 continue  # tool results travel with their calls
-            if not self.turn:  # the batch starts mid-answer
-                self._start(ms, r["uuid"])
-                self._say(ms, f"[{MARK}: continued in Claude]", ("note", r["uuid"]))
             blocks = (
                 content
                 if isinstance(content, list)
@@ -141,12 +152,17 @@ class _Translator:
                 if isinstance(content, str)
                 else []
             )
+            if not any(_translatable(b) for b in blocks):
+                continue  # thinking only, or nothing Codex can show: no turn for it
+            if not self.turn:  # the batch starts mid-answer
+                self._start(ms, r["uuid"])
+                self._say(ms, f"[{MARK}: continued in Claude]", ("note", r["uuid"]))
             for i, b in enumerate(blocks):
-                if not isinstance(b, dict):
+                if not _translatable(b):
                     continue
-                if b.get("type") == "text" and (b.get("text") or "").strip():
+                if b.get("type") == "text":
                     self._say(ms, b["text"], ("text", r["uuid"], i))
-                elif b.get("type") == "tool_use":
+                else:
                     self._tool(ms, r, b)
         if self.turn:
             self._end(ms)
@@ -289,7 +305,7 @@ class _Translator:
                     "id": item_id,
                     "changes": {path: change},
                     "status": status,
-                    "stdout": text[:2000],
+                    "stdout": shown,
                     "stderr": "",
                 },
             )
@@ -352,23 +368,63 @@ class _Translator:
         )
 
 
+def _timestamps(records: list[dict], now_ms: int) -> list[int]:
+    """Each record's time in epoch ms. One without a timestamp takes the one before it (the first
+    one after it, at the start); ``now_ms`` only when no record has one."""
+    stamps = [epoch_ms(r.get("timestamp")) for r in records]
+    first = next((s for s in stamps if s is not None), now_ms)
+    out, last = [], first
+    for s in stamps:
+        last = s if s is not None else last
+        out.append(last)
+    return out
+
+
+def _translatable(block: object) -> bool:
+    """A block Codex gets: text with something in it, or a tool call that is part of the work.
+    Thinking is never forged on the other side, and Claude's tool loading is not the work."""
+    if not isinstance(block, dict):
+        return False
+    if block.get("type") == "text":
+        return bool((block.get("text") or "").strip())
+    return block.get("type") == "tool_use" and block.get("name") not in PLUMBING_TOOLS
+
+
 def _shell_command(name: str, inp: dict, cwd: str) -> tuple[str, list[str], list[dict]]:
-    """(display command, argv, parsed_cmd) for a Claude shell-like tool."""
+    """(display command, argv, parsed_cmd) for a Claude shell-like tool. Read, Grep and Glob show
+    as the ``cat -n`` and ``rg`` commands that do the same."""
     if name == "Bash":
         cmd = inp.get("command") or ""
         return cmd, ["/bin/bash", "-lc", cmd], [{"type": "unknown", "cmd": cmd}]
     if name == "Read":
         path = inp.get("file_path") or ""
-        cmd = f"Read {path}"
+        argv = ["cat", "-n", path]
+        cmd = shlex.join(argv)
         parsed = {"type": "read", "cmd": cmd, "name": os.path.basename(path), "path": path}
-        return cmd, ["Read", path], [parsed]
+        return cmd, argv, [parsed]
     query, path = inp.get("pattern") or "", inp.get("path") or cwd
-    cmd = f"{name} {query} {path}"
     if name == "Grep":
-        parsed = {"type": "search", "cmd": cmd, "query": query, "path": path}
-    else:
-        parsed = {"type": "list_files", "cmd": cmd, "path": path}
-    return cmd, [name, query, path], [parsed]
+        argv = ["rg", *_grep_flags(inp), "--", query, path]
+        cmd = shlex.join(argv)
+        return cmd, argv, [{"type": "search", "cmd": cmd, "query": query, "path": path}]
+    argv = ["rg", "--files", "--glob", query, path]
+    cmd = shlex.join(argv)
+    return cmd, argv, [{"type": "list_files", "cmd": cmd, "path": path}]
+
+
+def _grep_flags(inp: dict) -> list[str]:
+    """The ``rg`` flags for a Claude Grep call. Grep lists matching files unless told otherwise."""
+    mode = inp.get("output_mode") or "files_with_matches"
+    flags = {"files_with_matches": ["-l"], "count": ["-c"]}.get(mode, [])
+    if mode == "content" and inp.get("-n"):
+        flags.append("-n")
+    if inp.get("-i"):
+        flags.append("-i")
+    if inp.get("glob"):
+        flags += ["--glob", str(inp["glob"])]
+    if inp.get("type"):
+        flags += ["--type", str(inp["type"])]
+    return flags
 
 
 def _file_change(name: str, inp: dict, ref: str, outputs: OutputStore) -> tuple[str, dict, str]:

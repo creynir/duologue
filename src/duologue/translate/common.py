@@ -10,6 +10,7 @@ from datetime import UTC, datetime
 
 # Tags duologue's own notes, so a note never travels back to the side it came from.
 MARK = "⇄ duologue"
+NOTE_PREFIX = f"[{MARK}:"  # every note duologue writes starts with this
 
 # Every id duologue writes derives from this namespace and the source record's id.
 NAMESPACE = uuid.UUID("33315e20-742e-4a7d-90d3-56d6e041de3a")
@@ -83,14 +84,21 @@ def tool_result_text(content: object) -> str:
 def unified_diff(path: str, old: str | None, new: str | None) -> str:
     """A unified diff of one file's change, headed with the file's base name."""
     name = os.path.basename(path)
-    return "".join(
-        difflib.unified_diff(
-            (old or "").splitlines(True), (new or "").splitlines(True), f"a/{name}", f"b/{name}"
-        )
-    )
+    return "".join(difflib.unified_diff(_lines(old), _lines(new), f"a/{name}", f"b/{name}"))
+
+
+def _lines(text: str | None) -> list[str]:
+    # Every line ends in a newline, or a last line without one would run into the next diff line.
+    return [ln if ln.endswith("\n") else ln + "\n" for ln in (text or "").splitlines(True)]
+
+
+def is_note(text: str) -> bool:
+    """A note duologue wrote. Notes start with ``[⇄ duologue:``; the mark elsewhere in a text, such
+    as an agent quoting a note, does not make it one."""
+    return text.lstrip().startswith(NOTE_PREFIX)
 
 
 def is_codex_noise(text: str) -> bool:
     """Text Codex put in a user-role message that the user did not type, or one of our notes."""
     s = text.strip()
-    return not s or s.startswith(CODEX_INJECTED) or MARK in s or CODEX_IMPORT_SENTINEL in s
+    return not s or s.startswith(CODEX_INJECTED) or is_note(s) or CODEX_IMPORT_SENTINEL in s

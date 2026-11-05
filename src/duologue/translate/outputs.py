@@ -45,9 +45,11 @@ class OutputStore:
 
     def _write(self, ref: str, text: str) -> Path:
         self.directory.mkdir(parents=True, exist_ok=True)
-        name = re.sub(r"[^A-Za-z0-9_.-]", "_", str(ref))
-        if len(name) > 80:
-            name = name[:64] + "-" + hashlib.sha256(str(ref).encode()).hexdigest()[:12]
+        ref = str(ref)
+        name = re.sub(r"[^A-Za-z0-9_.-]", "_", ref)
+        if name != ref or len(name) > 80:
+            # A changed or shortened name could match another ref's: the digest keeps them apart.
+            name = name[:64] + "-" + hashlib.sha256(ref.encode()).hexdigest()[:12]
         path = self.directory / f"{name}.txt"
         tmp = path.with_suffix(".tmp")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)

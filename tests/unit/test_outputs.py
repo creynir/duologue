@@ -46,6 +46,16 @@ def test_unsafe_and_long_refs_make_safe_short_file_names(tmp_path):
     assert len(names) == 3  # two long refs that share a prefix still get their own files
 
 
+def test_refs_that_sanitise_alike_keep_their_own_files(tmp_path):
+    store = OutputStore(tmp_path / "out", model_limit=1)
+    first = store.keep("pair:turn:a/b", "first")
+    second = store.keep("pair_turn_a_b", "second")
+
+    assert first != second
+    files = {p.read_text() for p in (tmp_path / "out").iterdir()}
+    assert files == {"first", "second"}
+
+
 def test_full_outputs_are_private_to_the_user(tmp_path):
     store = OutputStore(tmp_path / "out", model_limit=1)
     store.keep("r", "xx")

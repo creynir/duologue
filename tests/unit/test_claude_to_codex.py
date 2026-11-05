@@ -1,4 +1,5 @@
 import json
+import shlex
 
 import pytest
 from builders import CWD, ClaudeTranscript
@@ -8,7 +9,7 @@ from duologue.translate.claude_to_codex import (
     claude_to_codex,
     is_user_input,
 )
-from duologue.translate.common import MARK
+from duologue.translate.common import MARK, epoch_ms
 from duologue.translate.outputs import OutputStore
 
 
@@ -95,6 +96,26 @@ def test_a_batch_that_starts_mid_answer_opens_with_a_note(store):
     assert first["content"][0]["text"] == f"[{MARK}: continued in Claude]"
 
 
+def test_a_record_with_nothing_to_show_opens_no_turn(store):
+    t = ClaudeTranscript()
+    t.user("start")
+    t.assistant([{"type": "thinking", "thinking": "hmm", "signature": "s"}])
+    t.assistant([{"type": "tool_use", "id": "toolu_x", "name": "ToolSearch", "input": {}}])
+    lines = translate(t.records[1:], store)
+
+    assert lines == []
+
+
+def test_a_record_without_a_timestamp_takes_its_neighbours(store):
+    t = ClaudeTranscript()
+    t.user("start")
+    t.assistant("answer")
+    del t.records[0]["timestamp"]
+    lines = translate(t.records, store)
+
+    assert {ln.ms for ln in lines} == {epoch_ms(t.records[1]["timestamp"])}
+
+
 # ------------------------------------------------------------------------------------------ tools
 def test_bash_becomes_a_command_execution_in_the_records_folder(store):
     lines = translate(one_call("Bash", {"command": "ls -la"}, "a\nb"), store)
@@ -115,18 +136,41 @@ def test_a_failed_tool_shows_as_failed(store):
 
 
 @pytest.mark.parametrize(
-    ("name", "inp", "parsed"),
+    ("name", "inp", "argv", "parsed"),
     [
-        ("Read", {"file_path": "/work/project/a.py"}, {"type": "read", "name": "a.py"}),
-        ("Grep", {"pattern": "TODO", "path": "src"}, {"type": "search", "query": "TODO"}),
-        ("Glob", {"pattern": "*.py"}, {"type": "list_files", "path": CWD}),
+        (
+            "Read",
+            {"file_path": "/work/project/a.py"},
+            ["cat", "-n", "/work/project/a.py"],
+            {"type": "read", "name": "a.py", "path": "/work/project/a.py"},
+        ),
+        (
+            "Grep",
+            {"pattern": "TODO", "path": "src"},
+            ["rg", "-l", "--", "TODO", "src"],
+            {"type": "search", "query": "TODO", "path": "src"},
+        ),
+        (
+            "Grep",
+            {"pattern": "x", "output_mode": "content", "-n": True, "-i": True, "glob": "*.py"},
+            ["rg", "-n", "-i", "--glob", "*.py", "--", "x", CWD],
+            {"type": "search", "query": "x", "path": CWD},
+        ),
+        (
+            "Glob",
+            {"pattern": "*.py"},
+            ["rg", "--files", "--glob", "*.py", CWD],
+            {"type": "list_files", "path": CWD},
+        ),
     ],
 )
-def test_read_grep_and_glob_become_their_codex_actions(store, name, inp, parsed):
+def test_read_grep_and_glob_show_as_the_commands_that_do_the_same(store, name, inp, argv, parsed):
     lines = translate(one_call(name, inp, "result"), store)
 
     (cmd,) = [i for i in items(lines) if i["type"] == "CommandExecution"]
+    assert cmd["command"] == argv
     assert parsed.items() <= cmd["parsed_cmd"][0].items()
+    assert cmd["parsed_cmd"][0]["cmd"] == shlex.join(argv)
 
 
 def test_edit_becomes_a_file_change_with_a_diff(store):
@@ -138,6 +182,25 @@ def test_edit_becomes_a_file_change_with_a_diff(store):
     assert diff["type"] == "update"
     assert "-x = 1" in diff["unified_diff"] and "+x = 2" in diff["unified_diff"]
     assert change["status"] == "completed"
+
+
+def test_an_edit_without_final_newlines_still_gives_one_line_per_change(store):
+    inp = {"file_path": "/f.py", "old_string": "x = 1", "new_string": "x = 2"}
+    lines = translate(one_call("Edit", inp, "ok"), store)
+
+    (change,) = [i for i in items(lines) if i["type"] == "FileChange"]
+    diff_lines = change["changes"]["/f.py"]["unified_diff"].splitlines()
+    assert "-x = 1" in diff_lines and "+x = 2" in diff_lines
+
+
+def test_a_file_changes_long_output_keeps_its_pointer(store):
+    long = "y" * (store.ui_limit + 500)
+    inp = {"file_path": "/f", "old_string": "a", "new_string": "b"}
+    lines = translate(one_call("Edit", inp, long), store)
+
+    (change,) = [i for i in items(lines) if i["type"] == "FileChange"]
+    assert change["stdout"].startswith(f"[{len(long)} characters; the full output is in ")
+    assert change["stdout"].endswith("\n" + long[: store.ui_limit])
 
 
 def test_multiedit_puts_every_edit_in_one_diff(store):
@@ -239,6 +302,29 @@ def test_what_is_not_conversation_is_left_out(store):
     assert texts == ["real question", "Answer."]
 
 
+def test_a_record_duologue_wrote_never_travels_back_whole(store):
+    # duologue merges its lead note into the first message it writes from Codex; sending the rest
+    # of that record back would deliver the Codex user's message to Codex a second time.
+    t = ClaudeTranscript()
+    note = {"type": "text", "text": f"[{MARK}: continued in Codex. What follows happened there.]"}
+    t.user([note, {"type": "text", "text": "typed in Codex"}])
+    t.user("typed in Claude")
+    lines = translate(t.records, store)
+
+    texts = [i["content"][0]["text"] for i in items(lines)]
+    assert texts == ["typed in Claude"]
+
+
+def test_an_agent_quoting_the_mark_is_not_a_note(store):
+    t = ClaudeTranscript()
+    t.user("what does the note say?")
+    t.assistant(f"It says [{MARK}: continued in Codex].")
+    lines = translate(t.records, store)
+
+    texts = [i["content"][0]["text"] for i in items(lines)]
+    assert texts == ["what does the note say?", f"It says [{MARK}: continued in Codex]."]
+
+
 @pytest.mark.parametrize(
     ("content", "extra", "expected"),
     [
@@ -247,6 +333,7 @@ def test_what_is_not_conversation_is_left_out(store):
         ([{"type": "tool_result", "tool_use_id": "t", "content": "x"}], {}, False),
         ("   ", {}, False),
         (f"[{MARK}: note]", {}, False),
+        (f"what is {MARK}?", {}, True),
         ("hello", {"isMeta": True}, False),
         ("hello", {"isSidechain": True}, False),
         ("summary", {"isCompactSummary": True}, False),
