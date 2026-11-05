@@ -42,6 +42,28 @@ jobs:
       - run: pip install -e ".[dev]"
       - run: pytest -q
 
+  e2e:
+    # duologue against the real Claude Code and Codex CLIs, each pointed at a local stand-in for
+    # its model API (tests/e2e/mock_models.py), so no account is needed. The versions are the
+    # ones duologue was tested with; a Codex whose item format changed fails the format gate.
+    runs-on: ubuntu-latest
+    env:
+      CLAUDE_CODE_VERSION: "2.1.318"
+      CODEX_VERSION: "0.166.0"
+      DUOLOGUE_E2E_REQUIRED: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "22"
+      - run: npm install -g "@anthropic-ai/claude-code@$CLAUDE_CODE_VERSION" "@openai/codex@$CODEX_VERSION"
+      - run: claude --version && codex --version
+      - run: pip install -e ".[dev]"
+      - run: pytest -m e2e -v
+
   build:
     runs-on: ubuntu-latest
     steps:

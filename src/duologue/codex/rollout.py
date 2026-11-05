@@ -17,10 +17,7 @@ import uuid
 from pathlib import Path
 
 from duologue.ids import require_id
-from duologue.journal import prefix_hash
 from duologue.jsonl import Line
-
-__all__ = ["prefix_hash"]  # where callers that read rollouts find it
 
 SESSIONS = "sessions"
 ARCHIVED = "archived_sessions"

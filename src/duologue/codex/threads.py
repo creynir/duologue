@@ -42,13 +42,12 @@ from duologue.codex.rollout import (
     is_compressed,
     model_provider,
     new_rollout_path,
-    prefix_hash,
     sqlite_home,
     uuid7,
 )
 from duologue.codex.rpc import AppServer, AppServerError, daemon_running
 from duologue.ids import require_id
-from duologue.journal import Blocked, Intent, Journal, Wait, tail_state
+from duologue.journal import Blocked, Intent, Journal, Wait, prefix_hash, tail_state
 from duologue.jsonl import dumps, ends_with_newline, iter_lines
 from duologue.translate.claude_to_codex import RolloutLine
 from duologue.translate.common import iso_ms
@@ -161,11 +160,19 @@ def encode(lines: Sequence[RolloutLine], first_ordinal: int) -> bytes:
 
 # ------------------------------------------------------------------------------------- append
 def append_turns(
-    codex: Codex, thread_id: str, lines: Sequence[RolloutLine], *, journal: Journal
+    codex: Codex,
+    thread_id: str,
+    lines: Sequence[RolloutLine],
+    *,
+    journal: Journal,
+    expect_size: int | None = None,
 ) -> Appended:
     """Append ``lines`` (whole turns from the translator) to the thread and have Codex index
     them. Raises :class:`Wait` when the thread is busy and :class:`Blocked` when it needs a
-    person; see the module docstring for what an exception after the write means."""
+    person; see the module docstring for what an exception after the write means.
+
+    ``expect_size`` is the size the caller read the rollout at: when the file has grown since
+    (a turn finished meanwhile), nothing is written, so the caller can look at it first."""
     require_id(thread_id, "thread id")
     turns = turn_ids(lines)
     if len(set(turns)) != len(turns):
@@ -174,6 +181,9 @@ def append_turns(
     if not lines:
         size = path.stat().st_size
         return Appended(path, size, size, (), False)
+    if expect_size is not None and path.stat().st_size != expect_size:
+        # Checked before converting a legacy thread: the conversion rewrites the file itself.
+        raise Wait("the Codex thread changed while duologue prepared its turns")
     if not ends_with_newline(path):
         raise Wait("Codex is writing to the thread")
     if _is_held(codex, thread_id):
@@ -186,6 +196,7 @@ def append_turns(
         # Nobody has the thread loaded, so nobody works on that turn: a Codex that stopped left
         # it open (Codex 0.166 does not close it on resume). Its next turn closes it.
         raise Wait("the last Codex turn in the thread never finished; it syncs after the next one")
+    converted = history_mode(path) != "paginated"
     path = _paginated(codex, thread_id, path)
     index, size = _caught_up(codex, thread_id, path)
     present = [t for t in turns if t in index.turns]
@@ -198,7 +209,10 @@ def append_turns(
         )
     data = encode(lines, index.next_ordinal or 0)
     with _writer(codex, thread_id):
-        if path.stat().st_size != size:
+        grew = expect_size is not None and not converted and size != expect_size
+        if path.stat().st_size != size or grew:
+            # A turn that finished since the caller read the file must not end up before ours
+            # unseen. (Codex's own conversion of a legacy thread changes the size on purpose.)
             raise Wait("the Codex thread changed while duologue prepared its turns")
         intent = Intent("codex", path, size, data, turns, prefix_hash(path, size))
         journal.begin(intent)
@@ -296,14 +310,17 @@ def create_thread(
     journal: Journal,
     source: str = "vscode",
     created_ms: int | None = None,
+    thread_id: str | None = None,
 ) -> tuple[str, Appended]:
     """Create a paginated thread holding the turns ``build(thread_id)`` returns, and have Codex
-    index it. ``source`` is how the thread is listed; the Codex app lists ``vscode`` threads."""
+    index it. ``source`` is how the thread is listed; the Codex app lists ``vscode`` threads.
+    ``thread_id`` (a UUIDv7, see :func:`~duologue.codex.rollout.uuid7`) lets the caller record
+    the thread before it exists."""
     provider = model_provider(codex.home)
     if provider is None:
         raise Blocked("Codex's config.toml could not be read, so its model provider is unknown")
     created_ms = int(time.time() * 1000) if created_ms is None else created_ms
-    thread_id = uuid7(created_ms)
+    thread_id = uuid7(created_ms) if thread_id is None else require_id(thread_id, "thread id")
     lines = list(build(thread_id))
     meta = {
         "session_id": thread_id,
@@ -443,6 +460,11 @@ def _write(path: Path, intent: Intent) -> None:
             if tail_state(path, intent) == "partial":
                 os.truncate(path, intent.base)
             raise
+
+
+def take_out(codex: Codex, thread_id: str, intent: Intent) -> bool:
+    """Remove a write duologue made that Codex indexed none of, when nothing follows it."""
+    return _take_out(codex, thread_id, intent)
 
 
 def _take_out(codex: Codex, thread_id: str, intent: Intent) -> bool:

@@ -62,3 +62,20 @@ def test_full_outputs_are_private_to_the_user(tmp_path):
 
     mode = stat.S_IMODE((tmp_path / "out" / "r.txt").stat().st_mode)
     assert mode == 0o600
+
+
+def test_an_existing_file_is_kept_only_when_it_is_ours(tmp_path):
+    import os
+
+    store = OutputStore(tmp_path / "out", model_limit=5)
+    store.keep("ref", "x" * 50)
+    [kept] = list((tmp_path / "out").iterdir())
+    before = kept.stat().st_mtime_ns
+    store.keep("ref", "x" * 50)  # the same output again: left as it is
+    assert kept.stat().st_mtime_ns == before
+    elsewhere = tmp_path / "elsewhere.txt"
+    elsewhere.write_text("x" * 50)
+    kept.unlink()
+    os.symlink(elsewhere, kept)  # a link planted where the output goes is replaced, not used
+    store.keep("ref", "x" * 50)
+    assert not kept.is_symlink() and oct(kept.stat().st_mode & 0o777) == "0o600"

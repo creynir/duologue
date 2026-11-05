@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 authors = [{ name = "duologue contributors" }]
 keywords = ["claude-code", "codex", "coding-agents", "transcripts", "sync"]
 classifiers = [
-    "Development Status :: 2 - Pre-Alpha",
+    "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Developers",
     "Operating System :: MacOS",
@@ -51,7 +51,7 @@ pythonpath = ["tests"]
 addopts = ["--strict-markers", "-m", "not e2e"]
 markers = [
     "integration: hermetic homes, a fake Codex app-server and mock model servers; runs in CI",
-    "e2e: real Claude Code and Codex CLIs on throwaway sessions; never in CI, run with -m e2e",
+    "e2e: the real Claude Code and Codex CLIs against local model stand-ins; run with -m e2e",
 ]
 
 [tool.ruff]

@@ -18,7 +18,7 @@ from pathlib import Path
 
 from duologue.claude.live import UNKNOWN
 from duologue.claude.transcript import MESSAGE_TYPES, Tail, new_transcript_path, tail
-from duologue.ids import is_id
+from duologue.ids import is_id, require_id
 from duologue.journal import Blocked, Intent, Journal, Wait, prefix_hash, tail_state
 from duologue.jsonl import encode, ends_with_newline, iter_lines, read_lines
 
@@ -39,11 +39,17 @@ class Written:
 
 
 def append_records(
-    path: Path, records: list[dict], *, journal: Journal, live: Live | None = None
+    path: Path,
+    records: list[dict],
+    *,
+    journal: Journal,
+    live: Live | None = None,
+    expect_size: int | None = None,
 ) -> Written:
     """Append ``records`` to the transcript at ``path``. Raises :class:`Wait` when Claude has the
-    session open or the transcript moved on since the records were built, and
-    :class:`Blocked` when the records fail the structure check or only some of them are there."""
+    session open or the transcript moved on since the records were built (or since the caller
+    read it at ``expect_size``), and :class:`Blocked` when the records fail the structure check
+    or only some of them are there."""
     ids = tuple(str(r.get("uuid")) for r in records)
     size = path.stat().st_size
     if not records:
@@ -56,7 +62,7 @@ def append_records(
             _same_records(path, start, stop, records)
             return Written(path, start, stop, ids, False)
         raise Blocked(f"{len(there)} of the {len(ids)} records are already in the Claude session")
-    if records[0].get("parentUuid") != end.parent_uuid:
+    if records[0].get("parentUuid") != end.parent_uuid or expect_size not in (None, size):
         raise Wait("the Claude transcript moved on; duologue builds its records again")
     problems = check_structure(end, records)
     if problems:
@@ -101,10 +107,12 @@ def create_session(
     build: Callable[[str], list[dict]],
     journal: Journal,
     title: str | None = None,
+    session_id: str | None = None,
 ) -> tuple[str, Written]:
     """Create a session in ``cwd`` holding the records ``build(session_id)`` returns, titled
-    ``title`` in Claude's session list."""
-    session_id = str(uuid.uuid4())
+    ``title`` in Claude's session list. ``session_id`` lets the caller record the session
+    before it exists."""
+    session_id = str(uuid.uuid4()) if session_id is None else require_id(session_id, "session id")
     records = build(session_id)
     problems = check_structure(tail([]), records)
     if problems:
