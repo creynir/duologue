@@ -3,7 +3,6 @@
 import gzip
 import json
 import subprocess
-import sys
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -235,15 +234,11 @@ def test_turns_go_back_and_forth(pair):
 # ------------------------------------------------------------------------------- waiting/busy
 @pytest.fixture
 def claude_running():
+    """A process that looks like Claude Code resuming the session: named ``claude`` (a shell
+    renamed with ``exec -a``), with ``--resume <session>`` on its command line."""
+    script = 'exec -a claude /bin/sh -c "echo ready; cat > /dev/null" "$@"'
     p = subprocess.Popen(
-        [
-            sys.executable,
-            "-c",
-            "import sys; print('ready', flush=True); sys.stdin.read()",
-            "claude",
-            "--resume",
-            SESSION,
-        ],
+        ["bash", "-c", script, "claude", "--resume", SESSION],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         text=True,

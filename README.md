@@ -7,9 +7,10 @@ Claude, carry on in Codex, come back to Claude: each side shows what happened on
 own native history. Messages are messages, shell commands are commands, file edits are edits, and
 each model is shown the other's work on its next turn.
 
-**Status: alpha.** It works end to end with Claude Code 2.1.318 and Codex 0.166.0, and the tests
-run both real CLIs on every change. It writes into files that both apps treat as internal. OpenAI
-calls edits to Codex's session files from outside Codex unsupported
+**Status: alpha.** It works end to end with Claude Code 2.1.318 and Codex 0.166.0, and with
+Claude Code 2.1.322 and Codex 0.167.0 (the ChatGPT app's own 0.167.0-alpha.3.2 too), and the
+tests run those real CLIs on every change. It writes into files that both apps treat as internal.
+OpenAI calls edits to Codex's session files from outside Codex unsupported
 ([openai/codex#49328](https://github.com/openai/codex/issues/49328)), so a Codex update can
 break it. duologue checks the item format of the Codex it runs with, and refuses to write to one
 it has not been tested with.

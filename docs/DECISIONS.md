@@ -109,7 +109,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
 
 - **Appending.** Write `tool_use` and its `tool_result` as strictly alternating user and assistant
   records, with `sourceToolAssistantUUID` on results and deterministic uuids. Add a lead note saying
-  the turns happened in Codex; without it Claude doubts tool calls it did not make.
+  the turns happened in Codex; without it Claude doubts tool calls it did not make. The note says
+  the answers are Codex's, not Claude's: checked with real models (2026-11-10), Haiku took
+  Codex's answer for its own and Sonnet could not tell whose it was until the note said so.
 - **The `model` field is mandatory.** Every assistant record needs `model`, or `--resume` hangs.
   Use the last real model in the session, or `<synthetic>` before Claude has run.
 - **Never forge `thinking` blocks**: signatures are checked.
@@ -120,7 +122,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   memory, and its next message would leave appended records on a side branch. Live sessions are
   in `<CLAUDE_CONFIG_DIR>/sessions/<pid>.json` (`sessionId`, `pid`, `status`; Claude Code 2.1.318
   also writes `<pid>.<hash>.key` files there), and a process that resumed the session names it
-  on its command line (`ps -A -ww`: without `-ww` Linux cuts command lines to 80 columns). The
+  on its command line (`ps -A -ww`: without `-ww` Linux cuts command lines to 80 columns). Only
+  Claude Code's own program counts (`claude`, or Node or Bun running its `cli.js`): a shell whose
+  command line holds a `claude --resume` command kept a real pair waiting. The
   check runs again just after the write, which is taken out if Claude opened the session
   meanwhile. The prototype relaunched copies it ran itself
   (`claude --resume <id> --remote-control "<title>"`); the package leaves launching to the user.

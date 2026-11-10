@@ -69,9 +69,23 @@ def _resumed(session_id: str) -> int | None:
         pid_text, _, args = line.strip().partition(" ")
         if not pid_text.isdigit() or int(pid_text) == os.getpid():
             continue
-        if "claude" in args.lower() and _resumes(args.split(), session_id):
+        words = args.split()
+        if _is_claude_code(words) and _resumes(words, session_id):
             return int(pid_text)
     return None
+
+
+def _is_claude_code(words: list[str]) -> bool:
+    """Whether a command line runs Claude Code itself: its ``claude`` program, or Node or Bun
+    running its ``cli.js``. Not a shell or script that merely mentions such a command."""
+    if not words:
+        return False
+    program = os.path.basename(words[0])
+    if program == "claude":
+        return True
+    return program in ("node", "bun") and any(
+        "claude-code" in w and os.path.basename(w) == "cli.js" for w in words[1:3]
+    )
 
 
 def _resumes(words: list[str], session_id: str) -> bool:
