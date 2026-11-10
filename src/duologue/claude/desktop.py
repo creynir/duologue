@@ -26,12 +26,14 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
-from duologue.ids import UUID
+from duologue.ids import UUID, is_id
 from duologue.pairs import write_atomic
 
 SESSIONS = "claude-code-sessions"
 CARD = "local_"
-FROM_TEMPLATE = ("model", "effort", "permissionMode")
+# Taken from the app's newest card. Never its permission mode: that is the user's choice for one
+# session, and a session duologue makes gets the app's default, however permissive the last was.
+FROM_TEMPLATE = ("model", "effort")
 
 
 def default_folder() -> Path | None:
@@ -72,12 +74,10 @@ def workspace(folder: Path | None) -> Path | None:
     if folder is None or not (folder / SESSIONS).is_dir():
         return None
     account = (_read(folder / "config.json") or {}).get("lastKnownAccountUuid")
-    accounts = [folder / SESSIONS / account] if isinstance(account, str) and account else []
-    accounts = [a for a in accounts if a.is_dir()] or [
-        a for a in (folder / SESSIONS).iterdir() if a.is_dir()
-    ]
+    if not is_id(account) or not (folder / SESSIONS / account).is_dir():
+        return None  # never another account's list
     newest: tuple[float, Path] | None = None
-    for acct in accounts:
+    for acct in [folder / SESSIONS / account]:
         for device in acct.iterdir():
             if not device.is_dir():
                 continue
@@ -129,6 +129,7 @@ def write_card(
         "lastActivityAt": last_ms,
         "lastFocusedAt": last_ms,
         **{k: template[k] for k in FROM_TEMPLATE if k in template},
+        "permissionMode": "default",
         "isArchived": False,
         "title": title,
         "titleSource": "auto",

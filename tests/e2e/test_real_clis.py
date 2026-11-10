@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -385,9 +386,10 @@ def test_a_session_the_desktop_app_copies_is_followed(world: World):
     on in it there, the app copies the session (as `claude --resume --fork-session` does) and
     points its card at the copy: the pair follows, and the new turn reaches Codex once."""
     app = world.root / "Claude"
-    device = app / "claude-code-sessions" / "acct" / "dev"
+    account = "acc00000-0000-4000-8000-000000000001"
+    device = app / "claude-code-sessions" / account / "dev"
     device.mkdir(parents=True)
-    (app / "config.json").write_text(json.dumps({"lastKnownAccountUuid": "acct"}))
+    (app / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account}))
     (device / "local_00000000-0000-4000-8000-000000000000.json").write_text(
         json.dumps({"model": "claude-mock-1", "effort": "high", "permissionMode": "default"})
     )
@@ -403,6 +405,11 @@ def test_a_session_the_desktop_app_copies_is_followed(world: World):
 
     copy = world.claude("carried on in the desktop app", "--resume", session, "--fork-session")
     card_path.write_text(json.dumps(dict(card, cliSessionId=copy)))
+    from duologue.claude.transcript import find_transcript
+    from duologue.engine import COPY_QUIET
+
+    old = time.time() - COPY_QUIET - 1  # the app finished writing its copy a while ago
+    os.utime(find_transcript(world.root / "claude", copy), (old, old))
     out = world.duologue("sync")
     assert "copied 1 Claude turn(s) to Codex" in out, out
     [pair] = json.loads(world.duologue("status", "--json"))
@@ -412,7 +419,5 @@ def test_a_session_the_desktop_app_copies_is_followed(world: World):
     assert shown.count("carried on in the desktop app") == 1
     # That Codex turn goes to the copy the pair follows now, and then nothing is left.
     assert "copied 1 Codex turn(s) to Claude" in world.duologue("sync")
-    from duologue.claude.transcript import find_transcript
-
     assert "what did claude say" in find_transcript(world.root / "claude", copy).read_text()
     assert "idle: up to date" in world.duologue("sync")

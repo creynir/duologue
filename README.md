@@ -158,8 +158,9 @@ claude_desktop_dir = "~/Library/Application Support/Claude"   # that app's folde
   created with the others from its folder.
 - **The Codex app** lists a thread duologue created under its folder, as it lists its own.
 - **The Claude desktop app** lists a session duologue created, under its folder, the next time
-  the app starts (macOS; `desktop_cards = false` turns it off). When you carry on in it there, the
-  app copies the session into one of its own; duologue follows the copy.
+  the app starts (macOS, with Claude Code's default folder; `desktop_cards = false` turns it off).
+  When you carry on in it there, the app copies the session into one of its own; duologue follows
+  the copy, and the old session is titled "(continued in the Claude desktop app)".
 - **Remote Control** shows a Claude session while a Claude Code process runs it with remote
   control on; duologue does not start one.
 

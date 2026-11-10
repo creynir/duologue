@@ -108,7 +108,15 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     claude_home = data.get("claude_home") or env.get("CLAUDE_CONFIG_DIR") or "~/.claude"
     codex_home = data.get("codex_home") or env.get("CODEX_HOME") or "~/.codex"
     desktop = data.get("claude_desktop_dir")
-    desktop_folder = Path(desktop).expanduser() if desktop else default_desktop_folder()
+    # The desktop app goes with Claude Code's default folder: with another one, only when named.
+    claude_default = not data.get("claude_home") and not env.get("CLAUDE_CONFIG_DIR")
+    desktop_folder = (
+        Path(desktop).expanduser()
+        if desktop
+        else default_desktop_folder()
+        if claude_default
+        else None
+    )
     notify = data.get("notify", [])
     if not all(isinstance(x, str) for x in notify):
         raise ConfigError("notify must be a list of strings: the command and its arguments")

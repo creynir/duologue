@@ -767,9 +767,10 @@ def test_doctor_marks_an_unreadable_auto_json(auto_homes):
 def app(auto_homes, tmp_path):
     """A Claude desktop app folder, as the app lays it out, for duologue's config."""
     folder = tmp_path / "Claude"
-    device = folder / "claude-code-sessions" / "acct" / "dev"
+    account = "acc00000-0000-4000-8000-000000000001"
+    device = folder / "claude-code-sessions" / account / "dev"
     device.mkdir(parents=True)
-    (folder / "config.json").write_text(json.dumps({"lastKnownAccountUuid": "acct"}))
+    (folder / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account}))
     (device / "local_00000000-0000-4000-8000-000000000000.json").write_text(
         json.dumps({"model": "claude-test", "effort": "high", "permissionMode": "auto"})
     )
@@ -819,7 +820,16 @@ def go_on_in_a_copy(path: Path, new_session: str, prompt: str) -> Path:
     t.assistant("ok")
     target = path.with_name(f"{new_session}.jsonl")
     target.write_bytes(encode(copy + t.records))
+    settled_copy(target)
     return target
+
+
+def settled_copy(path: Path) -> None:
+    """As if the app finished writing its copy a while ago."""
+    from duologue.engine import COPY_QUIET
+
+    when = time.time() - COPY_QUIET - 1
+    os.utime(path, (when, when))
 
 
 def test_the_pair_follows_the_session_the_desktop_app_goes_on_with(auto_homes, app):
@@ -850,8 +860,129 @@ def test_a_copy_without_the_synced_point_blocks(auto_homes, app):
     t.assistant("ok")
     old = find_transcript(auto_homes.claude, pair.claude)
     old.with_name(f"{OTHER}.jsonl").write_bytes(encode(t.records))
+    settled_copy(old.with_name(f"{OTHER}.jsonl"))
     card_path = next(app.device.glob(f"{pair.card}.json"))
     card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
     run("sync")
     [pair] = [p for p in pairs().values() if p.card]  # (the copy is paired as a new session)
     assert pair.blocked and "desktop app" in pair.blocked and pair.claude != OTHER
+
+
+def test_release_goes_on_with_a_copy_that_lacks_the_synced_point(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    t = ClaudeTranscript(cwd=auto_homes.work, session=OTHER)
+    t.user("something else entirely")
+    t.assistant("ok")
+    old = find_transcript(auto_homes.claude, pair.claude)
+    copy = old.with_name(f"{OTHER}.jsonl")
+    copy.write_bytes(encode(t.records))
+    settled_copy(copy)
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    set_config(auto_homes, "auto = false\n")  # (else the copy is paired as a session of its own)
+    run("sync")
+    code, out = run("release", pair.name)
+    assert code == 0 and "goes on with the Claude desktop app's copy" in out, out
+    [pair] = pairs().values()
+    assert pair.claude == OTHER and not pair.blocked
+    assert run("sync")[1].count("blocked") == 0
+    assert "(continued in the Claude desktop app)" in old.read_text()  # its old session
+
+
+def test_a_copy_still_being_written_is_waited_for(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    old = find_transcript(auto_homes.claude, pair.claude)
+    copy = go_on_in_a_copy(old, OTHER, "carried on in the desktop app")
+    os.utime(copy)  # just written
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    code, out = run("sync")
+    [pair] = pairs().values()
+    assert not pair.blocked and pair.claude != OTHER and "writing its copy" in pair.status
+
+
+def test_a_codex_turn_is_not_written_into_a_session_the_app_moved_on_from(both, app):
+    from duologue import engine as engine_module
+
+    e = engine()
+    e.pairs[both.name].card = "local_0d000000-0000-4000-8000-000000000001"
+    e.save()
+    card = app.device / "local_0d000000-0000-4000-8000-000000000001.json"
+    card.write_text(json.dumps({"cliSessionId": SESSION}))
+    both.codex.turn("from codex", "ok")
+    size = both.claude.path.stat().st_size
+    real = engine_module.Engine.card_moved
+    calls = iter([None, None, OTHER])  # the app copies the session just as duologue writes
+
+    def moved(self, pair):
+        return next(calls, OTHER) if pair.name == both.name else real(self, pair)
+
+    import pytest as _pytest
+
+    with _pytest.MonkeyPatch.context() as m:
+        m.setattr(engine_module.Engine, "card_moved", moved)
+        outcome, _ = sync(both.name)
+    assert outcome.state == "waiting" and "goes on with the session in a copy" in outcome.text
+    assert both.claude.path.stat().st_size == size  # what duologue wrote was taken out
+
+
+def test_held_pairs_are_left_alone_and_a_block_is_said_once(auto_homes, app, monkeypatch):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    t = ClaudeTranscript(cwd=auto_homes.work, session=OTHER)
+    t.user("unrelated")
+    t.assistant("ok")
+    copy = find_transcript(auto_homes.claude, pair.claude).with_name(f"{OTHER}.jsonl")
+    copy.write_bytes(encode(t.records))
+    settled_copy(copy)
+    set_config(auto_homes, "auto = false\n")
+    run("hold", pair.name)
+    run("sync")
+    [pair] = pairs().values()
+    assert pair.hold and not pair.blocked
+    run("release", pair.name)
+    told = []
+    monkeypatch.setattr(engine_module_notify(), "notify", lambda self, text: told.append(text))
+    for _ in range(3):
+        run("sync")
+    assert len(told) == 1
+
+
+def engine_module_notify():
+    from duologue.engine import Engine
+
+    return Engine
+
+
+def test_cards_already_there_are_followed_with_desktop_cards_off(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    set_config(auto_homes, "desktop_cards = false\n")
+    copy = go_on_in_a_copy(find_transcript(auto_homes.claude, pair.claude), OTHER, "go on")
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    assert copy.exists()
+    code, out = run("sync")
+    assert "copied 1 Claude turn(s) to Codex" in out, out
+    assert [p.claude for p in pairs().values()] == [OTHER]
+
+
+def test_a_creation_cut_short_still_gets_its_card(auto_homes, app, monkeypatch):
+    from duologue.claude import sessions
+
+    codex_thread(auto_homes)
+    real = sessions._verify
+    monkeypatch.setattr(sessions, "_verify", lambda *a: (_ for _ in ()).throw(OSError("cut")))
+    run("sync")
+    monkeypatch.setattr(sessions, "_verify", real)
+    run("sync")
+    run("sync")
+    assert len(cards(app)) == 1

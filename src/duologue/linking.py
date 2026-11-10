@@ -248,6 +248,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
     pair = Pair(
         name=_unique(engine, name or _codex_title(finished)), claude=session_id, codex=codex
     )
+    pair.card_wanted = True  # listed in the Claude desktop app once it is there
     version = claude_version(engine.config.claude_bin)
     key, kept = pair.key, {}
 
@@ -292,7 +293,6 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
         )[1],
     )
     engine.confirm(pair, {"end": made.end, "anchor": made.uuids[-1]}, after_codex)
-    pair.card_wanted = True  # listed in the Claude desktop app on its first sync
     source = Cursor(end, before_digest, after_codex["anchor"])
     _source_unchanged(engine, pair, xpath, source, "Codex thread")
     done = f"created Claude session {session_id} with {kept['turns']} turn(s) from Codex"
@@ -457,6 +457,13 @@ def release(engine: Engine, pair: Pair) -> str:
             except Blocked:
                 engine.accept_pending(pair)
                 said.append("the interrupted write was settled as the files stand")
+        moved = engine.card_moved(pair)
+        if moved and find_transcript(engine.config.claude_home, moved):
+            # The desktop app goes on with the session in a copy that lacks the synced point:
+            # the pair goes on with the copy from where it stands.
+            copy = find_transcript(engine.config.claude_home, moved)
+            engine.move_to(pair, moved, _reanchor_claude(copy, pair.claude_cursor))
+            said.append("the pair goes on with the Claude desktop app's copy of the session")
         try:
             cpath, xpath = engine.paths(pair)
         except Gone as e:
