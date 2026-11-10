@@ -452,16 +452,62 @@ def test_unlink_and_find_pair(pair):
     assert engine().pairs == {}
 
 
-def test_a_deleted_conversation_removes_its_pair(pair, homes):
+def gone_an_hour(name: str) -> None:
+    from duologue.engine import GONE_AFTER
+
+    e = engine()
+    e.pairs[name].gone_since -= GONE_AFTER
+    e.save()
+
+
+def test_a_conversation_gone_for_an_hour_removes_its_pair(pair, homes):
+    from duologue.pairs import AutoState, auto_state_file
+
     pair.claude.path.unlink()
+    e = engine()
+    outcome = e.sync(e.pairs[pair.name])
+    assert outcome.state == "waiting" and "removed if it is still gone in an hour" in outcome.text
+    gone_an_hour(pair.name)
     e = engine()
     outcome = e.sync(e.pairs[pair.name])
     assert outcome.state == "removed" and "not on this machine any more" in outcome.text
     e = engine()
     assert e.pairs == {}
-    from duologue.pairs import AutoState, auto_state_file
+    # The Codex thread is paired again by itself only once the user carries on in it.
+    passed = AutoState.load(auto_state_file(e.config)).passed
+    assert [v[2] for v in passed.values()] == ["its other side was deleted"]
 
-    assert THREAD in AutoState.load(auto_state_file(e.config)).ignored  # no copy made again
+
+def test_a_conversation_back_within_the_hour_keeps_its_pair(pair):
+    kept = pair.claude.path.read_bytes()
+    pair.claude.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    pair.claude.path.write_bytes(kept)
+    pair.claude.turn("back", "ok")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "synced" and p.gone_since is None
+
+
+def test_a_conversation_gone_during_an_unsettled_write_removes_its_pair(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    monkeypatch.setattr(threads, "finish", lambda *a, **k: (_ for _ in ()).throw(OSError("cut")))
+    assert sync(pair.name)[0].state == "error" and engine().pairs[pair.name].pending
+    pair.codex.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed" and engine().pairs == {}
+
+
+def test_removing_a_pair_does_not_need_auto_json(pair, homes):
+    pair.claude.path.unlink()
+    sync(pair.name)
+    gone_an_hour(pair.name)
+    (homes.duo / "auto.json").write_text("{not json")
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
 
 
 def test_a_missing_app_folder_blocks_and_removes_nothing(pair, homes):
@@ -1312,3 +1358,13 @@ def test_release_will_not_have_codex_index_an_unsettled_write(pair, tmp_path, mo
     with pytest.raises(Wait, match="not settled"):
         linking.release(e, e.pairs[pair.name])
     assert packed.exists() and "thread/resume" not in requests(log)
+
+
+def test_an_unmounted_projects_folder_blocks_and_removes_nothing(pair, homes, tmp_path):
+    import shutil
+
+    shutil.rmtree(homes.claude / "projects")
+    (homes.claude / "projects").symlink_to(tmp_path / "not-mounted")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "blocked" and p.gone_since is None
+    assert engine().pairs

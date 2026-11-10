@@ -266,4 +266,29 @@ def test_a_pair_written_by_a_later_duologue_still_loads(tmp_path: Path):
     data = json.loads((tmp_path / "pairs.json").read_text())
     data["pairs"][0]["field_from_the_future"] = 1
     (tmp_path / "pairs.json").write_text(json.dumps(data))
-    assert store.load()["x"].claude == "c"
+    pairs = store.load()
+    assert pairs["x"].claude == "c"
+    store.save(pairs)  # and saving here keeps what it does not know
+    saved = json.loads((tmp_path / "pairs.json").read_text())["pairs"][0]
+    assert saved["field_from_the_future"] == 1
+
+
+def test_auto_json_entries_that_are_not_well_formed_are_dropped(tmp_path: Path):
+    from duologue.pairs import AutoState
+
+    path = tmp_path / "auto.json"
+    path.write_text(
+        json.dumps(
+            {
+                "ignored": ["a"],
+                "passed": {"/p": 5, "/q": [1, 2, "why"]},
+                "failed": {"/r": "soon"},
+                "waiting": {"x": 1},
+                "from_the_future": {"k": 1},
+            }
+        )
+    )
+    state = AutoState.load(path)
+    assert state.passed == {"/q": [1, 2, "why"]} and state.failed == {} and state.waiting == {}
+    state.save()
+    assert json.loads(path.read_text())["from_the_future"] == {"k": 1}

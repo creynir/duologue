@@ -92,7 +92,12 @@ def found(engine: Engine, state: AutoState, now: float) -> list[Found]:
         if not stat.S_ISREG(st.st_mode):  # a pipe or a device would hang the pass
             return
         stamp = (st.st_size, st.st_mtime_ns)
-        if st.st_mtime < cutoff or ident in taken or ident in state.ignored:
+        if ident in taken:  # paired, by hand or by an earlier pass: nothing to remember
+            for memo in (state.passed, state.failed):
+                if memo.pop(str(path), None) is not None:
+                    state.changed = True
+            return
+        if st.st_mtime < cutoff or ident in state.ignored:
             return
         if (state.passed.get(str(path)) or [])[:2] == list(stamp):
             return

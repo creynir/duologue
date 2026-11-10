@@ -11,7 +11,8 @@ Every conversation syncs by itself.
   typed yet are left out, and so is a pair you unlinked until you link it again. `duologue
   status` says what waits or was left out, and why. A try that failed is made again ten minutes
   later. `auto = false` turns it off.
-- **A deleted conversation removes its pair**, and the other side is not paired again.
+- **A conversation deleted for an hour removes its pair**; the other side is paired again only
+  once the user carries on in it. A folder that is not there (an unmounted drive) blocks instead.
 - **`sync --quiet`** (the service) prints a stop once, not on every pass, and a pass that
   changed nothing does not rewrite the pairs file.
 - **Codex's own importer.** A Claude session Codex already imported is paired with that thread

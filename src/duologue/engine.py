@@ -34,10 +34,11 @@ from pathlib import Path
 
 from duologue.claude import sessions as claude_sessions
 from duologue.claude.live import live_pid
-from duologue.claude.transcript import find_transcript, is_typed, settled, tail
+from duologue.claude.transcript import PROJECTS, find_transcript, is_typed, settled, tail
 from duologue.codex import lock
 from duologue.codex import threads as codex_threads
 from duologue.codex.rollout import (
+    SESSIONS,
     anchor_ends,
     batch_anchor,
     batch_end,
@@ -56,6 +57,7 @@ from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import (
     ActivityLog,
     AutoState,
+    AutoStateError,
     Cursor,
     Pair,
     Pending,
@@ -91,12 +93,13 @@ CONFLICT = (
     "you wrote in both Claude and Codex since the last sync, so nothing was copied; keep one "
     'side\'s new turns with: duologue resolve "{name}" --keep claude (or --keep codex)'
 )
+GONE_AFTER = 3600  # seconds a conversation is missing before its pair is removed
 KNOWN_RECORD_TYPES = ("user", "assistant")  # the only chain records that carry a message
 TRANSIENT = (AppServerError, OSError, TimeoutError, sqlite3.Error, subprocess.SubprocessError)
 
 
 class Gone(Blocked):
-    """One of the pair's conversations was deleted (its app's folder is still there)."""
+    """One of the pair's conversations is not there, though its app's folder of them is."""
 
 
 @dataclass(frozen=True)
@@ -134,7 +137,10 @@ class Engine:
         except Wait as e:
             outcome = Outcome("waiting", str(e))
         except Gone as e:
-            return self.retire(pair, e)
+            if time.time() - (pair.gone_since or time.time()) >= GONE_AFTER:
+                return self.retire(pair, e)
+            pair.gone_since = pair.gone_since or time.time()
+            outcome = Outcome("waiting", f"{e}; the pair is removed if it is still gone in an hour")
         except Blocked as e:
             self.block(pair, str(e))
             outcome = Outcome("blocked", str(e))
@@ -149,16 +155,28 @@ class Engine:
         return outcome
 
     def retire(self, pair: Pair, gone: Gone) -> Outcome:
-        """Remove a pair one of whose conversations was deleted. The other is not paired again
-        by itself: it would get a copy the user just removed."""
-        AutoState.load(auto_state_file(self.config)).ignore(pair.claude, pair.codex)
+        """Remove a pair one of whose conversations has been gone for :data:`GONE_AFTER`. The
+        other is paired again by itself only once it changes (the user carries on in it), not
+        straight away: it would get a copy of what the user just deleted."""
         self.pairs.pop(pair.name, None)
         self.forget_pending(pair)
+        for find in (self.claude_path, self.codex_file):
+            try:
+                path = find(pair)
+                st = path.stat()
+                state = AutoState.load(auto_state_file(self.config))
+                why = "its other side was deleted"
+                state.pass_over(str(path), (st.st_size, st.st_mtime_ns), why)
+                state.save()
+            except (Blocked, AutoStateError, OSError):
+                pass  # the deleted side; or no pairing by itself now anyway
         text = f"{gone}; the pair is removed"
         self.log.write(pair.name, "removed", text)
         return Outcome("removed", text)
 
     def _sync(self, pair: Pair, force: bool) -> Outcome:
+        self.claude_path(pair), self.codex_file(pair)  # both still there, before settling
+        pair.gone_since = None
         if pair.pending:
             self.settle(pair)
         cpath, xpath = self.claude_path(pair), self.codex_file(pair)
@@ -492,7 +510,8 @@ class Engine:
         cpath = find_transcript(self.config.claude_home, pair.claude)
         if cpath is None:
             text = f"the Claude session {pair.claude} is not on this machine any more"
-            raise Gone(text) if self.config.claude_home.is_dir() else Blocked(text)
+            looked = (self.config.claude_home / PROJECTS).is_dir()  # not an unmounted folder
+            raise Gone(text) if looked else Blocked(text)
         return cpath
 
     def codex_file(self, pair: Pair) -> Path:
@@ -500,7 +519,7 @@ class Engine:
         xpath = self.codex.rollout(pair.codex)
         if xpath is None:
             text = f"the Codex thread {pair.codex} is not on this machine any more"
-            raise Gone(text) if self.codex.home.is_dir() else Blocked(text)
+            raise Gone(text) if (self.codex.home / SESSIONS).is_dir() else Blocked(text)
         return xpath
 
     def codex_path(self, pair: Pair) -> Path:

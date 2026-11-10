@@ -109,8 +109,13 @@ def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):
 
 
 def test_a_deleted_conversation_is_one_line_and_its_pair_goes(linked, capsys):
+    from test_engine import gone_an_hour
+
     claude, _ = linked
     claude.path.unlink()
+    assert main(["sync"]) == 0
+    assert "removed if it is still gone in an hour" in capsys.readouterr().out
+    gone_an_hour("work")
     assert main(["sync"]) == 0
     assert "not on this machine any more; the pair is removed" in capsys.readouterr().out
     assert main(["release", "work"]) == 1

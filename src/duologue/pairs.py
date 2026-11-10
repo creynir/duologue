@@ -77,6 +77,9 @@ class Pair:
     codex_quiet: list | None = None
     # A note to put before the next Claude turns copied to Codex (turns left out before them)
     note_to_codex: str | None = None
+    gone_since: float | None = None  # when a pass first found one of its conversations missing
+    # Fields a later duologue wrote: kept as they are, so saving here does not drop them.
+    extra: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -94,12 +97,16 @@ class Pair:
         return "linked"
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        return {**d.pop("extra"), **d}
 
     @classmethod
     def from_dict(cls, d: dict) -> Pair:
-        # Fields a later duologue added are left out: the pair still syncs with this one.
-        d = {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
+        # Fields a later duologue added are kept aside, and written back as they were.
+        known = set(cls.__dataclass_fields__) - {"extra"}
+        extra = {k: v for k, v in d.items() if k not in known}
+        d = {k: v for k, v in d.items() if k in known}
+        d["extra"] = extra
         d["claude_cursor"] = Cursor(**d.get("claude_cursor") or {})
         d["codex_cursor"] = Cursor(**d.get("codex_cursor") or {})
         d["pending"] = Pending(**d["pending"]) if d.get("pending") else None
@@ -248,6 +255,7 @@ class AutoState:
     failed: dict[str, list] = field(default_factory=dict)  # path -> [when, why]
     waiting: dict[str, str] = field(default_factory=dict)  # id -> why, in the last pass
     settings: dict = field(default_factory=dict)  # the ones the reasons in ``passed`` rest on
+    extra: dict = field(default_factory=dict)  # what a later duologue wrote: kept as it is
     changed: bool = False
 
     @classmethod
@@ -265,17 +273,26 @@ class AutoState:
         if not isinstance(data, dict) or not isinstance(data.get("ignored", []), list):
             raise AutoStateError(f"{path} does not hold what duologue writes there")
 
-        def mapping(key: str) -> dict:
+        def entries(key: str, fits) -> dict:
+            """The well-formed entries (bookkeeping: one that is not is dropped)."""
             value = data.get(key)
-            return dict(value) if isinstance(value, dict) else {}
+            return {k: v for k, v in value.items() if fits(v)} if isinstance(value, dict) else {}
 
+        def stamped(v) -> bool:
+            return isinstance(v, list) and len(v) >= 3 and all(isinstance(x, int) for x in v[:2])
+
+        def tried(v) -> bool:
+            return isinstance(v, list) and len(v) >= 2 and isinstance(v[0], int | float)
+
+        known = {"ignored", "passed", "failed", "waiting", "settings"}
         return cls(
             path,
             {x for x in data.get("ignored", []) if isinstance(x, str)},
-            mapping("passed"),
-            mapping("failed"),
-            mapping("waiting"),
-            mapping("settings"),
+            entries("passed", stamped),
+            entries("failed", tried),
+            entries("waiting", lambda v: isinstance(v, str)),
+            entries("settings", lambda v: True),
+            extra={k: v for k, v in data.items() if k not in known},
         )
 
     def pass_over(self, path: str, stamp: tuple[int, int], why: str) -> None:
@@ -294,6 +311,7 @@ class AutoState:
 
     def save(self) -> None:
         data = {
+            **self.extra,
             "ignored": sorted(self.ignored),
             "passed": self.passed,
             "failed": self.failed,

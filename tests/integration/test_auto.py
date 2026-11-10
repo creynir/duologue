@@ -665,3 +665,19 @@ def test_an_idle_pass_does_not_rewrite_the_pairs_file(both):
     time.sleep(0.01)
     assert sync(both.name, force=False)[0].state == "idle"
     assert state.stat().st_mtime_ns == before
+
+
+def test_status_forgets_what_was_paired_since(auto_homes, monkeypatch):
+    claude_session(auto_homes)
+
+    def fail(*args, **kwargs):
+        raise AppServerError("thread/resume", {"message": "no answer"})
+
+    with monkeypatch.context() as m:
+        m.setattr(linking, "link", fail)
+        run("sync")
+    assert state().failed
+    assert run("link", "--claude", SESSION)[0] == 0
+    run("sync")
+    assert not state().failed
+    assert "not paired yet" not in run("status")[1]
