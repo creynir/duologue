@@ -5,8 +5,9 @@
 What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Claude Code
 2.1.318 (see [docs/PRIOR_ART.md](docs/PRIOR_ART.md)).
 
-- **Diffs in Claude.** A Codex change to one file arrives as Claude's own `Write` or `Edit`, so
-  the Claude app shows the diff.
+- **Diffs in Claude.** A new file, or a change to one place in one file, arrives from Codex as
+  Claude's own `Write` or `Edit`, so the Claude app shows the diff. Other changes stay one
+  `apply_patch` call.
 - **Messages typed while Claude works** reach Codex in the turn they joined.
 - **Undo and edits in Codex.** Rolled-back turns that had not synced are left out. When Claude
   already has them, a note tells Claude how many were undone, with the next Codex turns or on

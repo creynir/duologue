@@ -57,8 +57,10 @@ note telling the model where the older ones are.
   the turns while no Codex process has the thread loaded, holding Codex's own writer lock. Then
   it lets Codex index them, and checks that it did.
 - **Codex to Claude.** Codex's commands, file changes and MCP calls become tool calls and results
-  in the Claude transcript, after a note saying they happened in Codex. A change to one file
-  becomes Claude's own `Write` or `Edit`, so the Claude app shows the diff. (Turns that Codex's own
+  in the Claude transcript, after a note saying they happened in Codex. A new file, or a change
+  to one place in one file, becomes Claude's own `Write` or `Edit`, so the Claude app shows the
+  diff; Claude Code then treats that file as read, and may overwrite it without reading it first.
+  Other changes arrive as one `apply_patch` call. (Turns that Codex's own
   importer made hold only text, and arrive as text.) duologue writes them
   only while no Claude Code process has the session open, so it carries on from them when it is
   next opened.

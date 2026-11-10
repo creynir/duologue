@@ -1074,6 +1074,9 @@ def test_link_from_claude_keeps_a_queued_message_in_its_turn(homes):
     claude.save()
     p, said = linking.link(engine(), claude=SESSION, codex=None, name="q", cwd=CWD)
     assert "with 1 turn(s)" in said
+    path = Codex(homes.codex, homes.bin).rollout(p.codex)
+    said_in_codex = [i["content"][0]["text"] for i in items(path) if i["type"] == "UserMessage"]
+    assert said_in_codex == ["build it", "and test it too"]
 
 
 def test_a_compressed_thread_is_not_resumed_while_claude_is_still_working(

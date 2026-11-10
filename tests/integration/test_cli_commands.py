@@ -141,3 +141,18 @@ def test_hold_with_an_empty_reason_still_holds(linked, capsys):
     assert main(["status", "--json"]) == 0
     [pair] = json.loads(capsys.readouterr().out)
     assert pair["hold"] == "held by you"
+
+
+def test_doctor_goes_on_when_codex_index_cannot_be_read(linked, capsys, monkeypatch):
+    import sqlite3
+
+    from duologue.codex.threads import Codex
+
+    def locked(self, thread_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Codex, "index", locked)
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "Codex's index could not be read (database is locked)" in out
+    assert "background service:" in out  # the rest of the report still comes

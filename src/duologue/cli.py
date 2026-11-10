@@ -7,6 +7,7 @@ import contextlib
 import json
 import os
 import shutil
+import sqlite3
 import sys
 from collections.abc import Iterator, Sequence
 
@@ -270,13 +271,16 @@ def _pair_files(e, p) -> list[tuple[bool | None, str]]:
         )
     try:
         xpath = e.codex_file(p)
+        if is_compressed(xpath):
+            out.append((None, "Codex keeps the thread compressed while it is idle"))
+            return out
+        index = e.codex.index(p.codex)  # before the size: Codex appends, then indexes
         size = xpath.stat().st_size
     except (Blocked, OSError):
         return out
-    if is_compressed(xpath):
-        out.append((None, "Codex keeps the thread compressed while it is idle"))
+    except sqlite3.Error as err:
+        out.append((None, f"Codex's index could not be read ({err})"))
         return out
-    index = e.codex.index(p.codex)
     if index.next_offset is None:
         out.append((None, "Codex has not indexed the thread yet"))
     elif index.next_offset > size:

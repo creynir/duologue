@@ -215,7 +215,8 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
     ends = turn_ends(lines)
     if not ends:
         raise LinkError("the Codex thread has no finished turn to copy yet")
-    finished = [ln for ln in lines if ln.end <= batch_end(lines)]
+    end = batch_end(lines)  # after the last turn, or a rollback that follows it
+    finished = [ln for ln in lines if ln.end <= end]
     # The turns Codex still holds: a rollback drops earlier turns, as Codex rebuilds the thread.
     groups = [g for _, g in codex_turns([ln.record for ln in finished])[0]]
     cwd = session_meta(xpath).get("cwd") or os.getcwd()
@@ -251,7 +252,6 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
             lead_extra=extra,
         )
 
-    end = batch_end(lines)  # after a rollback that follows the last turn, as the copy is
     after_codex = {"end": end, "anchor": batch_anchor(finished)}
     before_digest = prefix_hash(xpath, end)
     made = _create(

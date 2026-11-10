@@ -22,8 +22,10 @@ checked against the apps themselves, and what duologue does about each finding.
 ## The landscape
 
 Most tools copy a conversation once into a new session of the other app, or hand over a text
-summary. Few append to an existing session, and none keeps one conversation going in both official
-apps with each side's tool calls shown natively, which is what duologue does.
+summary. Few append to an existing session. The closest to duologue is tandem, which maps tool
+calls natively both ways but runs one command-line harness at a time, and whose tool activity does
+not appear in the Codex app. None keeps one conversation going in both official apps, with each
+side's tool calls shown natively in the other app.
 
 ### A. Live two-way sync
 
@@ -115,7 +117,7 @@ without it.
 | Editing an earlier message or undoing in Codex appends `thread_rolled_back` with `num_turns`. Codex ends the open turn, then drops the last `num_turns` turns. | codex-rs `app-server-protocol/src/protocol/thread_history.rs` (`handle_thread_rollback`) | Turns rolled back before they synced never reach Claude. When turns Claude already has are rolled back, a note says how many, with Codex's next turns or on its own. A Claude turn on top of a rollback is a conflict. |
 | Codex may keep a rollout compressed (`.jsonl.zst`), and writes it out plain when the thread is resumed. | codex-rs `rollout/src/recorder.rs`; checked with Codex 0.166.0 | A compressed thread stays compressed while neither side has anything to copy (Codex's index ends at the cursor), and is resumed when one does, instead of waiting until someone opens it in Codex. Archived threads are left alone. |
 | A message typed while Claude works is stored as an `attachment` of type `queued_command` (`commandMode` "prompt", origin `human`) and folded into the running turn. Task notifications and messages from other agents (origin `peer`, marked `isMeta`) use the same record. | codeg; checked in about 1,000 such records written by Claude Code 2.1.220 to 2.1.316 | Travels to Codex as a second user message in the same turn, as Codex records a message sent mid-turn. Task notifications and other agents' messages do not. |
-| Claude's session list reads the first and last 64 KiB of a transcript. It shows the prompt in the last `last-prompt` line (`lastPrompt`, `leafUuid`, `sessionId`), cut to 200 characters. | mirkobrombin, FredrikAhman, Maxaccurate; checked in transcripts Claude Code wrote | Every append from Codex ends with a `last-prompt` line naming the last message typed in Codex. |
+| Claude's session list reads the first and last 64 KiB of a transcript. It shows the prompt in the last `last-prompt` line (`lastPrompt`, `leafUuid`, `sessionId`), cut to 200 characters. | mirkobrombin, FredrikAhman, Maxaccurate; checked in transcripts Claude Code wrote | Every append from Codex that holds a message typed in Codex ends with a `last-prompt` line naming the last one. |
 | The Claude app draws a diff from the result record of its own `Edit` and `Write` tools (`structuredPatch`, `oldString`, `newString`). | tandem, opal-bridge; the fields checked in records Claude Code wrote | A Codex change to one file becomes Claude's own `Write` (new file) or `Edit` (one hunk) with that record. Anything else stays one `apply_patch` call. Claude Code 2.1.318 resumes a session holding them (an end-to-end test). |
 | Above 5,242,880 bytes, Claude Code loads a transcript only from its last compaction on. | zen; checked in Claude Code 2.1.318's transcript loader | `doctor` notes a transcript past that size. |
 | Cursors alone do not stop echoes after a cursor moves back. The robust tools also recognise their own records: by id shape, a marker field or a ledger. | Chendestiny, ccx, Maxaccurate, faratech | Records duologue writes to Claude carry `duologueSource`; Codex turns it writes have name-based (version 5) ids. A sync pass never sends either back. A new pair's history copy still includes them. |

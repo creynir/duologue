@@ -286,8 +286,7 @@ def test_codex_file_changes_resume_in_claude_as_its_own_write_and_edit(world: Wo
     request = world.mock.seen("messages")[-1]
     calls = {use["name"]: (use["input"], result) for use, result in claude_calls(request)}
     assert calls["Write"][0] == {"file_path": new, "content": "one\ntwo\n"}
-    assert calls["Edit"][0]["file_path"] == old
-    assert "b" in calls["Edit"][0]["old_string"] and "B" in calls["Edit"][0]["new_string"]
+    assert calls["Edit"][0] == {"file_path": old, "old_string": "a\nb\nc", "new_string": "a\nB\nc"}
     assert all(result is not None for _, result in calls.values())
 
 
