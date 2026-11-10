@@ -263,7 +263,11 @@ None does one live conversation in both official apps with native blocks on both
   records. Translate only `user`/`assistant` records.
 - **The Claude desktop app's cards are undocumented, and duologue writes them.** Their fields, the
   account and device folders, and the app copying a session it did not make come from the app's
-  own cards and two tools that write them; none of it is checked with the real app yet. A card
+  own cards and two tools that write them: [Agentryx-ai/pass-the-thread](https://github.com/Agentryx-ai/pass-the-thread)
+  (`src/claude-desktop-target.ts`, `docs/FORMATS.md`) and
+  [FredrikAhman/claudeimportfromcodex](https://github.com/FredrikAhman/claudeimportfromcodex)
+  (`src/desktop_register.py`); see [PRIOR_ART.md](PRIOR_ART.md). None of it is checked with the
+  real app yet. A card
   the app does not take shows nothing; one it changes in another way than expected is followed
   only as far as the copy holds the synced point, else the pair blocks. `desktop_cards = false`
   stops new cards.
