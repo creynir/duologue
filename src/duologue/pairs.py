@@ -75,6 +75,11 @@ class Pair:
     checked: dict = field(default_factory=dict)  # side -> file stamp its cursor last matched
     # [Codex cursor end, Codex file size] when a pass last found nothing in Codex to copy
     codex_quiet: list | None = None
+    # A note to put before the next Claude turns copied to Codex (turns left out before them)
+    note_to_codex: str | None = None
+    gone_since: float | None = None  # when a pass first found one of its conversations missing
+    # Fields a later duologue wrote: kept as they are, so saving here does not drop them.
+    extra: dict = field(default_factory=dict)
 
     @property
     def key(self) -> str:
@@ -92,15 +97,28 @@ class Pair:
         return "linked"
 
     def to_dict(self) -> dict:
-        return asdict(self)
+        d = asdict(self)
+        return {**d.pop("extra"), **d}
 
     @classmethod
     def from_dict(cls, d: dict) -> Pair:
-        d = dict(d)
-        d["claude_cursor"] = Cursor(**d.get("claude_cursor") or {})
-        d["codex_cursor"] = Cursor(**d.get("codex_cursor") or {})
-        d["pending"] = Pending(**d["pending"]) if d.get("pending") else None
+        # Fields a later duologue added are kept aside, and written back as they were.
+        known = set(cls.__dataclass_fields__) - {"extra"}
+        extra = {k: v for k, v in d.items() if k not in known}
+        d = {k: v for k, v in d.items() if k in known}
+        d["extra"] = extra
+        d["claude_cursor"] = Cursor(**_known(Cursor, d.get("claude_cursor") or {}))
+        d["codex_cursor"] = Cursor(**_known(Cursor, d.get("codex_cursor") or {}))
+        d["pending"] = Pending(**_known(Pending, d["pending"])) if d.get("pending") else None
         return cls(**d)
+
+
+def _known(cls, d: dict) -> dict:
+    """``d``'s fields that ``cls`` has: a later duologue's additions inside a cursor or a write
+    record are left out (they are worked out again)."""
+    if not isinstance(d, dict):
+        raise TypeError(f"a {cls.__name__.lower()} is not an object")
+    return {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
 
 
 class Store:
@@ -226,3 +244,105 @@ class ActivityLog:
                 if pair is None or entry.get("pair") == pair:
                     out.append(entry)
         return out[-n:] if n > 0 else out
+
+
+# ------------------------------------------------------------------------- pairing by itself
+class AutoStateError(ValueError):
+    """``auto.json`` cannot be read. It lists what the user unlinked, so nothing is paired by
+    itself until it is fixed or removed."""
+
+
+@dataclass
+class AutoState:
+    """``<home>/auto.json``: the ids not to pair by itself (the user's decisions), and what the
+    last passes found (bookkeeping)."""
+
+    path: Path
+    ignored: set[str] = field(default_factory=set)
+    passed: dict[str, list] = field(default_factory=dict)  # path -> [size, mtime_ns, why]
+    failed: dict[str, list] = field(default_factory=dict)  # path -> [when, why]
+    waiting: dict[str, str] = field(default_factory=dict)  # id -> why, in the last pass
+    settings: dict = field(default_factory=dict)  # the ones the reasons in ``passed`` rest on
+    extra: dict = field(default_factory=dict)  # what a later duologue wrote: kept as it is
+    changed: bool = False
+
+    @classmethod
+    def load(cls, path: Path) -> AutoState:
+        try:
+            st = os.stat(path)
+        except FileNotFoundError:
+            return cls(path)
+        if not stat.S_ISREG(st.st_mode):
+            raise AutoStateError(f"{path} is not a file")
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as e:
+            raise AutoStateError(f"{path} cannot be read ({e})") from e
+        if not isinstance(data, dict) or not isinstance(data.get("ignored", []), list):
+            raise AutoStateError(f"{path} does not hold what duologue writes there")
+
+        def entries(key: str, fits) -> dict:
+            """The well-formed entries (bookkeeping: one that is not is dropped)."""
+            value = data.get(key)
+            return {k: v for k, v in value.items() if fits(v)} if isinstance(value, dict) else {}
+
+        def stamped(v) -> bool:
+            return (
+                isinstance(v, list)
+                and len(v) == 3
+                and all(isinstance(x, int) for x in v[:2])
+                and isinstance(v[2], str)
+            )
+
+        def tried(v) -> bool:
+            return isinstance(v, list) and len(v) >= 2 and isinstance(v[0], int | float)
+
+        known = {"ignored", "passed", "failed", "waiting", "settings"}
+        return cls(
+            path,
+            {x for x in data.get("ignored", []) if isinstance(x, str)},
+            entries("passed", stamped),
+            entries("failed", tried),
+            entries("waiting", lambda v: isinstance(v, str)),
+            entries("settings", lambda v: True),
+            extra={k: v for k, v in data.items() if k not in known},
+        )
+
+    def pass_over(self, path: str, stamp: tuple[int, int], why: str) -> None:
+        """Remember that the conversation in ``path`` was left out as it stands, and why."""
+        self.passed[path] = [*stamp, why]
+        self.failed.pop(path, None)
+        self.changed = True
+
+    def fail(self, path: str, why: str, now: float) -> bool:
+        """Remember that a try at the conversation in ``path`` failed; whether that is news (not
+        the reason logged last time)."""
+        old = self.failed.get(path)
+        self.failed[path] = [now, why]
+        self.changed = True
+        return not (isinstance(old, list) and old[1:] == [why])
+
+    def save(self) -> None:
+        data = {
+            **self.extra,
+            "ignored": sorted(self.ignored),
+            "passed": self.passed,
+            "failed": self.failed,
+            "waiting": self.waiting,
+            "settings": self.settings,
+        }
+        write_atomic(self.path, (json.dumps(data, indent=1) + "\n").encode())
+
+    def ignore(self, *ids: str) -> None:
+        self.ignored.update(ids)
+        self.save()
+
+    def unignore(self, *ids: str) -> None:
+        if self.ignored & set(ids):
+            self.ignored -= set(ids)
+            self.save()
+
+
+def auto_state_file(config) -> Path:
+    """``auto.json`` in duologue's folder (``config`` is a :class:`~duologue.config.Config`)."""
+    return config.home / "auto.json"

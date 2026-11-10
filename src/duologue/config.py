@@ -13,6 +13,10 @@ optional::
     codex_source = "vscode"        # how threads duologue creates are listed (the app lists vscode)
     notify = ["notify-send", "duologue"]   # run with a message as its last argument
     allow_untested_codex = false   # write to a Codex whose item format duologue has not seen
+    auto = true                    # pair new conversations by itself (false: only what you link)
+    auto_days = 7                  # ... ones that changed within this many days
+    auto_scripted = false          # ... and scripted runs (claude -p, the Agent SDK, codex exec)
+    on_conflict = "keep-both"      # after you wrote in both apps; "stop" waits for resolve
 """
 
 from __future__ import annotations
@@ -41,6 +45,10 @@ class Config:
     codex_source: str = "vscode"
     notify: tuple[str, ...] = field(default_factory=tuple)
     allow_untested_codex: bool = False
+    auto: bool = True
+    auto_days: float = 7.0
+    auto_scripted: bool = False
+    on_conflict: str = "keep-both"
 
     @property
     def config_file(self) -> Path:
@@ -77,7 +85,12 @@ _TYPES: dict[str, tuple[type, ...]] = {
     "codex_source": (str,),
     "notify": (list,),
     "allow_untested_codex": (bool,),
+    "auto": (bool,),
+    "auto_days": (int, float),
+    "auto_scripted": (bool,),
+    "on_conflict": (str,),
 }
+CONFLICT_POLICIES = ("keep-both", "stop")
 
 
 def load(env: Mapping[str, str] | None = None) -> Config:
@@ -100,6 +113,10 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         codex_source=data.get("codex_source", "vscode"),
         notify=tuple(notify),
         allow_untested_codex=data.get("allow_untested_codex", False),
+        auto=data.get("auto", True),
+        auto_days=float(data.get("auto_days", 7.0)),
+        auto_scripted=data.get("auto_scripted", False),
+        on_conflict=data.get("on_conflict", "keep-both"),
     )
 
 
@@ -121,4 +138,9 @@ def _read(path: Path) -> dict:
     quiet = data.get("quiet_seconds", 0)
     if not math.isfinite(quiet) or quiet < 0 or data.get("copy_budget", 1) <= 0:
         raise ConfigError(f"{path}: quiet_seconds must be 0 or more, copy_budget above 0")
+    days = data.get("auto_days", 1)
+    if not math.isfinite(days) or days <= 0:
+        raise ConfigError(f"{path}: auto_days must be above 0")
+    if data.get("on_conflict", "keep-both") not in CONFLICT_POLICIES:
+        raise ConfigError(f"{path}: on_conflict must be " + " or ".join(CONFLICT_POLICIES))
     return data

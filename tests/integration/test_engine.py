@@ -31,9 +31,10 @@ def homes(tmp_path: Path, fake_codex_bin: Path, monkeypatch):
     duo, claude, codex = tmp_path / "duo", tmp_path / "claude", tmp_path / "codex"
     for d in (duo, claude, codex):
         d.mkdir()
+    # These tests pair by hand (test_auto covers pairing by itself).
     (duo / "config.toml").write_text(
         f'codex_bin = "{fake_codex_bin}"\nclaude_bin = "{tmp_path / "no-claude"}"\n'
-        "quiet_seconds = 0\n"
+        "quiet_seconds = 0\nauto = false\n"
     )
     monkeypatch.setenv("DUOLOGUE_HOME", str(duo))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
@@ -42,6 +43,13 @@ def homes(tmp_path: Path, fake_codex_bin: Path, monkeypatch):
         monkeypatch.delenv(knob, raising=False)
     monkeypatch.setattr(gate, "KNOWN_FORMATS", {FAKE_FORMAT: "the fake codex"})
     return SimpleNamespace(duo=duo, claude=claude, codex=codex, bin=str(fake_codex_bin))
+
+
+@pytest.fixture
+def stop(homes):
+    """The "stop" policy: after the user wrote in both apps, the pair waits for resolve."""
+    with open(homes.duo / "config.toml", "a") as fh:
+        fh.write('on_conflict = "stop"\n')
 
 
 def engine() -> Engine:
@@ -270,7 +278,7 @@ def test_a_quiet_pass_skips_unchanged_sides(pair):
 
 
 # ---------------------------------------------------------------------------------- conflicts
-def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair):
+def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     claude_size = pair.claude.path.stat().st_size
@@ -286,7 +294,7 @@ def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair):
     assert "in codex" not in json.dumps(pair.claude.records())  # Codex's turn stays in Codex
 
 
-def test_resolve_by_keeping_codex(pair):
+def test_resolve_by_keeping_codex(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     sync(pair.name)
@@ -444,11 +452,71 @@ def test_unlink_and_find_pair(pair):
     assert engine().pairs == {}
 
 
-def test_a_missing_side_blocks(pair):
+def gone_an_hour(name: str) -> None:
+    from duologue.engine import GONE_AFTER
+
+    e = engine()
+    e.pairs[name].gone_since -= GONE_AFTER
+    e.save()
+
+
+def test_a_conversation_gone_for_an_hour_removes_its_pair(pair, homes):
+    from duologue.pairs import AutoState, auto_state_file
+
     pair.claude.path.unlink()
+    e = engine()
+    outcome = e.sync(e.pairs[pair.name])
+    assert outcome.state == "waiting" and "removed if it is still gone in an hour" in outcome.text
+    gone_an_hour(pair.name)
+    e = engine()
+    outcome = e.sync(e.pairs[pair.name])
+    assert outcome.state == "removed" and "not on this machine any more" in outcome.text
+    e = engine()
+    assert e.pairs == {}
+    # The Codex thread is paired again by itself only once the user carries on in it.
+    passed = AutoState.load(auto_state_file(e.config)).passed
+    assert [v[2] for v in passed.values()] == ["its other side was deleted"]
+
+
+def test_a_conversation_back_within_the_hour_keeps_its_pair(pair):
+    kept = pair.claude.path.read_bytes()
+    pair.claude.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    pair.claude.path.write_bytes(kept)
+    pair.claude.turn("back", "ok")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "synced" and p.gone_since is None
+
+
+def test_a_conversation_gone_during_an_unsettled_write_removes_its_pair(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    monkeypatch.setattr(threads, "finish", lambda *a, **k: (_ for _ in ()).throw(OSError("cut")))
+    assert sync(pair.name)[0].state == "error" and engine().pairs[pair.name].pending
+    pair.codex.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed" and engine().pairs == {}
+
+
+def test_removing_a_pair_does_not_need_auto_json(pair, homes):
+    pair.claude.path.unlink()
+    sync(pair.name)
+    gone_an_hour(pair.name)
+    (homes.duo / "auto.json").write_text("{not json")
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+
+
+def test_a_missing_app_folder_blocks_and_removes_nothing(pair, homes):
+    import shutil
+
+    shutil.rmtree(homes.claude)
     outcome, p = sync(pair.name)
     assert outcome.state == "blocked" and "not on this machine" in outcome.text
-    assert p.blocked
+    assert p.blocked and engine().pairs
 
 
 # ------------------------------------------------------------- what counts as new content
@@ -730,7 +798,7 @@ def test_the_format_alert_goes_out_once(pair, homes, monkeypatch):
     assert sent.read_text().count("has not been tested") == 1
 
 
-def test_resolve_keep_claude_waits_for_a_running_codex_turn(pair):
+def test_resolve_keep_claude_waits_for_a_running_codex_turn(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     sync(pair.name)
@@ -790,7 +858,7 @@ def test_a_source_rewritten_while_linking_blocks_the_new_pair(homes, monkeypatch
     )
 
 
-def test_a_codex_turn_that_finishes_after_the_pass_read_is_not_skipped(pair, monkeypatch):
+def test_a_codex_turn_that_finishes_after_the_pass_read_is_not_skipped(pair, monkeypatch, stop):
     from duologue.codex import threads
 
     pair.claude.turn("in claude", "ok")
@@ -906,7 +974,7 @@ def test_a_codex_turn_rolled_back_before_it_synced_never_reaches_claude(pair):
     assert "undone" not in json.dumps(pair.claude.records()[-6:])
 
 
-def test_a_claude_turn_after_a_codex_rollback_is_a_conflict(pair):
+def test_a_claude_turn_after_a_codex_rollback_is_a_conflict(pair, stop):
     pair.claude.turn("in claude", "ok")
     started = {"type": "task_started", "turn_id": "codex-empty", "started_at": 1}
     ended = {"type": "turn_aborted", "turn_id": "codex-empty", "reason": "interrupted"}
@@ -968,7 +1036,7 @@ def test_a_codex_line_numbered_out_of_order_blocks_the_append(pair):
 
 
 # ------------------------------------------------------------- after the pre-merge review
-def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pair):
+def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pair, stop):
     pair.codex.turn("one", "ok")
     assert sync(pair.name)[0].state == "synced"
     pair.codex.add([pair.codex.rollback(1)])  # undone in Codex, nothing sent yet
@@ -1012,7 +1080,7 @@ def test_an_archived_compressed_thread_is_left_alone(pair, homes, tmp_path, monk
     assert "thread/resume" not in requests(log)
 
 
-def test_resolve_and_release_write_a_compressed_thread_out(pair):
+def test_resolve_and_release_write_a_compressed_thread_out(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     assert sync(pair.name)[0].state == "conflict"
@@ -1123,7 +1191,7 @@ def an_undo_conflict(pair) -> None:
     assert sync(pair.name)[0].state == "conflict"
 
 
-def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair):
+def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair, stop):
     an_undo_conflict(pair)
     turns = pair.codex.turn_ids()
     e = engine()
@@ -1133,7 +1201,7 @@ def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair):
     assert len(pair.codex.turn_ids()) == len(turns) + 1
 
 
-def test_keeping_codex_after_an_undo_conflict_tells_claude_then_moves_on(pair):
+def test_keeping_codex_after_an_undo_conflict_tells_claude_then_moves_on(pair, stop):
     an_undo_conflict(pair)
     e = engine()
     linking.resolve(e, e.pairs[pair.name], "codex")
@@ -1217,7 +1285,7 @@ def test_codex_turns_in_a_compressed_thread_reach_claude_whatever_the_codex_form
 
 
 # -------------------------------------------------------- after the third review round
-def test_an_undo_told_after_a_kept_codex_side_names_the_turn_codex_undid(pair):
+def test_an_undo_told_after_a_kept_codex_side_names_the_turn_codex_undid(pair, stop):
     an_undo_conflict(pair)  # "one" synced, undone in Codex, then "in claude" typed in Claude
     e = engine()
     linking.resolve(e, e.pairs[pair.name], "codex")
@@ -1290,3 +1358,81 @@ def test_release_will_not_have_codex_index_an_unsettled_write(pair, tmp_path, mo
     with pytest.raises(Wait, match="not settled"):
         linking.release(e, e.pairs[pair.name])
     assert packed.exists() and "thread/resume" not in requests(log)
+
+
+def test_an_unmounted_projects_folder_blocks_and_removes_nothing(pair, homes, tmp_path):
+    import shutil
+
+    shutil.rmtree(homes.claude / "projects")
+    (homes.claude / "projects").symlink_to(tmp_path / "not-mounted")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "blocked" and p.gone_since is None
+    assert engine().pairs
+
+
+def test_the_hour_counts_from_when_the_conversation_was_first_missing(pair):
+    from duologue.engine import GONE_AFTER
+
+    pair.claude.path.unlink()
+    for _ in range(2):  # two passes half an hour apart: still within the hour
+        assert sync(pair.name)[0].state == "waiting"
+        e = engine()
+        e.pairs[pair.name].gone_since -= GONE_AFTER / 2 + 1
+        e.save()
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+
+
+def test_a_deleted_codex_thread_leaves_the_claude_session_unpaired_until_it_changes(pair, homes):
+    from duologue.pairs import AutoState, auto_state_file
+
+    pair.codex.path.unlink()
+    sync(pair.name)
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+    passed = AutoState.load(auto_state_file(engine().config)).passed
+    assert passed[str(pair.claude.path)][2] == "its other side was deleted"
+
+
+def test_an_unmounted_codex_sessions_folder_blocks_and_removes_nothing(pair, homes, tmp_path):
+    import shutil
+
+    shutil.rmtree(homes.codex / "sessions")
+    (homes.codex / "sessions").symlink_to(tmp_path / "not-mounted")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "blocked" and p.gone_since is None
+    assert engine().pairs
+
+
+def test_a_write_cut_off_when_the_other_side_went_is_taken_out(pair, monkeypatch):
+    from duologue.claude import sessions
+
+    pair.codex.turn("from codex", "ok")
+    size = pair.claude.path.stat().st_size
+    crash_in(monkeypatch, sessions, "_verify")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    with open(pair.claude.path, "r+b") as fh:  # the append was cut off partway
+        fh.truncate(size + 40)
+    pair.codex.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+    assert pair.claude.path.stat().st_size == size  # no half record left in Claude's file
+
+
+def test_a_blocked_pair_whose_conversation_is_gone_is_removed_too(pair, capsys):
+    from duologue.cli import main
+
+    e = engine()
+    e.block(e.pairs[pair.name], "something needed a person")
+    e.save()
+    pair.claude.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    assert main(["release", pair.name]) == 1
+    assert "removed by itself within the hour" in capsys.readouterr().err
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"

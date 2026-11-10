@@ -19,6 +19,12 @@ def test_defaults(tmp_path: Path):
     assert cfg.codex_home == Path("~/.codex").expanduser()
     assert (cfg.quiet_seconds, cfg.copy_budget, cfg.codex_source) == (15.0, 400_000, "vscode")
     assert cfg.notify == () and not cfg.allow_untested_codex
+    assert (cfg.auto, cfg.auto_days, cfg.auto_scripted, cfg.on_conflict) == (
+        True,
+        7.0,
+        False,
+        "keep-both",
+    )
 
 
 def test_the_apps_variables_then_the_config_file(tmp_path: Path):
@@ -43,6 +49,10 @@ def test_the_apps_variables_then_the_config_file(tmp_path: Path):
         "not toml = =\n",
         "quiet_seconds = nan\n",
         "quiet_seconds = inf\n",
+        "auto = 1\n",
+        "auto_days = 0\n",
+        "auto_days = nan\n",
+        'on_conflict = "ask"\n',
     ],
 )
 def test_a_bad_config_file_is_reported(tmp_path: Path, text: str):
@@ -231,3 +241,66 @@ def test_no_service_elsewhere(tmp_path: Path):
     service.platform = "win32"
     with pytest.raises(RuntimeError):
         service.files()
+
+
+def test_auto_json_that_cannot_be_read_is_reported_not_reset(tmp_path: Path):
+    from duologue.pairs import AutoState, AutoStateError
+
+    path = tmp_path / "auto.json"
+    for text in ("not json", "[1, 2]", '{"ignored": "x"}'):
+        path.write_text(text)
+        with pytest.raises(AutoStateError):
+            AutoState.load(path)
+        assert path.read_text() == text  # the user's unlinks are not thrown away
+    path.write_text('{"ignored": ["a"], "passed": [], "settings": 3}')
+    state = AutoState.load(path)
+    assert (state.ignored, state.passed, state.settings) == ({"a"}, {}, {})
+    state.ignore("b")
+    state.unignore("a")
+    assert AutoState.load(path).ignored == {"b"}
+
+
+def test_a_pair_written_by_a_later_duologue_still_loads(tmp_path: Path):
+    store = Store(tmp_path / "pairs.json")
+    store.save({"x": Pair(name="x", claude="c", codex="t")})
+    data = json.loads((tmp_path / "pairs.json").read_text())
+    data["pairs"][0]["field_from_the_future"] = 1
+    (tmp_path / "pairs.json").write_text(json.dumps(data))
+    pairs = store.load()
+    assert pairs["x"].claude == "c"
+    store.save(pairs)  # and saving here keeps what it does not know
+    saved = json.loads((tmp_path / "pairs.json").read_text())["pairs"][0]
+    assert saved["field_from_the_future"] == 1
+
+
+def test_auto_json_entries_that_are_not_well_formed_are_dropped(tmp_path: Path):
+    from duologue.pairs import AutoState
+
+    path = tmp_path / "auto.json"
+    path.write_text(
+        json.dumps(
+            {
+                "ignored": ["a"],
+                "passed": {"/p": 5, "/q": [1, 2, "why"], "/s": [1, 2, 3]},
+                "failed": {"/r": "soon"},
+                "waiting": {"x": 1},
+                "from_the_future": {"k": 1},
+            }
+        )
+    )
+    state = AutoState.load(path)
+    assert state.passed == {"/q": [1, 2, "why"]} and state.failed == {} and state.waiting == {}
+    state.save()
+    saved = json.loads(path.read_text())
+    assert saved["from_the_future"] == {"k": 1}
+    assert saved["passed"] == {"/q": [1, 2, "why"]} and saved["failed"] == saved["waiting"] == {}
+
+
+def test_a_cursor_that_is_not_an_object_is_reported_not_a_traceback(tmp_path: Path):
+    store = Store(tmp_path / "pairs.json")
+    store.save({"x": Pair(name="x", claude="c", codex="t")})
+    data = json.loads((tmp_path / "pairs.json").read_text())
+    data["pairs"][0]["codex_cursor"] = 7
+    (tmp_path / "pairs.json").write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="a pair is not readable"):
+        store.load()

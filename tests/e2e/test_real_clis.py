@@ -320,3 +320,61 @@ def test_a_message_queued_while_claude_worked_reaches_codex_in_that_turn(world: 
 def test_doctor_knows_this_codex(world: World):
     out = world.duologue("doctor", ok=False)
     assert "item format known" in out, out
+
+
+def test_sync_pairs_new_conversations_by_itself(world: World):
+    """With nothing linked, a sync gives a new Claude session its Codex thread and a new Codex
+    thread its Claude session; each app opens the one made for it, and nothing is paired twice."""
+    session = world.claude("run the claude probe")
+    thread = world.codex("run the codex probe")
+    # claude -p and codex exec are scripted runs: left out, as the real CLIs mark them.
+    out = world.duologue("sync")
+    assert "created" not in out and json.loads(world.duologue("status", "--json")) == [], out
+    assert "left out: 2 (2 a script ran it)" in world.duologue("status")
+    with open(world.root / "duologue" / "config.toml", "a") as fh:
+        fh.write("auto_scripted = true\n")
+    out = world.duologue("sync")
+    assert "created Codex thread" in out and "created Claude session" in out, out
+    pairs = {p["claude"]: p["codex"] for p in json.loads(world.duologue("status", "--json"))}
+    assert len(pairs) == 2
+    made_thread = pairs[session]
+    made_session = next(c for c, x in pairs.items() if x == thread)
+    assert "commandExecution" in world.codex_items(made_thread)
+    assert world.claude("what did codex run", "--resume", made_session) == made_session
+    commands = [
+        use["input"].get("command") for use, _ in claude_calls(world.mock.seen("messages")[-1])
+    ]
+    assert commands == ["echo probe-from-codex"]
+    out = world.duologue("sync")
+    assert "created" not in out and "copied 1 Claude turn(s) to Codex" in out, out
+    assert len(json.loads(world.duologue("status", "--json"))) == 2
+
+
+def test_turns_written_in_both_apps_reach_both_models(world: World):
+    """After the user wrote in both apps, each side gets the other's turns after its own, and
+    each model is told they happened at the same time."""
+    session = world.claude("hello from claude")
+    thread = world.codex("hello from codex")
+    world.duologue("link", "--claude", session, "--codex", thread, "--name", "both")
+    world.claude("run the claude probe", "--resume", session)
+    world.codex("resume", thread, "run the codex probe")
+
+    out = world.duologue("sync")
+    assert "copied 1 Claude turn(s) to Codex, after the turns made in Codex meanwhile" in out, out
+    out = world.duologue("sync")
+    assert "copied 1 Codex turn(s) to Claude" in out, out
+
+    world.claude("what happened in codex", "--resume", session)
+    request = world.mock.seen("messages")[-1]
+    commands = [use["input"].get("command") for use, _ in claude_calls(request)]
+    assert commands[-1] == "echo probe-from-codex"
+    assert "at the same time" in json.dumps(request["messages"])
+    world.codex("resume", thread, "what happened in claude")
+    shown = json.dumps(world.mock.seen("responses")[-1]["input"])
+    assert "[Claude ran Bash] echo probe-from-claude" in shown and "at the same time" in shown
+
+    # Those last two turns were written in both apps too: each travels once, then nothing is
+    # left to copy.
+    out = world.duologue("sync") + world.duologue("sync")
+    assert "copied 1 Claude turn(s) to Codex" in out and "copied 1 Codex turn(s) to Claude" in out
+    assert "idle: up to date" in world.duologue("sync")

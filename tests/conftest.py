@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -14,6 +15,16 @@ from duologue.codex.threads import Codex
 from duologue.translate.common import iso_ms
 
 FAKE_CODEX = Path(__file__).parent / "fakes" / "fake_codex.py"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def never_the_real_homes(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Every test runs against throwaway homes, including one that undoes its own settings:
+    the variables fall back to these, never to the user's real folders."""
+    base = tmp_path_factory.mktemp("session-homes")
+    for var in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        os.environ[var] = str(base / var.lower())
+    os.environ.pop("CODEX_SQLITE_HOME", None)  # Codex keeps its databases there when it is set
 
 
 @pytest.fixture
@@ -41,16 +52,17 @@ def write_rollout(
     *,
     history_mode: str = "paginated",
     cwd: str = CWD,
+    meta: dict | None = None,
 ) -> Path:
-    """A rollout for ``thread_id``: session_meta, then ``records``, ordinals in sequence (none
-    in a legacy rollout)."""
+    """A rollout for ``thread_id``: session_meta (with ``meta`` added), then ``records``,
+    ordinals in sequence (none in a legacy rollout)."""
     folder = codex_home / "sessions" / "2026" / "11" / "04"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"rollout-2026-11-04T14-00-00-{thread_id}.jsonl"
     meta = {
         "timestamp": iso_ms(START_MS),
         "type": "session_meta",
-        "payload": {"id": thread_id, "cwd": cwd, "history_mode": history_mode},
+        "payload": {"id": thread_id, "cwd": cwd, "history_mode": history_mode, **(meta or {})},
     }
     lines = []
     for n, r in enumerate([meta, *records]):

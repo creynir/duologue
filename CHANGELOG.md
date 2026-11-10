@@ -2,6 +2,31 @@
 
 ## Unreleased
 
+Every conversation syncs by itself.
+
+- **Automatic pairing.** Each sync pass pairs the Claude Code sessions and Codex threads that
+  changed in the last 7 days (`auto_days`) and have no other side yet, newest first and up to 10
+  a pass, creating that side in the same folder. Scripted runs, Codex subagent, rewound,
+  archived and compressed threads, conversations whose folder is gone and ones with nothing
+  typed yet are left out, and so is a pair you unlinked until you link it again. `duologue
+  status` says what waits or was left out, and why. A try that failed is made again ten minutes
+  later. `auto = false` turns it off.
+- **A conversation deleted for an hour removes its pair**; the other side is paired again only
+  once the user carries on in it. A write cut off on the side that is left is finished or taken
+  out first. A folder that is not there (an unmounted drive) blocks instead.
+- **`sync --quiet`** (the service) prints a stop once, not on every pass, and a pass that
+  changed nothing does not rewrite the pairs file.
+- **Codex's own importer.** A Claude session Codex already imported is paired with that thread
+  instead of getting a second copy. What Claude added since the import follows, the newest turns
+  within the copy budget, after a note saying where the others are. A session that no longer
+  starts with what Codex copied syncs with that thread from now on when you carried on in it in
+  Codex, and gets a thread of its own otherwise. The importer's turns never travel back to
+  Claude.
+- **Writing in both apps keeps both.** Claude's new turns go to Codex after Codex's, and Codex's
+  to Claude after Claude's, each with a note that they happened at the same time. An undo in
+  Codex of a Claude turn copied this way is told to Claude. `on_conflict = "stop"` keeps the
+  old behaviour: the pair waits for `duologue resolve`.
+
 What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Claude Code
 2.1.318 (see [docs/PRIOR_ART.md](docs/PRIOR_ART.md)).
 
@@ -11,7 +36,8 @@ What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Cl
 - **Messages typed while Claude works** reach Codex in the turn they joined.
 - **Undo and edits in Codex.** Rolled-back turns that had not synced are left out. When Claude
   already has them, a note tells Claude how many were undone, with the next Codex turns or on
-  its own. A Claude turn written on top of an undo is a conflict.
+  its own. A Claude turn written on top of an undo goes to Codex after it, as any turn written
+  in both apps does (with `on_conflict = "stop"`, it is a conflict).
 - **Rewound and compressed Codex threads.** A rewound thread blocks with that reason, and `link`
   will not copy its history. A thread Codex compressed while idle is written out again when
   either side has turns to copy (and by `release` and `resolve`), instead of waiting until it

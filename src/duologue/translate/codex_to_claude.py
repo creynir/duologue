@@ -23,8 +23,8 @@ from dataclasses import dataclass, field, replace
 from duologue.translate.common import (
     MARK,
     ORIGIN,
+    from_claude,
     is_codex_noise,
-    is_derived_id,
     is_note,
     iso_ms,
     stable_id,
@@ -73,11 +73,12 @@ def codex_to_claude_steps(
     records: Iterable[dict], *, key: str, outputs: OutputStore, skip_ours: bool = False
 ) -> list[ClaudeStep]:
     """Translate new Codex rollout records into Claude steps. ``key`` identifies the pair. Turns
-    Codex rolled back are left out. ``skip_ours`` also leaves out turns duologue wrote (their
-    turn ids are derived): a sync pass never sends those back."""
+    Codex rolled back are left out. ``skip_ours`` also leaves out turns that hold what was said
+    in Claude (duologue's, whose ids are derived, and Codex's importer's): a sync pass never
+    sends those back."""
     steps: list[ClaudeStep] = []
     for turn_key, group in _turns(list(records))[0]:
-        if skip_ours and is_derived_id(turn_key):
+        if skip_ours and from_claude(turn_key):
             continue
         steps += _turn_steps(group, f"{key}:{turn_key}", outputs)
     return steps
@@ -91,15 +92,20 @@ def undone_steps(n: int, ref: str, timestamp: str | None) -> list[ClaudeStep]:
     return [ClaudeStep("assistant", [{"type": "text", "text": text}], timestamp, f"undo:{ref}")]
 
 
-def undone_what(records_before: Iterable[dict], n: int) -> str:
-    """Which turns an undo of ``n`` took back, for the notes: the prompts that began the last
-    ``n`` turns Codex held in ``records_before`` (the thread up to the cursor), quoted. "The last
-    n turns" alone would point at the wrong ones once Claude has turns of its own after them."""
-    groups = codex_turns(records_before)[0][-n:] if n > 0 else []
-    prompts = [p for p in (_turn_prompt(g) for _, g in groups) if p]
+def undone_held(records_before: Iterable[dict], records: Iterable[dict]) -> tuple[int, str]:
+    """How many turns Claude holds an undo in ``records`` (the new part) took back, and which,
+    quoted by the prompts that began them: turns from before them (``records_before``, the
+    thread up to the cursor) and duologue's copies of Claude's turns among them. duologue's own
+    notes, which Codex counts as turns, were never Claude's. "The last n turns" alone would point
+    at the wrong ones once Claude has turns of its own after them."""
+    _, earlier, ours = _turns(list(records))
+    groups = codex_turns(records_before)[0][-earlier:] if earlier > 0 else []
+    held = [g for _, g in groups if not _is_note_turn(g)] + [g for _, g in ours]
+    n = len(held)
+    prompts = [p for p in (_turn_prompt(g) for g in held) if p]
     if len(prompts) < n:  # a turn without a prompt cannot be named: say how many instead
-        return f"the last {n} turn(s) of the conversation Codex held"
-    return "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
+        return n, f"the last {n} turn(s) of the conversation Codex held"
+    return n, "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
 
 
 def _turn_prompt(group: list[dict]) -> str:
@@ -121,21 +127,27 @@ def _turn_prompt(group: list[dict]) -> str:
 def codex_turns(
     records: Iterable[dict], *, skip_ours: bool = False
 ) -> tuple[list[tuple[str, list[dict]]], int]:
-    """The turns in ``records`` that Codex still holds, as (turn id, records), without duologue's
-    own when ``skip_ours``; and how many turns from before ``records`` Codex rolled back in them
-    (edit and resend, undo): turns the other side may already hold."""
-    groups, undone = _turns(list(records))
-    kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and is_derived_id(k))]
-    return kept, undone
+    """The turns in ``records`` that Codex still holds, as (turn id, records), without the ones
+    that hold what was said in Claude when ``skip_ours``; and how many turns Codex rolled back in
+    them (edit and resend, undo) that the other side may already hold: turns from before
+    ``records``, and, when ``skip_ours``, duologue's copies of Claude's turns within them."""
+    groups, undone, ours = _turns(list(records))
+    kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and from_claude(k))]
+    # Claude holds its own turns, so an undo of duologue's copy of one is news to Claude.
+    return kept, undone + (len(ours) if skip_ours else 0)
 
 
-def _turns(records: list[dict]) -> tuple[list[tuple[str, list[dict]]], int]:
+def _turns(
+    records: list[dict],
+) -> tuple[list[tuple[str, list[dict]]], int, list[tuple[str, list[dict]]]]:
     """The records grouped by turn (a task_started line opens one), each with a stable key, without
-    the turns a later ``thread_rolled_back`` took back; and how many it took back from before
-    ``records``. As Codex rebuilds a thread: a rollback ends the turn it falls in, then drops the
-    last ``num_turns`` turns."""
+    the turns a later ``thread_rolled_back`` took back; how many it took back from before
+    ``records``; and the turns holding what was said in Claude that it took back within them. As
+    Codex rebuilds a thread: a rollback ends the turn it falls in, then drops the last
+    ``num_turns`` turns."""
     groups: list[list[dict]] = [[]]
     undone = 0
+    ours: list[tuple[str, list[dict]]] = []
     for r in records:
         kind = _payload(r).get("type") if r.get("type") == "event_msg" else None
         if kind == "thread_rolled_back":
@@ -143,19 +155,34 @@ def _turns(records: list[dict]) -> tuple[list[tuple[str, list[dict]]], int]:
             turns = [g for g in groups if _is_turn(g)]
             gone = turns[len(turns) - min(n, len(turns)) :]
             undone += n - len(gone)
+            ours += [
+                (k, g)
+                for k, g in ((_group_key(g), g) for g in gone)
+                if from_claude(k) and not _is_note_turn(g)
+            ]
             groups = [g for g in groups if not any(g is x for x in gone)] + [[]]
             continue
         if kind == "task_started" and groups[-1]:
             groups.append([])
         groups[-1].append(r)
-    out = []
-    for g in groups:
-        if not g:
-            continue
-        started = next((_payload(r) for r in g if _payload(r).get("type") == "task_started"), {})
-        # Not the group's position: a later batch that starts elsewhere must give the same key.
-        out.append((str(started.get("turn_id") or f"untitled-{g[0].get('timestamp')}"), g))
-    return out, undone
+    return [(_group_key(g), g) for g in groups if g], undone, ours
+
+
+def _group_key(group: list[dict]) -> str:
+    started = next((_payload(r) for r in group if _payload(r).get("type") == "task_started"), {})
+    # Not the group's position: a later batch that starts elsewhere must give the same key.
+    return str(started.get("turn_id") or f"untitled-{group[0].get('timestamp')}")
+
+
+def _is_note_turn(group: list[dict]) -> bool:
+    """A turn duologue wrote to Codex that holds only one of its notes: Claude never had it."""
+    texts = [
+        _item_text(_payload(r)["item"])
+        for r in group
+        if _payload(r).get("type") == "item_completed"
+        and (_payload(r).get("item") or {}).get("type") == "UserMessage"
+    ]
+    return bool(texts) and all(is_note(t) for t in texts)
 
 
 def _is_turn(group: list[dict]) -> bool:

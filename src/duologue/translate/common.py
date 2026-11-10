@@ -48,6 +48,14 @@ LOCAL_COMMAND = ("<command-name>", "<local-command-stdout>", "<local-command-std
 
 # Codex's own importer marks the history it imported with this line.
 CODEX_IMPORT_SENTINEL = "<EXTERNAL SESSION IMPORTED>"
+# ... and gives the turns it writes these ids: they hold a Claude session's own words.
+CODEX_IMPORT_TURN = "external-import-turn-"
+
+
+def from_claude(turn_id: object) -> bool:
+    """Whether a Codex turn holds what was said in Claude: duologue wrote it (its id is derived)
+    or Codex's importer did. Such turns never travel back to Claude."""
+    return is_derived_id(turn_id) or str(turn_id).startswith(CODEX_IMPORT_TURN)
 
 
 def stable_id(*parts: object) -> uuid.UUID:

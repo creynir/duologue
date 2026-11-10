@@ -30,23 +30,36 @@ Until the first release is on PyPI: `pipx install git+https://github.com/creynir
 
 ## Quick start
 
-In the folder you work in:
+```sh
+duologue service install     # sync every 30 seconds in the background
+```
+
+That is all. On each pass duologue pairs the Claude Code sessions and Codex threads that changed
+in the last 7 days and have no other side yet, newest first and up to 10 a pass: it creates that
+side in the same folder, then keeps the two in sync. `duologue sync` runs a pass now; `duologue
+status` lists the pairs, and what is waiting to be paired or was left out, and why.
+
+A new side gets the newest turns that fit the copy budget (400,000 characters by default), with a
+note telling the model where the older ones are. A Claude session that Codex's own importer
+already copied is paired with that thread instead of getting a second one; what Claude added
+since the import follows, within the same budget. (If the session changed since in another way,
+the two are paired from now on only if you carried on in Codex's copy; otherwise the session
+gets a thread of its own, and Codex's copy stays as it is.)
+
+Left out: scripted runs (`claude -p`, the Agent SDK, `codex exec`) unless `auto_scripted = true`,
+Claude sessions that continue in another session, Codex subagent threads, threads rewound in
+Codex, archived threads, threads Codex compressed while idle (until you open them again),
+conversations whose folder is gone, ones with nothing typed or no finished turn yet, and pairs you
+unlinked. When a conversation has been deleted for an hour (while its app's folder of
+conversations is there; a folder that is not, such as an unmounted drive, blocks the pair
+instead), its pair goes, and the other side is paired again only once you carry on in it. To pair
+only what you choose, set `auto = false` and link by hand, in the folder you work in:
 
 ```sh
 duologue link --claude last --codex last   # pair the newest Claude session and Codex thread here
-duologue sync                              # copy what is new, both ways
-duologue service install                   # or let it sync every 30 seconds in the background
+duologue link --claude last                # a Codex thread with this Claude session's history
+duologue link --codex last                 # a Claude session with this Codex thread's history
 ```
-
-Only have a conversation on one side? Link that side alone and duologue creates the other:
-
-```sh
-duologue link --claude last    # a Codex thread with this Claude session's history
-duologue link --codex last     # a Claude session with this Codex thread's history
-```
-
-A new side gets the newest turns that fit the copy budget (400,000 characters by default), with a
-note telling the model where the older ones are.
 
 ## How it works
 
@@ -67,8 +80,7 @@ note telling the model where the older ones are.
 - **Only finished turns travel.** A turn still running on either side waits for its end. A
   message you type into Claude while it works travels with the turn it joined.
 - **Undo in Codex.** Turns you edit away or undo in Codex before they synced never reach Claude;
-  if Claude already has them, a note tells Claude how many were undone. Writing in Claude on
-  top of an undo is a conflict.
+  if Claude already has them, a note tells Claude which were undone.
 - **Nothing is copied twice.** Every id duologue writes derives from the source record. Each
   side has a cursor, and duologue's own records never travel back.
 
@@ -81,9 +93,12 @@ note telling the model where the older ones are.
   (unarchive it); a Codex turn never finished because Codex stopped (send the thread a new
   message); and a Codex whose item format duologue has not been tested with (update duologue;
   `notify` tells you once).
-- **Conflict.** You wrote in both apps since the last sync. Nothing is copied until you keep
-  one side's new turns: `duologue resolve <pair> --keep claude` (or `codex`). The other side's
-  new turns stay where they are.
+- **Written in both apps.** You wrote in both since the last sync. Both are kept: Claude's new
+  turns go to Codex after Codex's, then Codex's go to Claude after Claude's, each with a note
+  telling the model the two happened at the same time. With `on_conflict = "stop"` the pair
+  stops instead, as a **conflict**, until you keep one side's new turns:
+  `duologue resolve <pair> --keep claude` (or `codex`). The other side's new turns stay where
+  they are.
 - **Blocked** needs you. A file changed before the point already synced (rewinding a thread in
   Codex does this too), or an app did not take a write the way it should. Check the
   conversation, then run `duologue release <pair>`: the pair syncs on from where each side
@@ -107,13 +122,13 @@ note telling the model where the older ones are.
 | Command | What it does |
 |---|---|
 | `link` | Pair a Claude session with a Codex thread (`--claude`, `--codex`: an id, or `last`), or create the missing one |
-| `sync` | One sync pass now, for every pair or the ones named |
+| `sync` | One sync pass now: pairs new conversations, then syncs every pair (or only the ones named) |
 | `status` | Every pair, its state and its last sync (`--json` for all of it) |
 | `hold` / `release` | Pause a pair, or resume a held or blocked one |
-| `resolve` | After you wrote in both apps, keep one side's new turns |
+| `resolve` | With `on_conflict = "stop"`: after you wrote in both apps, keep one side's new turns |
 | `log` | Recent activity |
 | `doctor` | Check both apps, their versions, Codex's item format and every pair |
-| `unlink` | Stop syncing a pair; both conversations stay as they are |
+| `unlink` | Stop syncing a pair; both conversations stay as they are, and are not paired again unless you link them |
 | `service` | `install`, `uninstall` or `status` of the background sync (launchd or `systemd --user`); its output goes to `service.log` in duologue's folder (`$DUOLOGUE_HOME`, by default `~/.duologue`) |
 
 ## Configuration
@@ -129,11 +144,27 @@ quiet_seconds = 15                 # a finished Claude turn waits this long befo
 copy_budget = 400000               # characters copied into a side duologue creates
 notify = ["notify-send", "duologue"]   # run with a message when a pair stops
 allow_untested_codex = false       # write to a Codex whose item format is untested
+auto = true                        # pair new conversations by itself; false: only what you link
+auto_days = 7                      # ... the ones that changed within this many days
+auto_scripted = false              # ... and scripted runs too
+on_conflict = "keep-both"          # after you wrote in both apps; "stop" waits for resolve
 ```
+
+## Where conversations show up
+
+- **Claude Code** (the CLI's `--resume` list and the VS Code extension) lists a session duologue
+  created with the others from its folder.
+- **The Codex app** lists a thread duologue created under its folder, as it lists its own.
+- **The Claude desktop app** lists only the sessions it started itself.
+- **Remote Control** shows a Claude session while a Claude Code process runs it with remote
+  control on; duologue does not start one.
 
 ## Limits
 
 - Claude Code shows a long session only from its last compaction. Older turns stay in the file.
+- duologue writes a Codex turn into a Claude session only while no Claude Code process has it
+  open (a terminal, VS Code, the desktop app or Remote Control). Those turns wait until it is
+  closed; Claude's turns still go to Codex meanwhile.
 - A Codex app that keeps a thread loaded keeps duologue waiting. With a shared app-server daemon
   (`codex remote-control start`), duologue closes an idle thread briefly to write to it.
 - One user on one machine. Rebuilding a whole history from several copies is planned for a
