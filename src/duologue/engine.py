@@ -33,7 +33,14 @@ from duologue.claude.live import live_pid
 from duologue.claude.transcript import find_transcript, is_typed, settled, tail
 from duologue.codex import lock
 from duologue.codex import threads as codex_threads
-from duologue.codex.rollout import batch_end, is_archived, is_compressed, session_meta, turn_ends
+from duologue.codex.rollout import (
+    anchor_ends,
+    batch_anchor,
+    batch_end,
+    is_archived,
+    is_compressed,
+    session_meta,
+)
 from duologue.codex.rpc import AppServerError, daemon_running
 from duologue.codex.threads import Codex
 from duologue.config import Config
@@ -43,11 +50,14 @@ from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import ActivityLog, Cursor, Pair, Pending, Store, now_iso, write_atomic
 from duologue.translate.claude_to_codex import claude_to_codex, has_content
 from duologue.translate.codex_to_claude import (
+    LEAD_NOTE,
     UNDONE_NOTE,
+    UNDONE_ONLY_NOTE,
     ClaudeStep,
     claude_records,
     codex_to_claude_steps,
     codex_turns,
+    undone_steps,
 )
 from duologue.translate.outputs import OutputStore
 
@@ -116,7 +126,12 @@ class Engine:
         if is_compressed(xpath):
             # Codex compresses a thread that has been idle a while. Its index ending at the
             # cursor means nothing after it is new; otherwise Codex writes the file out again.
-            if not claude_new and self.codex.index(pair.codex).next_offset == pair.codex_cursor.end:
+            indexed = self.codex.index(pair.codex).next_offset
+            quiet = indexed == pair.codex_cursor.end or pair.codex_quiet == [
+                pair.codex_cursor.end,
+                indexed,
+            ]
+            if not claude_new and quiet:
                 pair.seen = seen
                 return Outcome("idle", "up to date")
             if claude_new:
@@ -144,9 +159,10 @@ class Engine:
                     "the Claude session is open; Codex's turns are copied to it once it closes"
                 )
             steps, undone = self.codex_part(pair, xlines)
-            if steps:
+            if steps or undone:
                 return self.to_claude(pair, cpath, xlines, steps, csize, live, undone)
         pair.seen = seen
+        pair.codex_quiet = [pair.codex_cursor.end, xsize]  # what a compressed copy would hold
         return Outcome("idle", "up to date")
 
     # ---------------------------------------------------------------------------- directions
@@ -187,6 +203,11 @@ class Engine:
         undone: int = 0,
     ) -> Outcome:
         t = tail(iter_lines(cpath))
+        lead, extra = LEAD_NOTE, UNDONE_NOTE.format(n=undone) if undone else ""
+        if not steps:  # Codex only undid turns Claude holds: say so
+            last = xlines[-1]
+            steps = undone_steps(undone, f"{last.end}:{last.record.get('timestamp')}", None)
+            lead, extra = UNDONE_ONLY_NOTE.format(n=undone), ""
         records = claude_records(
             steps,
             session_id=pair.claude,
@@ -198,11 +219,11 @@ class Engine:
             git_branch=t.git_branch,
             dangling=t.dangling,
             source_assistant=t.last_assistant,
-            lead_extra=UNDONE_NOTE.format(n=undone) if undone else "",
+            lead_extra=extra,
             last_prompt=True,
+            lead=lead,
         )
-        ends = turn_ends(xlines)
-        after_codex = {"end": xlines[-1].end, "anchor": ends[-1][0] if ends else None}
+        after_codex = {"end": xlines[-1].end, "anchor": batch_anchor(xlines)}
         turns = codex_turns([ln.record for ln in xlines], skip_ours=True)[0]
         journal = PairJournal(self, pair, claude=None, codex=after_codex)
         done = claude_sessions.append_records(
@@ -211,6 +232,8 @@ class Engine:
         self.confirm(pair, {"end": done.end, "anchor": done.uuids[-1]}, after_codex)
         pair.copied["to_claude"] += len(turns)
         text = f"copied {len(turns)} Codex turn(s) to Claude"
+        if not turns:
+            text = f"told Claude that Codex undid {undone} turn(s)"
         self.log.write(pair.name, "to_claude", text if done.written else text + " (already there)")
         return Outcome("synced", text)
 
@@ -229,7 +252,7 @@ class Engine:
         if self._still_matches("codex", pair, xpath, cur, stamp):
             return cur
         if cur.anchor:  # Codex rewrites a whole thread when it converts it: find the turn again
-            hits = [end for turn, end in turn_ends(iter_lines(xpath)) if turn == cur.anchor]
+            hits = anchor_ends(iter_lines(xpath), cur.anchor)
             if hits:
                 found = Cursor(hits[-1], prefix_hash(xpath, hits[-1]), cur.anchor)
                 pair.codex_cursor = found
@@ -296,7 +319,6 @@ class Engine:
             path = find_transcript(self.config.claude_home, pair.claude) or path
         intent = Intent(p.side, path, p.base, data, tuple(p.ids), p.before)
         if p.side == "codex":
-            self.codex_path(pair)  # a compressed thread is written out before it is read
             done = codex_threads.recover(self.codex, pair.codex, intent)
         else:
             done = claude_sessions.recover(path, intent)
@@ -402,6 +424,9 @@ class Engine:
         resumed). An archived thread is left alone, as every write to Codex leaves it."""
         if is_archived(self.codex.home, xpath):
             raise Wait("the thread is archived in Codex; it syncs again once it is unarchived")
+        if pair.pending and pair.pending.side == "codex":
+            # Codex would index whatever of that write landed before duologue could look at it.
+            raise Wait("Codex compressed the thread while a write to it was not settled")
         codex_threads.resume(self.codex, pair.codex)
         xpath = self.codex_file(pair)
         if is_compressed(xpath):
@@ -521,10 +546,10 @@ def codex_start(xpath: Path) -> Cursor:
     """Where syncing a Codex thread starts: after its last finished turn, or a rollback after it
     (that undo is already part of where the thread stands)."""
     lines = read_lines(xpath)
-    end, ends = batch_end(lines), turn_ends(lines)
+    end = batch_end(lines)
     if end is None:
         return Cursor(0, hashlib.sha256(b"").hexdigest(), None)
-    return Cursor(end, prefix_hash(xpath, end), ends[-1][0] if ends else None)
+    return Cursor(end, prefix_hash(xpath, end), batch_anchor(lines))
 
 
 def end_cursor(path: Path) -> Cursor:

@@ -278,6 +278,10 @@ def test_a_failed_edit_stays_an_error(store):
             id="a cut-off diff",
         ),
         pytest.param(
+            {"/w/a.txt": {"type": "update", "unified_diff": "@@ -1,2 +1,2 @@\n-a\n+b\n"}},
+            id="a diff one context line short",
+        ),
+        pytest.param(
             {
                 "/w/a.txt": {
                     "type": "update",

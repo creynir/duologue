@@ -15,6 +15,7 @@ import sqlite3
 import time
 import tomllib
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 from duologue.ids import require_id
@@ -126,6 +127,39 @@ def batch_end(lines: list[Line]) -> int | None:
         if (p.get("type") in TURN_ENDS and p.get("turn_id")) or p.get("type") == ROLLED_BACK:
             end = ln.end
     return end
+
+
+def batch_anchor(lines: list[Line]) -> str | None:
+    """What finds the end of ``lines`` again after Codex rewrites the file: the id of the last
+    finished turn, or, when a rollback follows it, that rollback (by its timestamp)."""
+    anchor = None
+    for ln in lines:
+        p = payload(ln.record)
+        if ln.record.get("type") != "event_msg":
+            continue
+        if p.get("type") in TURN_ENDS and p.get("turn_id"):
+            anchor = p["turn_id"]
+        elif p.get("type") == ROLLED_BACK:
+            anchor = _rollback_anchor(ln)
+    return anchor
+
+
+def _rollback_anchor(ln: Line) -> str:
+    return f"{ROLLED_BACK}@{ln.record.get('timestamp')}"
+
+
+def anchor_ends(lines: Iterable[Line], anchor: str) -> list[int]:
+    """Where ``anchor`` (see :func:`batch_anchor`) ends in ``lines``, each time it occurs."""
+    out = []
+    for ln in lines:
+        p = payload(ln.record)
+        if ln.record.get("type") != "event_msg":
+            continue
+        if p.get("type") in TURN_ENDS and p.get("turn_id") == anchor:
+            out.append(ln.end)
+        elif p.get("type") == ROLLED_BACK and anchor == _rollback_anchor(ln):
+            out.append(ln.end)
+    return out
 
 
 def open_turn(lines: list[Line]) -> bool:

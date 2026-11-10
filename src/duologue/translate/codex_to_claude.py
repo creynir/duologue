@@ -45,6 +45,11 @@ UNDONE_NOTE = (
     "before this, the last {n} turn(s) of the conversation were undone in Codex (the user edited "
     "or rolled back there): treat them as withdrawn."
 )
+UNDONE_ONLY_NOTE = (
+    "in Codex, the last {n} turn(s) of the conversation were undone (the user edited or rolled "
+    "back there): treat them as withdrawn."
+)
+NOTHING_ELSE_NOTE = "noted; nothing else has happened in Codex since."
 LAST_PROMPT_CHARS = 200  # Claude Code cuts the prompt its session list shows to this
 SKIPPED_ITEMS = (
     "Reasoning",
@@ -76,6 +81,14 @@ def codex_to_claude_steps(
             continue
         steps += _turn_steps(group, f"{key}:{turn_key}", outputs)
     return steps
+
+
+def undone_steps(n: int, ref: str, timestamp: str | None) -> list[ClaudeStep]:
+    """What Claude is shown when Codex undid ``n`` of the turns it holds and nothing else
+    happened: a note in the record that opens them (pass ``UNDONE_ONLY_NOTE`` as the lead) and
+    this reply. ``ref`` identifies the rollback, for the records' ids."""
+    text = f"[{MARK}: {NOTHING_ELSE_NOTE}]"
+    return [ClaudeStep("assistant", [{"type": "text", "text": text}], timestamp, f"undo:{ref}")]
 
 
 def codex_turns(
@@ -300,6 +313,7 @@ def claude_records(
     lead_extra: str = "",
     now_ms: int | None = None,
     last_prompt: bool = False,
+    lead: str = LEAD_NOTE,
 ) -> list[dict]:
     """Transcript records for ``steps``, to append after the record ``parent_uuid`` (of type
     ``parent_type``) in session ``session_id``.
@@ -309,13 +323,14 @@ def claude_records(
     tool calls at the end of the session that never got a result (Claude stopped mid-tool); the
     first record answers them, as Claude requires (after a user message too: Claude Code writes the
     results of parallel calls one record each). ``source_assistant`` is the assistant message
-    those calls are in, which the results link back to. ``lead_extra`` is added to the lead note.
+    those calls are in, which the results link back to. ``lead`` is the note that opens them,
+    and ``lead_extra`` is added to it.
     ``last_prompt`` ends the records with the ``last-prompt`` line Claude's session list reads,
     naming the last message the user typed in Codex, when there is one.
     """
     if not steps:
         return []
-    seq = _with_notes(list(steps), parent_type, dangling, lead_extra)
+    seq = _with_notes(list(steps), parent_type, dangling, lead_extra, lead)
     messages = _alternate(seq)
     anchor = next((s.key for s in steps if s.key), session_id)
     stamps = _fill_timestamps([m.timestamp for m in messages], now_ms)
@@ -397,6 +412,7 @@ def _with_notes(
     parent_type: str | None,
     dangling: tuple[str, ...] = (),
     lead_extra: str = "",
+    lead_note: str = LEAD_NOTE,
 ) -> list[ClaudeStep]:
     """The lead note before the Codex part, and a closing note when it ends on the user's side.
     Results for ``dangling`` calls open the first user message: tool results go first."""
@@ -408,7 +424,7 @@ def _with_notes(
         {"type": "tool_result", "tool_use_id": t, "content": NOT_RECORDED, "is_error": True}
         for t in dangling
     ]
-    lead_text = f"{LEAD_NOTE} {lead_extra}" if lead_extra else LEAD_NOTE
+    lead_text = f"{lead_note} {lead_extra}" if lead_extra else lead_note
     lead = closing + [{"type": "text", "text": f"[{MARK}: {lead_text}]"}]
     if seq[0].role == "user":
         if parent_type == "user" and not closing:

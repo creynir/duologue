@@ -22,6 +22,8 @@ from duologue.claude.transcript import PROJECTS, find_transcript, is_message, pr
 from duologue.codex import threads as codex_threads
 from duologue.codex.rollout import (
     SESSIONS,
+    anchor_ends,
+    batch_anchor,
     batch_end,
     is_compressed,
     session_meta,
@@ -249,8 +251,9 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
             lead_extra=extra,
         )
 
-    after_codex = {"end": ends[-1][1], "anchor": ends[-1][0]}
-    before_digest = prefix_hash(xpath, ends[-1][1])
+    end = batch_end(lines)  # after a rollback that follows the last turn, as the copy is
+    after_codex = {"end": end, "anchor": batch_anchor(finished)}
+    before_digest = prefix_hash(xpath, end)
     made = _create(
         engine,
         pair,
@@ -265,7 +268,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
         )[1],
     )
     engine.confirm(pair, {"end": made.end, "anchor": made.uuids[-1]}, after_codex)
-    source = Cursor(ends[-1][1], before_digest, ends[-1][0])
+    source = Cursor(end, before_digest, after_codex["anchor"])
     _source_unchanged(engine, pair, xpath, source, "Codex thread")
     done = f"created Claude session {session_id} with {kept['turns']} turn(s) from Codex"
     if kept["dropped"]:
@@ -349,9 +352,10 @@ def resolve(engine: Engine, pair: Pair, keep: str) -> str:
         cur = engine.codex_cursor(pair, xpath)  # finds the synced turn again after a rewrite
         if last_turn_open(xpath):
             raise LinkError("a Codex turn is still running; resolve once it has finished")
-        ends = turn_ends(iter_lines(xpath, cur.end))
-        if ends:
-            pair.codex_cursor = Cursor(ends[-1][1], prefix_hash(xpath, ends[-1][1]), ends[-1][0])
+        lines = read_lines(xpath, cur.end)
+        end = batch_end(lines)
+        if end is not None:
+            pair.codex_cursor = Cursor(end, prefix_hash(xpath, end), batch_anchor(lines))
         text = "keeping Claude's new turns; Codex's new turns stay in Codex only"
     else:
         engine.claude_cursor(pair, cpath)
@@ -470,9 +474,9 @@ def _reanchor_claude(cpath: Path, cur: Cursor) -> Cursor:
 
 
 def _reanchor_codex(xpath: Path, cur: Cursor) -> Cursor:
-    for turn, end in reversed(turn_ends(iter_lines(xpath))):
-        if cur.anchor and turn == cur.anchor:
-            return Cursor(end, prefix_hash(xpath, end), turn)
+    hits = anchor_ends(iter_lines(xpath), cur.anchor) if cur.anchor else []
+    if hits:
+        return Cursor(hits[-1], prefix_hash(xpath, hits[-1]), cur.anchor)
     return codex_start(xpath)
 
 

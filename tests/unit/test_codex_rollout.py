@@ -295,4 +295,5 @@ def test_syncing_starts_after_a_rollback_that_follows_the_last_turn(tmp_path: Pa
         tmp_path, THREAD, [*one_turn(), {"timestamp": "t", "type": "event_msg", "payload": rolled}]
     )
     cur = codex_start(path)
-    assert cur.end == path.stat().st_size and cur.anchor == "turn-1"
+    # The rollback, not the turn before it: found again after a rewrite, it is not read twice.
+    assert cur.end == path.stat().st_size and cur.anchor == "thread_rolled_back@t"

@@ -898,8 +898,9 @@ def test_a_codex_rollback_of_synced_turns_is_told_to_claude(pair):
 def test_a_codex_turn_rolled_back_before_it_synced_never_reaches_claude(pair):
     pair.codex.turn("a mistake", "ok")
     pair.codex.turn("what I meant", "ok", before=(pair.codex.rollback(1),))
-    outcome, _ = sync(pair.name)
-    assert outcome.state == "synced", outcome.text
+    outcome, p = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text, outcome.text
+    assert p.copied["to_claude"] == 1  # the turns delivered, not the turns in the batch
     asked = prompts(pair.claude.records())
     assert "a mistake" not in asked and asked[-1] == "what I meant"
     assert "undone" not in json.dumps(pair.claude.records()[-6:])
@@ -976,16 +977,18 @@ def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pai
     assert outcome.state == "conflict" and p.conflict
 
 
-def test_an_undo_in_codex_with_nothing_after_it_reaches_claude_with_the_next_turn(pair):
+def test_an_undo_in_codex_with_nothing_after_it_is_told_to_claude_once(pair):
     pair.codex.turn("one", "ok")
     assert sync(pair.name)[0].state == "synced"
     pair.codex.add([pair.codex.rollback(1)])
-    assert sync(pair.name)[0].state == "idle"  # nothing to show Claude yet
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "Codex undid 1 turn(s)" in outcome.text
+    said = json.dumps(pair.claude.records()[-3:], ensure_ascii=False)
+    assert "the last 1 turn(s) of the conversation were undone" in said
     pair.codex.turn("two", "ok")
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text
-    notes = json.dumps(pair.claude.records(), ensure_ascii=False).count("undone in Codex")
-    assert notes == 1
+    assert json.dumps(pair.claude.records(), ensure_ascii=False).count("were undone") == 1
 
 
 def test_codex_turns_waiting_in_a_compressed_thread_still_reach_claude(pair):
@@ -1106,3 +1109,105 @@ def test_records_duologue_wrote_stay_out_of_a_claude_turn_sent_after_them(pair):
     assert len(pair.codex.turn_ids()) == len(turns) + 1
     said = [i["content"][0]["text"] for i in items(pair.codex.path) if i["type"] == "UserMessage"]
     assert said.count("from codex") == 1 and said[-1] == "typed in claude"
+
+
+# ------------------------------------------------------- after the second review round
+def an_undo_conflict(pair) -> None:
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    pair.codex.add([pair.codex.rollback(1)])
+    pair.claude.turn("in claude", "ok")
+    assert sync(pair.name)[0].state == "conflict"
+
+
+def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair):
+    an_undo_conflict(pair)
+    turns = pair.codex.turn_ids()
+    e = engine()
+    linking.resolve(e, e.pairs[pair.name], "claude")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "Claude turn" in outcome.text, outcome.text
+    assert len(pair.codex.turn_ids()) == len(turns) + 1
+
+
+def test_keeping_codex_after_an_undo_conflict_tells_claude_then_moves_on(pair):
+    an_undo_conflict(pair)
+    e = engine()
+    linking.resolve(e, e.pairs[pair.name], "codex")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "Codex undid 1 turn(s)" in outcome.text
+    pair.claude.turn("after the undo", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "Claude turn" in outcome.text, outcome.text
+
+
+def test_a_codex_thread_linked_after_an_undo_starts_after_it(homes):
+    codex = CodexThread(homes.codex, homes.bin)
+    codex.turn("withdrawn", "ok")
+    codex.add([codex.rollback(1)])
+    p, _ = linking.link(engine(), claude=None, codex=THREAD, name="u", cwd=CWD)
+    assert engine().pairs["u"].codex_cursor.end == codex.path.stat().st_size
+    claude = Claude(homes.claude)
+    claude.path = find_transcript(homes.claude, p.claude)
+    claude.t = ClaudeTranscript(session=p.claude)
+    claude.turn("in claude", "ok")
+    outcome, _ = sync("u")
+    assert outcome.state == "synced" and "Claude turn" in outcome.text, outcome.text
+
+
+def test_an_undo_already_told_is_not_told_again_after_codex_rewrites_the_thread(pair):
+    pair.codex.turn("two", "ok")
+    pair.codex.turn("three", "ok", before=())
+    pair.codex.add([pair.codex.rollback(1)])  # "three" undone before it ever synced
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    text = pair.codex.path.read_text()  # Codex rewrites the thread, as when it converts it
+    pair.codex.path.write_text(text.replace('"cwd":"/work/project"', '"cwd":"/work/project/."', 1))
+    pair.codex.turn("four", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text, outcome.text
+    assert "were undone" not in json.dumps(pair.claude.records(), ensure_ascii=False)
+
+
+def test_a_compressed_thread_is_not_resumed_over_an_unsettled_write(pair, tmp_path, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    real = threads._write
+    crash_in(monkeypatch, threads, "_write")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    monkeypatch.setattr(threads, "_write", real)
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    packed = compress(pair.codex.path)
+    for _ in range(2):  # settling waits; so does the pass's own read
+        outcome, p = sync(pair.name)
+        assert outcome.state == "waiting" and p.pending is not None, outcome.text
+    assert packed.exists() and "thread/resume" not in requests(log)
+
+
+def test_a_compressed_thread_with_nothing_to_copy_is_resumed_once_at_most(
+    pair, tmp_path, monkeypatch
+):
+    started = {"type": "task_started", "turn_id": "codex-left-open", "started_at": 1}
+    pair.codex.add(  # a turn a stopped Codex left open: it never travels
+        [{"timestamp": "2026-11-04T15:00:01.000Z", "type": "event_msg", "payload": started}]
+    )
+    assert sync(pair.name)[0].state == "idle"
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    compress(pair.codex.path)
+    assert sync(pair.name)[0].state == "idle"
+    assert "thread/resume" not in requests(log)
+
+
+def test_codex_turns_in_a_compressed_thread_reach_claude_whatever_the_codex_format(
+    pair, monkeypatch
+):
+    monkeypatch.setenv("FAKE_CODEX_SCHEMA", "changed")  # only writes to Codex wait for that
+    pair.codex.turn("from codex", "ok")
+    compress(pair.codex.path)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    assert "from codex" in prompts(pair.claude.records())

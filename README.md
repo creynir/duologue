@@ -65,8 +65,8 @@ note telling the model where the older ones are.
 - **Only finished turns travel.** A turn still running on either side waits for its end. A
   message you type into Claude while it works travels with the turn it joined.
 - **Undo in Codex.** Turns you edit away or undo in Codex before they synced never reach Claude;
-  if Claude already has them, the next turns from Codex arrive with a note saying how many were
-  undone.
+  if Claude already has them, a note tells Claude how many were undone. Writing in Claude on
+  top of an undo is a conflict.
 - **Nothing is copied twice.** Every id duologue writes derives from the source record. Each
   side has a cursor, and duologue's own records never travel back.
 

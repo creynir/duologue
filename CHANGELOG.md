@@ -8,8 +8,9 @@ What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Cl
 - **Diffs in Claude.** A Codex change to one file arrives as Claude's own `Write` or `Edit`, so
   the Claude app shows the diff.
 - **Messages typed while Claude works** reach Codex in the turn they joined.
-- **Undo and edits in Codex.** Rolled-back turns that had not synced are left out; when Claude
-  already has them, the next Codex turns arrive with a note saying how many were undone.
+- **Undo and edits in Codex.** Rolled-back turns that had not synced are left out. When Claude
+  already has them, a note tells Claude how many were undone, with the next Codex turns or on
+  its own. A Claude turn written on top of an undo is a conflict.
 - **Rewound and compressed Codex threads.** A rewound thread blocks with that reason, and `link`
   will not copy its history. A thread Codex compressed while idle is written out again when
   either side has turns to copy (and by `release` and `resolve`), instead of waiting until it
