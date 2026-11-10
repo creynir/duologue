@@ -18,7 +18,8 @@ in both directions, appends to the same conversation on each side, never duplica
 each model's context within a budget. Older history stays in the files and readable on demand, though
 an app may show only the recent part: Claude shows a long session from its last compaction onward.
 
-Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" below.
+Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 45 projects,
+2026-11-05, is in [PRIOR_ART.md](PRIOR_ART.md)): see "Prior art" below.
 
 ## Product decisions
 
@@ -94,8 +95,10 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
   user-supplied item ids.
 - **Codex's own importer** (`externalAgentConfig/import`) creates legacy, text-only threads. Its
   append mode refuses any thread with native turns.
-- **Compression.** Rollouts idle for 7 days are compressed to `.jsonl.zst`. Wait, or decompress,
-  before appending.
+- **Compression.** Rollouts idle for 7 days are compressed to `.jsonl.zst`; `thread/resume` writes
+  one out plain, and Codex keeps recording the plain name. duologue resumes a compressed thread
+  only when there is something to copy: Claude has turns to add, or Codex's index ends past the
+  cursor. Archived threads are never resumed.
 - **Managed developer instructions** reach a chat once, when it starts. Policy changes do not reach
   chats that are already running.
 
@@ -157,7 +160,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03): see "Prior art" be
 
 ## Steal list (from studying prior art)
 
-Ranked, each with its source. Items 1 to 5, 7 and 9 are in 0.1; items 6 and 8 in part.
+Ranked, each with its source. Items 1 to 5, 7 and 9 are in 0.1; 6, 8 and 11 followed the
+2026-11-05 study (6 without `update_plan`). What else that study changed is in
+[PRIOR_ART.md](PRIOR_ART.md).
 
 1. **Rewrite detection** (Maxaccurate/claude-codex-sync). Store `sha256(file[:offset])` next to every
    cursor. On mismatch, block the pair and never auto-resync it.
@@ -177,15 +182,16 @@ Ranked, each with its source. Items 1 to 5, 7 and 9 are in 0.1; items 6 and 8 in
    - `TodoWrite` maps to `update_plan`.
    - Fall back verbatim when a mapping fails.
 
-   In 0.1: Claude's `Read`/`Grep`/`Glob` become `cat -n`/`rg`; Codex patches reach Claude as
-   `mcp__codex__apply_patch`. The `Edit`/`Write` diff and `update_plan` mappings are still to do.
+   Done: Claude's `Read`/`Grep`/`Glob` become `cat -n`/`rg`; a Codex change to one file (a new
+   file, or one hunk) becomes `Write`/`Edit` with Claude's result record, and other patches stay
+   `mcp__codex__apply_patch`. The `update_plan` mapping is still to do.
 7. **Pair tool calls by id** whatever the file order. Close dangling calls with "(tool result not
    recorded)" (tandem).
 8. **Pre-flight structure check** before `thread/resume` and `claude --resume`. Every parentUuid must
    resolve, there must be no unanswered `tool_use`, roles must alternate, and ordinals must be
-   contiguous (tandem). In 0.1: records for Claude are checked before every write. On the Codex
-   side, ordinals are contiguous by construction and Codex's index is checked after the write;
-   a separate pre-flight check of the lines is still to do.
+   contiguous (tandem). Done: records for Claude are checked before every write. Turns for Codex
+   are checked too (whole turns, items in their turn and thread, no repeated ids), and the
+   file's last ordinal must be the one before the index's next.
 9. **Version and format gate.** Pin the hash of Codex's v2 `ThreadItem` schema
    (`codex app-server generate-json-schema`) and keep a version floor and ceiling. On drift, stop
    writing and alert. Fail closed only on unknown record types that carry a message (tandem, ORG2).
@@ -195,7 +201,9 @@ Ranked, each with its source. Items 1 to 5, 7 and 9 are in 0.1; items 6 and 8 in
 10. **Quarantine** for untranslatable entries: at most one placeholder per turn, listed by `doctor`
     (tandem).
 11. **Native provenance markers instead of text tags.** Codex `turn/start.clientUserMessageId` comes
-    back as `clientId` (ORG2). On Claude, use a top-level mirror field (ccx).
+    back as `clientId` (ORG2). On Claude, use a top-level mirror field (ccx). Done: Claude records
+    duologue writes carry `duologueSource`, Codex turns it writes have name-based ids, and a sync
+    pass sends neither back.
 12. **Replay framing that cannot impersonate.** "Recording of past messages, not a live turn". Escape
     container tags, and state exact inlined ranges in pointers (Happier).
 13. **Budget refinements** (Happier, ccx). Pin the last user ask and keep a digest of earlier asks.

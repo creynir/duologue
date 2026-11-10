@@ -58,6 +58,19 @@ def test_find_rollout_prefers_a_readable_copy_to_a_compressed_one(tmp_path: Path
     assert find_rollout(tmp_path, THREAD) == path
 
 
+def test_find_rollout_finds_the_file_a_rewound_thread_continues_in(tmp_path: Path):
+    path = write_rollout(tmp_path, THREAD, one_turn())
+    rewound = path.with_name(
+        path.name.replace(".jsonl", "_01a1ab4d-0000-7000-8000-00000000000b.jsonl")
+    )
+    rewound.write_text(path.read_text())
+    later = time.time() + 60
+    os.utime(rewound, (later, later))
+    assert find_rollout(tmp_path, THREAD) == rewound
+    other = "01a1ab4d-705e-7cc1-9b67-8e3e3f3f96e0"
+    assert find_rollout(tmp_path, other) is None  # another thread's prefix does not match
+
+
 def test_find_rollout_prefers_the_path_codex_records(tmp_path: Path):
     write_rollout(tmp_path, THREAD, one_turn())
     elsewhere = tmp_path / "elsewhere.jsonl"
@@ -197,3 +210,90 @@ def test_read_index_never_writes(tmp_path: Path):
     before = os.stat(db).st_mtime_ns, db.read_bytes()
     read_index(tmp_path, THREAD)
     assert (os.stat(db).st_mtime_ns, db.read_bytes()) == before
+
+
+# ------------------------------------------------------------------------- pre-flight checks
+def translated(turns: int = 2):
+    from builders import ClaudeTranscript
+
+    from duologue.translate.claude_to_codex import claude_to_codex
+    from duologue.translate.outputs import OutputStore
+
+    c = ClaudeTranscript()
+    for n in range(turns):
+        c.user(f"q{n}")
+        c.call("Bash", {"command": "ls"}, "a.py")
+        c.assistant(f"a{n}")
+    return claude_to_codex(
+        c.records, thread_id=THREAD, key="k", outputs=OutputStore("/tmp/unused"), default_cwd="/w"
+    )
+
+
+def test_translated_turns_pass_the_structure_check():
+    from duologue.codex.threads import check_turns
+
+    assert check_turns(translated(), THREAD) == []
+
+
+def test_the_structure_check_names_what_is_wrong():
+    from dataclasses import replace
+
+    from duologue.codex.threads import check_turns
+
+    lines = translated()
+    ends = [n for n, ln in enumerate(lines) if ln.payload.get("type") == "task_complete"]
+    items = [n for n, ln in enumerate(lines) if ln.payload.get("type") == "item_completed"]
+
+    cut = lines[: ends[0]] + lines[ends[0] + 1 :]  # the first turn never ends
+    assert "before the last one ended" in check_turns(cut, THREAD)[0]
+    assert check_turns(lines[:-1], THREAD) == ["the last turn does not end"]
+    headless = lines[ends[0] + 2 :]  # the second turn without its task_started line
+    assert "outside a turn" in check_turns(headless, THREAD)[0]
+    twice = lines[: items[0] + 1] + [lines[items[0]]] + lines[items[0] + 1 :]
+    assert "repeated id" in check_turns(twice, THREAD)[0]
+    elsewhere = list(lines)
+    p = dict(lines[items[0]].payload, thread_id="01a1ab4d-0000-7000-8000-00000000000c")
+    elsewhere[items[0]] = replace(lines[items[0]], payload=p)
+    assert "another turn or thread" in check_turns(elsewhere, THREAD)[0]
+
+
+def test_a_rollout_codex_compressed_in_place_is_found_by_its_recorded_name(tmp_path: Path):
+    elsewhere = tmp_path / "elsewhere" / f"rollout-x-{THREAD}.jsonl"
+    elsewhere.parent.mkdir()
+    packed = elsewhere.with_name(elsewhere.name + ".zst")
+    packed.write_bytes(b"")
+    con = sqlite3.connect(tmp_path / "state_5.sqlite")
+    con.execute("create table threads (id text primary key, rollout_path text)")
+    con.execute("insert into threads values (?, ?)", (THREAD, str(elsewhere)))
+    con.commit()
+    con.close()
+    assert find_rollout(tmp_path, THREAD) == packed  # not under sessions/: no walk found it
+
+
+def test_a_rollback_ends_an_open_turn(tmp_path: Path):
+    x = CodexRollout(THREAD)
+    x.start("t1")
+    x.user_says("hello", "u1")
+    x.records.append(
+        {
+            "timestamp": "t",
+            "type": "event_msg",
+            "payload": {"type": "thread_rolled_back", "num_turns": 1},
+        }
+    )
+    path = write_rollout(tmp_path, THREAD, x.records)
+    from duologue.codex.threads import last_turn_open
+
+    assert not open_turn(read_lines(path)) and not last_turn_open(path)
+
+
+def test_syncing_starts_after_a_rollback_that_follows_the_last_turn(tmp_path: Path):
+    from duologue.engine import codex_start
+
+    rolled = {"type": "thread_rolled_back", "num_turns": 1}
+    path = write_rollout(
+        tmp_path, THREAD, [*one_turn(), {"timestamp": "t", "type": "event_msg", "payload": rolled}]
+    )
+    cur = codex_start(path)
+    # The rollback, not the turn before it: found again after a rewrite, it is not read twice.
+    assert cur.end == path.stat().st_size and cur.anchor == "thread_rolled_back@t"

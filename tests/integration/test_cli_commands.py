@@ -77,6 +77,27 @@ def test_doctor(linked, capsys):
     assert code == 1
 
 
+def test_doctor_looks_at_each_pairs_files(linked, capsys, monkeypatch):
+    claude, codex = linked
+    from duologue import cli
+
+    assert main(["doctor"]) == 1
+    out = capsys.readouterr().out
+    assert "MiB" not in out and "indexed" not in out  # nothing to say about either file
+    monkeypatch.setattr(cli, "CLAUDE_FULL_LOAD", 100)
+    with open(codex.path, "a") as fh:  # a line Codex has not indexed yet
+        fh.write(json.dumps({"timestamp": "t", "ordinal": 99, "type": "event_msg", "payload": {}}))
+        fh.write("\n")
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert 'pair "work": the Claude transcript is 0.0 MiB; above 5 MiB' in out
+    assert '    pair "work": Codex has indexed' in out  # a note, not a problem
+    data = codex.path.read_bytes()
+    codex.path.write_bytes(data[:200])  # shorter than what Codex indexed
+    main(["doctor"])
+    assert 'NO  pair "work": Codex\'s index of the thread ends at byte' in capsys.readouterr().out
+
+
 def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):
     claude, _ = linked
     other = "5e550000-0000-4000-8000-0000000000aa"
@@ -120,3 +141,18 @@ def test_hold_with_an_empty_reason_still_holds(linked, capsys):
     assert main(["status", "--json"]) == 0
     [pair] = json.loads(capsys.readouterr().out)
     assert pair["hold"] == "held by you"
+
+
+def test_doctor_goes_on_when_codex_index_cannot_be_read(linked, capsys, monkeypatch):
+    import sqlite3
+
+    from duologue.codex.threads import Codex
+
+    def locked(self, thread_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(Codex, "index", locked)
+    main(["doctor"])
+    out = capsys.readouterr().out
+    assert "Codex's index could not be read (database is locked)" in out
+    assert "background service:" in out  # the rest of the report still comes

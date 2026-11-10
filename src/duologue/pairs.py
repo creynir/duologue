@@ -73,6 +73,8 @@ class Pair:
     copied: dict = field(default_factory=lambda: {"to_codex": 0, "to_claude": 0})  # turns
     seen: list = field(default_factory=list)  # file sizes and mtimes when last up to date
     checked: dict = field(default_factory=dict)  # side -> file stamp its cursor last matched
+    # [Codex cursor end, Codex file size] when a pass last found nothing in Codex to copy
+    codex_quiet: list | None = None
 
     @property
     def key(self) -> str:

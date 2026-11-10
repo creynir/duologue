@@ -10,10 +10,12 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import time
 import tomllib
 import uuid
+from collections.abc import Iterable
 from pathlib import Path
 
 from duologue.ids import require_id
@@ -23,23 +25,28 @@ SESSIONS = "sessions"
 ARCHIVED = "archived_sessions"
 STATE_DB = "state_5.sqlite"
 TURN_ENDS = ("task_complete", "turn_aborted")
+ROLLED_BACK = "thread_rolled_back"  # undo or edit-and-resend: drops the last num_turns turns
 
 
 def find_rollout(codex_home: Path, thread_id: str, sqlite: Path | None = None) -> Path | None:
     """The thread's rollout: the path Codex's state database (in ``sqlite``, default the home)
     records, when the file is there, else the newest file named for the thread under
-    ``sessions/`` or ``archived_sessions/``."""
+    ``sessions/`` or ``archived_sessions/``. A thread rewound in Codex continues in a file named
+    for the thread and a new rollout (``rollout-<time>-<thread>_<rollout>.jsonl``)."""
     require_id(thread_id, "thread id")
     home = Path(codex_home)
     recorded = _recorded_path(Path(sqlite or home), thread_id)
-    if recorded is not None and recorded.exists():
-        return recorded
+    if recorded is not None:
+        # Codex compresses a file in place and keeps recording the plain name.
+        for path in (recorded, recorded.with_name(recorded.name + ".zst")):
+            if path.exists():
+                return path
     found = []
+    names = re.compile(rf"rollout-.*-{re.escape(thread_id)}(_[^/]*)?\.jsonl(\.zst)?")
     for folder in (SESSIONS, ARCHIVED):
         base = home / folder
-        if base.is_dir():
-            found += base.rglob(f"rollout-*-{thread_id}.jsonl")
-            found += base.rglob(f"rollout-*-{thread_id}.jsonl.zst")
+        if base.is_dir():  # one walk per folder
+            found += [p for p in base.rglob(f"rollout-*-{thread_id}*") if names.fullmatch(p.name)]
     # A readable copy wins over a compressed one, then the newest; Codex may move one meanwhile.
     stamped = [(not is_compressed(p), _mtime(p), p) for p in found]
     stamped = [(plain, t, p) for plain, t, p in stamped if t is not None]
@@ -108,8 +115,56 @@ def turn_ends(lines: list[Line]) -> list[tuple[str, int]]:
     return out
 
 
+def batch_end(lines: list[Line]) -> int | None:
+    """Where the part of ``lines`` that may travel ends: after the last finished turn or rollback
+    (``thread_rolled_back``, which Codex writes between turns). None when there is neither: a
+    running turn waits for its end."""
+    end = None
+    for ln in lines:
+        p = payload(ln.record)
+        if ln.record.get("type") != "event_msg":
+            continue
+        if (p.get("type") in TURN_ENDS and p.get("turn_id")) or p.get("type") == ROLLED_BACK:
+            end = ln.end
+    return end
+
+
+def batch_anchor(lines: list[Line]) -> str | None:
+    """What finds the end of ``lines`` again after Codex rewrites the file: the id of the last
+    finished turn, or, when a rollback follows it, that rollback (by its timestamp)."""
+    anchor = None
+    for ln in lines:
+        p = payload(ln.record)
+        if ln.record.get("type") != "event_msg":
+            continue
+        if p.get("type") in TURN_ENDS and p.get("turn_id"):
+            anchor = p["turn_id"]
+        elif p.get("type") == ROLLED_BACK:
+            anchor = _rollback_anchor(ln)
+    return anchor
+
+
+def _rollback_anchor(ln: Line) -> str:
+    return f"{ROLLED_BACK}@{ln.record.get('timestamp')}"
+
+
+def anchor_ends(lines: Iterable[Line], anchor: str) -> list[int]:
+    """Where ``anchor`` (see :func:`batch_anchor`) ends in ``lines``, each time it occurs."""
+    out = []
+    for ln in lines:
+        p = payload(ln.record)
+        if ln.record.get("type") != "event_msg":
+            continue
+        if p.get("type") in TURN_ENDS and p.get("turn_id") == anchor:
+            out.append(ln.end)
+        elif p.get("type") == ROLLED_BACK and anchor == _rollback_anchor(ln):
+            out.append(ln.end)
+    return out
+
+
 def open_turn(lines: list[Line]) -> bool:
-    """Whether the last turn in ``lines`` started and has not finished: Codex is working on it."""
+    """Whether the last turn in ``lines`` started and has not finished: Codex is working on it.
+    A rollback ends an open turn, as Codex rebuilds a thread."""
     state = False
     for ln in lines:
         if ln.record.get("type") != "event_msg":
@@ -117,7 +172,7 @@ def open_turn(lines: list[Line]) -> bool:
         kind = payload(ln.record).get("type")
         if kind == "task_started":
             state = True
-        elif kind in TURN_ENDS:
+        elif kind in TURN_ENDS or kind == ROLLED_BACK:
             state = False
     return state
 

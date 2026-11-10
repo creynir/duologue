@@ -4,8 +4,10 @@ It does what duologue relies on Codex for, the way Codex 0.166 does it, and no m
 
 - ``app-server``: JSON-RPC over stdio. ``thread/resume`` takes the thread's writer lock (held
   until the process exits or the thread is archived) and indexes the rollout's lines past the
-  checkpoint into ``thread_history_1.sqlite``; ``thread/loaded/list``, ``thread/archive``,
-  ``thread/unarchive`` and ``thread/unsubscribe`` behave like Codex's.
+  checkpoint into ``thread_history_1.sqlite``. A thread with only a compressed rollout
+  (``.jsonl.zst``; the tests compress with gzip, which the standard library has) is written
+  out as plain ``.jsonl`` first, as Codex does before it appends. ``thread/loaded/list``,
+  ``thread/archive``, ``thread/unarchive`` and ``thread/unsubscribe`` behave like Codex's.
 - ``migrate-rollouts --thread <id> --apply --json``: converts a legacy rollout to paginated.
 - ``app-server daemon-serve`` (fake only) runs a shared app-server on the home's control socket,
   and ``app-server proxy`` connects stdio to it, as ``codex app-server proxy`` does.
@@ -19,13 +21,15 @@ Lock files are created and removed under ``.coordination.lock``, as codex-rs doe
 
 Knobs, through the environment: ``FAKE_CODEX_NO_INDEX=1`` makes resume index nothing,
 ``FAKE_CODEX_INDEX_TURNS=<n>`` makes it index only the first n turns it finds,
-``FAKE_CODEX_LEAVE_LINES=<n>`` leaves the last n whole lines unindexed, and
+``FAKE_CODEX_LEAVE_LINES=<n>`` leaves the last n whole lines unindexed,
+``FAKE_CODEX_NO_EXPAND=1`` makes resume leave a compressed rollout as it is, and
 ``FAKE_CODEX_LOG`` names a file that gets one line per request.
 """
 
 from __future__ import annotations
 
 import fcntl
+import gzip
 import json
 import os
 import socket
@@ -48,9 +52,19 @@ create table if not exists thread_history_projection_state (
 """
 
 
-def rollout(thread_id: str) -> Path | None:
-    found = list(HOME.glob(f"*sessions/**/rollout-*-{thread_id}.jsonl"))
+def rollout(thread_id: str, suffix: str = ".jsonl") -> Path | None:
+    found = list(HOME.glob(f"*sessions/**/rollout-*-{thread_id}{suffix}"))
+    found += HOME.glob(f"*sessions/**/rollout-*-{thread_id}_*{suffix}")  # rewound
     return max(found, key=lambda p: p.stat().st_mtime) if found else None
+
+
+def expand(thread_id: str) -> None:
+    """Write a compressed rollout out as plain lines and drop the compressed copy."""
+    packed = rollout(thread_id, ".jsonl.zst")
+    if packed is None or rollout(thread_id) is not None or os.environ.get("FAKE_CODEX_NO_EXPAND"):
+        return
+    packed.with_suffix("").write_bytes(gzip.decompress(packed.read_bytes()))
+    packed.unlink()
 
 
 class Server:
@@ -92,7 +106,10 @@ class Server:
         if method == "initialize":
             return {"userAgent": "fake-codex"}
         if method == "thread/resume":
+            expand(tid)
             path = rollout(tid)
+            if path is None and rollout(tid, ".jsonl.zst") is not None:
+                return {"thread": {"id": tid}}  # left compressed (FAKE_CODEX_NO_EXPAND)
             if path is None:
                 raise RpcError(-32600, f"no rollout found for thread id {tid}")
             self.lock(tid)

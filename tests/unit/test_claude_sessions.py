@@ -12,6 +12,7 @@ from duologue.claude import live
 from duologue.claude.sessions import append_records, check_structure, create_session, recover
 from duologue.claude.transcript import (
     find_transcript,
+    is_typed,
     new_transcript_path,
     project_folder,
     settled,
@@ -148,6 +149,20 @@ def test_settled_skips_compaction_and_local_commands(tmp_path: Path):
     assert settled(read_lines(write(tmp_path, c.records)))
 
 
+def test_a_queued_message_waits_for_its_answer(tmp_path: Path):
+    c = ClaudeTranscript()
+    c.user("go")
+    c.assistant("done")
+    assert settled(read_lines(write(tmp_path, c.records)))
+    c.queued("one more thing")
+    assert not settled(read_lines(write(tmp_path, c.records)))
+    assert not is_typed(c.records[-1])  # it joins the running turn, it does not start one
+    c.assistant("done too")
+    assert settled(read_lines(write(tmp_path, c.records)))
+    c.queued("<task-notification>x</task-notification>", mode="task-notification", human=False)
+    assert settled(read_lines(write(tmp_path, c.records)))
+
+
 def test_settled(tmp_path: Path):
     c = ClaudeTranscript()
     assert settled([])
@@ -261,6 +276,52 @@ def test_append_after_a_finished_turn(tmp_path: Path):
     assert [ln.record["uuid"] for ln in read_lines(path, done.start)] == list(done.uuids)
     assert journal.intent.ids == done.uuids
     assert MARK in json.dumps(read_lines(path, done.start)[0].record, ensure_ascii=False)
+
+
+def records_with_prompt(lines) -> list[dict]:
+    t = tail(lines)
+    return claude_records(
+        codex_steps(),
+        session_id=SESSION,
+        parent_uuid=t.parent_uuid,
+        parent_type=t.parent_type,
+        model=t.model,
+        version=t.version,
+        cwd=t.cwd,
+        last_prompt=True,
+    )
+
+
+def test_an_append_may_end_with_a_last_prompt_line(tmp_path: Path):
+    path = write(tmp_path, a_session().records)
+    records = records_with_prompt(read_lines(path))
+    assert records[-1]["type"] == "last-prompt"
+    done = append_records(path, records, journal=MemoryJournal())
+    back = [ln.record for ln in read_lines(path, done.start)]
+    assert back[-1] == records[-1] and back[-1]["leafUuid"] == done.uuids[-1]
+    assert done.uuids == tuple(r["uuid"] for r in records[:-1])
+    assert tail(read_lines(path)).parent_uuid == done.uuids[-1]
+    again = append_records(path, records, journal=MemoryJournal())
+    assert not again.written
+
+
+@pytest.mark.parametrize(
+    "spoil, problem",
+    [
+        (lambda rs: rs.insert(1, rs.pop()), "comes before the end"),
+        (lambda rs: rs.append(dict(rs[-1])), "more than one"),
+        (lambda rs: rs[-1].update(leafUuid=rs[0]["uuid"]), "does not name the last record"),
+        (lambda rs: rs[-1].update(sessionId="5e550000-0000-4000-8000-0000000000ff"), "another"),
+    ],
+)
+def test_a_misplaced_or_wrong_last_prompt_line_blocks(tmp_path: Path, spoil, problem):
+    path = write(tmp_path, a_session().records)
+    records = records_with_prompt(read_lines(path))
+    spoil(records)
+    size = path.stat().st_size
+    with pytest.raises(Blocked, match=problem):
+        append_records(path, records, journal=MemoryJournal())
+    assert path.stat().st_size == size
 
 
 def test_append_twice_writes_once(tmp_path: Path):
@@ -618,3 +679,20 @@ def test_create_session(tmp_path: Path):
     assert records[0]["parentUuid"] is None
     assert oct(done.path.stat().st_mode & 0o777) == "0o600"
     assert journal.intent.base == 0
+
+
+def test_syncing_a_running_turn_starts_at_its_prompt_not_a_queued_message(tmp_path: Path):
+    from duologue.engine import claude_start
+
+    c = ClaudeTranscript()
+    c.user("done before")
+    c.assistant("ok")
+    c.user("refactor the parser")
+    c.call("Bash", {"command": "ls"}, "a.py")
+    c.queued("and add tests too")
+    running = c.assistant([{"type": "tool_use", "id": "toolu_9", "name": "Bash", "input": {}}])
+    running["message"]["stop_reason"] = "tool_use"  # Claude is still at work
+    path = write(tmp_path, c.records)
+    lines = read_lines(path)
+    assert not settled(lines)
+    assert claude_start(path).end == lines[1].end  # just before "refactor the parser"

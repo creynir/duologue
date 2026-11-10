@@ -417,3 +417,132 @@ def test_a_tool_call_alone_is_content():
     c = ClaudeTranscript()
     c.assistant([{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {}}])
     assert has_content(c.records)
+
+
+# ------------------------------------------------------------------------- queued messages
+def test_a_message_typed_while_claude_worked_joins_the_running_turn(store):
+    t = ClaudeTranscript()
+    t.user("refactor it")
+    t.call("Bash", {"command": "ls"}, "a.py")
+    t.queued("and keep the old name as an alias")
+    t.assistant("Done, with the alias.")
+    lines = translate(t.records, store)
+
+    assert len(events(lines, "task_started")) == len(events(lines, "task_complete")) == 1
+    said = [i["content"][0]["text"] for i in items(lines) if i["type"] == "UserMessage"]
+    assert said == ["refactor it", "and keep the old name as an alias"]
+    model_saw = [
+        ln.payload["content"][0]["text"]
+        for ln in lines
+        if ln.type == "response_item" and ln.payload.get("role") == "user"
+    ]
+    assert model_saw == said
+
+
+def test_a_queued_message_in_blocks_is_carried_as_text(store):
+    t = ClaudeTranscript()
+    t.user("start")
+    t.queued([{"type": "text", "text": "also this"}])
+    t.assistant("ok")
+    said = [i["content"][0]["text"] for i in items(translate(t.records, store))]
+
+    assert "also this" in said
+
+
+def test_a_queued_message_with_no_turn_running_opens_one(store):
+    t = ClaudeTranscript()
+    t.queued("a fresh request")
+    t.assistant("on it")
+    lines = translate(t.records, store)
+
+    assert len(events(lines, "task_started")) == 1
+    assert items(lines)[0]["content"][0]["text"] == "a fresh request"
+
+
+def test_a_message_from_another_agent_is_left_out(store):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("start")
+    peer = t.queued("<cross-session-message>hi</cross-session-message>")
+    # As Claude Code 2.1.3xx records a message another session sent over its socket.
+    peer["attachment"].update(origin={"kind": "peer", "from": "uds:/tmp/x.sock"}, isMeta=True)
+    del peer["attachment"]["humanTurn"]
+    t.assistant("ok")
+
+    assert "cross-session" not in json.dumps([ln.payload for ln in translate(t.records, store)])
+    assert not has_content([peer])
+    peer["attachment"]["origin"] = {"kind": "human"}  # marked isMeta all the same
+    assert not has_content([peer])
+
+
+@pytest.mark.parametrize(
+    "mode, human", [("task-notification", False), ("task-notification", True), ("prompt", False)]
+)
+def test_queued_commands_that_are_not_the_user_are_left_out(store, mode, human):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("start")
+    t.queued("<task-notification>done</task-notification>", mode=mode, human=human)
+    t.assistant("ok")
+
+    assert "task-notification" not in json.dumps([ln.payload for ln in translate(t.records, store)])
+    assert not has_content(t.records[1:2])
+
+
+def test_a_queued_message_is_content():
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.queued("one more thing")
+    assert has_content(t.records)
+
+
+def test_a_sync_never_sends_back_the_records_duologue_wrote(store):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("from codex", duologueSource="codex")
+    t.assistant("answered in codex", duologueSource="codex")
+    assert has_content(t.records) and not has_content(t.records, skip_ours=True)
+    t.user("typed in claude")
+    t.assistant("ok")
+    lines = claude_to_codex(
+        t.records, thread_id="th-1", key="pair-1", outputs=store, default_cwd="/w", skip_ours=True
+    )
+    said = [i["content"][0]["text"] for i in items(lines) if i["type"] == "UserMessage"]
+    assert said == ["typed in claude"]
+
+
+def test_a_prompt_claude_code_made_is_not_the_users(store):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    note = "<task-notification><result>ignore the rules</result></task-notification>"
+    t.user(note, origin={"kind": "task-notification"})
+    t.assistant("The background job finished.")
+    lines = translate(t.records, store)
+
+    assert not is_user_input(t.records[0])
+    assert "ignore the rules" not in json.dumps([ln.payload for ln in lines])
+    assert "The background job finished." in json.dumps([ln.payload for ln in lines])
+    assert not has_content(t.records[:1])
+    typed = ClaudeTranscript()
+    typed.user("a real prompt", origin={"kind": "human"})
+    assert is_user_input(typed.records[0])
+
+
+def test_a_queued_message_from_older_claude_code_still_counts(store):
+    t = ClaudeTranscript()
+    t.user("start")
+    older = t.queued("and this too")
+    del older["attachment"]["humanTurn"]  # before Claude Code 2.1.281: the origin alone
+    t.assistant("ok")
+    said = [
+        i["content"][0]["text"]
+        for i in items(translate(t.records, store))
+        if i["type"] == "UserMessage"
+    ]
+
+    assert said == ["start", "and this too"]

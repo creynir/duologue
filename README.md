@@ -57,11 +57,18 @@ note telling the model where the older ones are.
   the turns while no Codex process has the thread loaded, holding Codex's own writer lock. Then
   it lets Codex index them, and checks that it did.
 - **Codex to Claude.** Codex's commands, file changes and MCP calls become tool calls and results
-  in the Claude transcript, after a note saying they happened in Codex. (Turns that Codex's own
+  in the Claude transcript, after a note saying they happened in Codex. A new file, or a change
+  to one place in one file, becomes Claude's own `Write` or `Edit`, so the Claude app shows the
+  diff; Claude Code then treats that file as read, and may overwrite it without reading it first.
+  Other changes arrive as one `apply_patch` call. (Turns that Codex's own
   importer made hold only text, and arrive as text.) duologue writes them
   only while no Claude Code process has the session open, so it carries on from them when it is
   next opened.
-- **Only finished turns travel.** A turn still running on either side waits for its end.
+- **Only finished turns travel.** A turn still running on either side waits for its end. A
+  message you type into Claude while it works travels with the turn it joined.
+- **Undo in Codex.** Turns you edit away or undo in Codex before they synced never reach Claude;
+  if Claude already has them, a note tells Claude how many were undone. Writing in Claude on
+  top of an undo is a conflict.
 - **Nothing is copied twice.** Every id duologue writes derives from the source record. Each
   side has a cursor, and duologue's own records never travel back.
 
@@ -70,16 +77,17 @@ note telling the model where the older ones are.
 `duologue status` says what each pair is doing.
 
 - **Waiting** clears by itself once the app lets go: the Claude session is open, a Codex app has
-  the thread loaded, or a turn is running. Some waits need you: Codex compressed a thread that
-  has been idle for a week (open it in Codex); the thread is archived (unarchive it); a Codex
-  turn never finished because Codex stopped (send the thread a new message); and a Codex whose
-  item format duologue has not been tested with (update duologue; `notify` tells you once).
+  the thread loaded, or a turn is running. Some waits need you: the thread is archived
+  (unarchive it); a Codex turn never finished because Codex stopped (send the thread a new
+  message); and a Codex whose item format duologue has not been tested with (update duologue;
+  `notify` tells you once).
 - **Conflict.** You wrote in both apps since the last sync. Nothing is copied until you keep
   one side's new turns: `duologue resolve <pair> --keep claude` (or `codex`). The other side's
   new turns stay where they are.
-- **Blocked** needs you. A file changed before the point already synced, or an app did not take
-  a write the way it should. Check the conversation, then run `duologue release <pair>`: the
-  pair syncs on from where each side stands.
+- **Blocked** needs you. A file changed before the point already synced (rewinding a thread in
+  Codex does this too), or an app did not take a write the way it should. Check the
+  conversation, then run `duologue release <pair>`: the pair syncs on from where each side
+  stands.
 
 ## Safety
 

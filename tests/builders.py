@@ -61,6 +61,23 @@ class ClaudeTranscript:
         }
         return self._record("assistant", message, **extra)
 
+    def queued(self, prompt, mode: str = "prompt", human: bool = True) -> dict:
+        """A message typed while Claude was busy, as Claude Code 2.1.3xx records it: an
+        attachment that Claude takes into the running turn."""
+        r = self._record("attachment", {})
+        del r["message"]
+        r["attachment"] = {
+            "type": "queued_command",
+            "prompt": prompt,
+            "commandMode": mode,
+            "origin": {"kind": "human" if human else "system"},
+            "humanTurn": human,
+            "delivery_id": f"d-{self._n}",
+            "source_uuid": f"s-{self._n}",
+            "timestamp": r["timestamp"],
+        }
+        return r
+
     def call(self, name: str, inp: dict, result, error: bool = False) -> str:
         """A tool call and its result; returns the tool_use id."""
         tool_id = f"toolu_{self._n + 1:024d}"

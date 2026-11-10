@@ -1,5 +1,31 @@
 # Changelog
 
+## Unreleased
+
+What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Claude Code
+2.1.318 (see [docs/PRIOR_ART.md](docs/PRIOR_ART.md)).
+
+- **Diffs in Claude.** A new file, or a change to one place in one file, arrives from Codex as
+  Claude's own `Write` or `Edit`, so the Claude app shows the diff. Other changes stay one
+  `apply_patch` call.
+- **Messages typed while Claude works** reach Codex in the turn they joined.
+- **Undo and edits in Codex.** Rolled-back turns that had not synced are left out. When Claude
+  already has them, a note tells Claude how many were undone, with the next Codex turns or on
+  its own. A Claude turn written on top of an undo is a conflict.
+- **Rewound and compressed Codex threads.** A rewound thread blocks with that reason, and `link`
+  will not copy its history. A thread Codex compressed while idle is written out again when
+  either side has turns to copy (and by `release` and `resolve`), instead of waiting until it
+  is opened in Codex. An archived thread, or one whose last write by duologue is not settled
+  yet, is still left alone.
+- **Claude's session list** shows the last prompt from Codex.
+- **Task notifications** that reach Claude as prompts are not copied to Codex as the user's.
+- **Echo guard.** Records duologue wrote are recognised by a field (Claude) or their id (Codex)
+  and never sent back, even if a cursor moves behind them.
+- **Checks before writing to Codex:** whole turns, and line numbers that continue Codex's own.
+- **`doctor`** notes a Claude transcript over 5 MiB and a Codex index that lags or overruns its
+  file.
+- The note before Codex's turns says their tool outputs show files as they were then.
+
 ## 0.1.0
 
 The first release: one AI coding conversation in both Claude Code and Codex.
