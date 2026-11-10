@@ -97,7 +97,7 @@ def undone_what(records_before: Iterable[dict], n: int) -> str:
     n turns" alone would point at the wrong ones once Claude has turns of its own after them."""
     groups = codex_turns(records_before)[0][-n:] if n > 0 else []
     prompts = [p for p in (_turn_prompt(g) for _, g in groups) if p]
-    if not prompts or len(groups) < n:
+    if len(prompts) < n:  # a turn without a prompt cannot be named: say how many instead
         return f"the last {n} turn(s) of the conversation Codex held"
     return "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
 

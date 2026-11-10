@@ -26,6 +26,7 @@ import contextlib
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import time
 from collections.abc import Callable, Iterator, Mapping, Sequence
@@ -311,7 +312,11 @@ def recover(codex: Codex, thread_id: str, intent: Intent) -> bool:
         if intent.base == 0:
             return False  # a new thread whose file was never made
         raise Wait("the Codex thread's file is not there now")
-    if codex.index(thread_id).holds(intent.ids, intent.end):
+    try:
+        whole = codex.index(thread_id).holds(intent.ids, intent.end)
+    except sqlite3.Error:
+        whole = False  # a locked index: decided from the file below, or waited for
+    if whole:
         return True  # Codex has all of it: nothing to inspect, even in a compressed file
     if is_compressed(path):
         raise Wait("the Codex thread's file is compressed now")

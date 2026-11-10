@@ -15,8 +15,8 @@ What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Cl
 - **Rewound and compressed Codex threads.** A rewound thread blocks with that reason, and `link`
   will not copy its history. A thread Codex compressed while idle is written out again when
   either side has turns to copy (and by `release` and `resolve`), instead of waiting until it
-  is opened in Codex. An archived thread, or one with a write duologue has not settled, is
-  still left alone.
+  is opened in Codex. An archived thread, or one whose last write by duologue is not settled
+  yet, is still left alone.
 - **Claude's session list** shows the last prompt from Codex.
 - **Task notifications** that reach Claude as prompts are not copied to Codex as the user's.
 - **Echo guard.** Records duologue wrote are recognised by a field (Claude) or their id (Codex)

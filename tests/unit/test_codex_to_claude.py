@@ -670,3 +670,18 @@ def test_a_form_feed_inside_a_line_does_not_end_the_hunk():
     (hunk,) = parse_unified_diff(diff)
 
     assert hunk["lines"] == ["-a = 1", "+a = 2", " \x0c", "-b = 1", "+b = 2"]
+
+
+def test_undone_turns_are_named_by_their_prompts_or_counted():
+    from duologue.translate.codex_to_claude import undone_what
+
+    x = CodexRollout()
+    a_turn(x, "first")
+    a_turn(x, "second")
+    assert undone_what(x.records, 1) == 'the turn(s) that began "second"'
+    assert undone_what(x.records, 2) == 'the turn(s) that began "first", "second"'
+    x.start("no-prompt")  # a turn with no message from the user
+    x.agent_says("on my own", "np-a")
+    x.complete("on my own")
+    assert undone_what(x.records, 2) == "the last 2 turn(s) of the conversation Codex held"
+    assert undone_what(x.records, 5) == "the last 5 turn(s) of the conversation Codex held"

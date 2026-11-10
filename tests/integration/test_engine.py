@@ -1238,7 +1238,17 @@ def test_an_edit_and_resend_arrives_in_one_piece(pair):
     )
     outcome, _ = sync(pair.name)
     assert outcome.state == "waiting" and "running after an undo" in outcome.text
-    assert "nothing else" not in json.dumps(pair.claude.records(), ensure_ascii=False)
+    x = CodexRollout(THREAD, start_ms=1_793_900_900_000)
+    x.start("codex-edited")
+    x.user_says("one, edited", "edited-u")
+    x.agent_says("ok", "edited-a")
+    x.complete("ok")
+    pair.codex.add(x.records[1:])  # the edited turn ends (its task_started is already there)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text, outcome.text
+    texts = json.dumps(pair.claude.records(), ensure_ascii=False)
+    assert texts.count("were undone in Codex") == 1 and "nothing else" not in texts
+    assert prompts(pair.claude.records())[-1] == "one, edited"
 
 
 def test_a_write_codex_indexed_whole_settles_although_the_thread_is_compressed(pair, monkeypatch):
