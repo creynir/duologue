@@ -92,12 +92,16 @@ def undone_steps(n: int, ref: str, timestamp: str | None) -> list[ClaudeStep]:
     return [ClaudeStep("assistant", [{"type": "text", "text": text}], timestamp, f"undo:{ref}")]
 
 
-def undone_what(records_before: Iterable[dict], n: int) -> str:
-    """Which turns an undo of ``n`` took back, for the notes: the prompts that began the last
-    ``n`` turns Codex held in ``records_before`` (the thread up to the cursor), quoted. "The last
-    n turns" alone would point at the wrong ones once Claude has turns of its own after them."""
-    groups = codex_turns(records_before)[0][-n:] if n > 0 else []
-    prompts = [p for p in (_turn_prompt(g) for _, g in groups) if p]
+def undone_what(records_before: Iterable[dict], n: int, records: Iterable[dict] = ()) -> str:
+    """Which turns an undo of ``n`` took back, for the notes, quoted by the prompts that began
+    them: duologue's copies of Claude's turns that ``records`` (the new part) rolls back, then
+    the last of the turns Codex held in ``records_before`` (the thread up to the cursor). "The
+    last n turns" alone would point at the wrong ones once Claude has turns of its own after
+    them."""
+    ours = _turns(list(records))[2]
+    earlier = n - len(ours)
+    groups = codex_turns(records_before)[0][-earlier:] if earlier > 0 else []
+    prompts = [p for p in (_turn_prompt(g) for _, g in [*groups, *ours]) if p]
     if len(prompts) < n:  # a turn without a prompt cannot be named: say how many instead
         return f"the last {n} turn(s) of the conversation Codex held"
     return "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
@@ -126,18 +130,23 @@ def codex_turns(
     that hold what was said in Claude when ``skip_ours``; and how many turns from before
     ``records`` Codex rolled back in them (edit and resend, undo): turns the other side may
     already hold."""
-    groups, undone = _turns(list(records))
+    groups, undone, ours = _turns(list(records))
     kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and from_claude(k))]
-    return kept, undone
+    # Claude holds its own turns, so an undo of duologue's copy of one is news to Claude.
+    return kept, undone + (len(ours) if skip_ours else 0)
 
 
-def _turns(records: list[dict]) -> tuple[list[tuple[str, list[dict]]], int]:
+def _turns(
+    records: list[dict],
+) -> tuple[list[tuple[str, list[dict]]], int, list[tuple[str, list[dict]]]]:
     """The records grouped by turn (a task_started line opens one), each with a stable key, without
-    the turns a later ``thread_rolled_back`` took back; and how many it took back from before
-    ``records``. As Codex rebuilds a thread: a rollback ends the turn it falls in, then drops the
-    last ``num_turns`` turns."""
+    the turns a later ``thread_rolled_back`` took back; how many it took back from before
+    ``records``; and the turns holding what was said in Claude that it took back within them. As
+    Codex rebuilds a thread: a rollback ends the turn it falls in, then drops the last
+    ``num_turns`` turns."""
     groups: list[list[dict]] = [[]]
     undone = 0
+    ours: list[tuple[str, list[dict]]] = []
     for r in records:
         kind = _payload(r).get("type") if r.get("type") == "event_msg" else None
         if kind == "thread_rolled_back":
@@ -145,19 +154,19 @@ def _turns(records: list[dict]) -> tuple[list[tuple[str, list[dict]]], int]:
             turns = [g for g in groups if _is_turn(g)]
             gone = turns[len(turns) - min(n, len(turns)) :]
             undone += n - len(gone)
+            ours += [(k, g) for k, g in ((_group_key(g), g) for g in gone) if from_claude(k)]
             groups = [g for g in groups if not any(g is x for x in gone)] + [[]]
             continue
         if kind == "task_started" and groups[-1]:
             groups.append([])
         groups[-1].append(r)
-    out = []
-    for g in groups:
-        if not g:
-            continue
-        started = next((_payload(r) for r in g if _payload(r).get("type") == "task_started"), {})
-        # Not the group's position: a later batch that starts elsewhere must give the same key.
-        out.append((str(started.get("turn_id") or f"untitled-{g[0].get('timestamp')}"), g))
-    return out, undone
+    return [(_group_key(g), g) for g in groups if g], undone, ours
+
+
+def _group_key(group: list[dict]) -> str:
+    started = next((_payload(r) for r in group if _payload(r).get("type") == "task_started"), {})
+    # Not the group's position: a later batch that starts elsewhere must give the same key.
+    return str(started.get("turn_id") or f"untitled-{group[0].get('timestamp')}")
 
 
 def _is_turn(group: list[dict]) -> bool:

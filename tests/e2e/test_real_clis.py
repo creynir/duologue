@@ -325,10 +325,14 @@ def test_doctor_knows_this_codex(world: World):
 def test_sync_pairs_new_conversations_by_itself(world: World):
     """With nothing linked, a sync gives a new Claude session its Codex thread and a new Codex
     thread its Claude session; each app opens the one made for it, and nothing is paired twice."""
-    with open(world.root / "duologue" / "config.toml", "a") as fh:
-        fh.write("auto_scripted = true\n")  # the tests' conversations are scripted runs
     session = world.claude("run the claude probe")
     thread = world.codex("run the codex probe")
+    # claude -p and codex exec are scripted runs: left out, as the real CLIs mark them.
+    out = world.duologue("sync")
+    assert "created" not in out and json.loads(world.duologue("status", "--json")) == [], out
+    assert "left out: 2 (2 a script ran it)" in world.duologue("status")
+    with open(world.root / "duologue" / "config.toml", "a") as fh:
+        fh.write("auto_scripted = true\n")
     out = world.duologue("sync")
     assert "created Codex thread" in out and "created Claude session" in out, out
     pairs = {p["claude"]: p["codex"] for p in json.loads(world.duologue("status", "--json"))}
@@ -369,7 +373,8 @@ def test_turns_written_in_both_apps_reach_both_models(world: World):
     shown = json.dumps(world.mock.seen("responses")[-1]["input"])
     assert "[Claude ran Bash] echo probe-from-claude" in shown and "at the same time" in shown
 
-    # Each of those last turns travels once, and then nothing is left to copy.
-    world.duologue("sync")
-    world.duologue("sync")
-    assert world.duologue("sync").count("synced") == 0
+    # Those last two turns were written in both apps too: each travels once, then nothing is
+    # left to copy.
+    out = world.duologue("sync") + world.duologue("sync")
+    assert "copied 1 Claude turn(s) to Codex" in out and "copied 1 Codex turn(s) to Claude" in out
+    assert "idle: up to date" in world.duologue("sync")

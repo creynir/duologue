@@ -4,7 +4,7 @@ import json
 
 import pytest
 from builders import SESSION
-from test_engine import THREAD, Claude, CodexThread, homes  # noqa: F401 (fixture)
+from test_engine import THREAD, Claude, CodexThread, homes, stop  # noqa: F401 (fixtures)
 
 from duologue.cli import main
 
@@ -50,7 +50,7 @@ def test_hold_release_unlink(linked, capsys):
     assert "no pairs yet" in capsys.readouterr().out
 
 
-def test_a_conflict_is_reported_and_resolved(linked, capsys):
+def test_a_conflict_is_reported_and_resolved(linked, capsys, stop):  # noqa: F811
     claude, codex = linked
     claude.turn("in claude", "ok")
     codex.turn("in codex", "ok")
@@ -108,14 +108,28 @@ def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):
     assert err.startswith("duologue link: not now: Codex 0.166.0") and "Traceback" not in err
 
 
-def test_a_block_is_one_line_not_a_traceback(linked, capsys):
+def test_a_deleted_conversation_is_one_line_and_its_pair_goes(linked, capsys):
     claude, _ = linked
     claude.path.unlink()
-    assert main(["sync"]) == 1
-    assert "not on this machine" in capsys.readouterr().out
+    assert main(["sync"]) == 0
+    assert "not on this machine any more; the pair is removed" in capsys.readouterr().out
     assert main(["release", "work"]) == 1
     err = capsys.readouterr().err
-    assert err.startswith("duologue release: the Claude session") and "Traceback" not in err
+    assert err.startswith("duologue release: no pair") and "Traceback" not in err
+
+
+def test_quiet_sync_prints_a_stop_once(linked, capsys):
+    from test_engine import engine
+
+    e = engine()
+    p = e.pairs["work"]
+    e.block(p, "checked by the test")
+    p.status = ""
+    e.save()
+    assert main(["sync", "--quiet"]) == 1
+    assert "checked by the test" in capsys.readouterr().out
+    assert main(["sync", "--quiet"]) == 1
+    assert capsys.readouterr().out == ""  # the same stop is not printed on every pass
 
 
 def test_log_reports_an_ambiguous_pair(linked, capsys):

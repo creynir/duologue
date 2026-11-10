@@ -34,19 +34,24 @@ Until the first release is on PyPI: `pipx install git+https://github.com/creynir
 duologue service install     # sync every 30 seconds in the background
 ```
 
-That is all. On each pass duologue pairs every Claude Code session and Codex thread that changed
-in the last 7 days and has no other side yet: it creates that side in the same folder, then keeps
-the two in sync. `duologue sync` runs a pass now; `duologue status` lists the pairs.
+That is all. On each pass duologue pairs the Claude Code sessions and Codex threads that changed
+in the last 7 days and have no other side yet, newest first and up to 10 a pass: it creates that
+side in the same folder, then keeps the two in sync. `duologue sync` runs a pass now; `duologue
+status` lists the pairs, and what is waiting to be paired or was left out, and why.
 
 A new side gets the newest turns that fit the copy budget (400,000 characters by default), with a
 note telling the model where the older ones are. A Claude session that Codex's own importer
 already copied is paired with that thread instead of getting a second one; what Claude added
-since the import follows, within the same budget.
+since the import follows, within the same budget. (If the session changed since in another way,
+the two sync from now on when you carried on in Codex's copy; otherwise the session gets a
+thread of its own.)
 
 Left out: scripted runs (`claude -p`, the Agent SDK, `codex exec`) unless `auto_scripted = true`,
-Codex subagent threads, archived threads, conversations whose folder is gone, ones with nothing
-typed in them yet, and pairs you unlinked. To pair only what you choose, set `auto = false` and
-link by hand, in the folder you work in:
+Codex subagent threads, threads rewound in Codex, archived threads, threads Codex compressed while
+idle (until you open them again), conversations whose folder is gone, ones with nothing typed or
+no finished turn yet, and pairs you unlinked. When a conversation is deleted, its pair goes, and
+the other side is not paired again. To pair only what you choose, set `auto = false` and link by
+hand, in the folder you work in:
 
 ```sh
 duologue link --claude last --codex last   # pair the newest Claude session and Codex thread here
@@ -118,7 +123,7 @@ duologue link --codex last                 # a Claude session with this Codex th
 | `sync` | One sync pass now: pairs new conversations, then syncs every pair (or only the ones named) |
 | `status` | Every pair, its state and its last sync (`--json` for all of it) |
 | `hold` / `release` | Pause a pair, or resume a held or blocked one |
-| `resolve` | After you wrote in both apps, keep one side's new turns |
+| `resolve` | With `on_conflict = "stop"`: after you wrote in both apps, keep one side's new turns |
 | `log` | Recent activity |
 | `doctor` | Check both apps, their versions, Codex's item format and every pair |
 | `unlink` | Stop syncing a pair; both conversations stay as they are, and are not paired again unless you link them |

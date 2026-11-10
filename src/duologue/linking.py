@@ -18,13 +18,11 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeVar
 
-from duologue import auto
 from duologue.claude import sessions as claude_sessions
 from duologue.claude.transcript import (
     PROJECTS,
     find_transcript,
     is_message,
-    is_typed,
     project_folder,
 )
 from duologue.codex import threads as codex_threads
@@ -51,7 +49,7 @@ from duologue.ids import UUID as ID
 from duologue.ids import is_id
 from duologue.journal import Blocked, Wait, prefix_hash
 from duologue.jsonl import Line, iter_lines, read_lines
-from duologue.pairs import Cursor, Pair
+from duologue.pairs import AutoState, AutoStateError, Cursor, Pair, auto_state_file
 from duologue.translate.claude_to_codex import (
     RolloutLine,
     claude_to_codex,
@@ -87,7 +85,12 @@ class NoSuchPair(LinkError):
 
 
 class NotImported(LinkError):
-    """The thread Codex's importer made no longer matches the Claude session."""
+    """The thread Codex's importer made no longer matches the Claude session. ``continued``:
+    the user carried on in that thread in Codex."""
+
+    def __init__(self, text: str, continued: bool):
+        super().__init__(text)
+        self.continued = continued
 
 
 # ----------------------------------------------------------------------------------- finding
@@ -159,7 +162,10 @@ def link(
     engine.pairs[pair.name] = pair
     engine.save()
     engine.log.write(pair.name, "link", done)
-    auto.AutoState.load(auto.state_file(engine)).unignore(pair.claude, pair.codex)
+    try:  # linked by hand: the user wants them paired again
+        AutoState.load(auto_state_file(engine.config)).unignore(pair.claude, pair.codex)
+    except (AutoStateError, OSError) as e:
+        engine.log.write(pair.name, "error", f"linked, but auto.json was not updated: {e}")
     return pair, done
 
 
@@ -306,18 +312,19 @@ def link_import(engine: Engine, claude: str, codex: str, sha256: str) -> tuple[P
     cpath = find_transcript(engine.config.claude_home, claude)
     if cpath is None:
         raise LinkError(f"no Claude Code session {claude!r} in {engine.config.claude_home}")
-    copied = _prefix_with_digest(cpath, sha256)
-    if copied is None:
-        raise NotImported("the Claude session changed since Codex imported it")
     pair = Pair(name=_unique(engine, _claude_title(engine, claude)), claude=claude, codex=codex)
     xpath = engine.codex_path(pair)
+    lines = read_lines(xpath)
+    copied = _prefix_with_digest(cpath, sha256)
+    if copied is None:
+        continued = any(not t.startswith(CODEX_IMPORT_TURN) for t, _ in turn_ends(lines))
+        raise NotImported("the Claude session changed since Codex imported it", continued)
     pair.claude_cursor, dropped = _newest_since(engine, pair, cpath, copied)
     if dropped:
         pair.note_to_codex = (
             f"the Claude Code session goes on after the turns imported above; its next {dropped} "
             f"turn(s) are not copied here. They are in {cpath}"
         )
-    lines = read_lines(xpath)
     ends = [(turn, end) for turn, end in turn_ends(lines) if turn.startswith(CODEX_IMPORT_TURN)]
     if ends:
         turn, end = ends[-1]
@@ -338,8 +345,8 @@ def _newest_since(engine: Engine, pair: Pair, cpath: Path, copied: Cursor) -> tu
     copy budget (at least one), and how many turns before them are left out."""
     lines = read_lines(cpath, copied.end)
     parts: list[list[Line]] = []
-    for ln in lines:
-        if is_typed(ln.record) or not parts:
+    for ln in lines:  # split where the user typed (a queued message is not a user record)
+        if is_user_input(ln.record) or not parts:
             parts.append([])
         parts[-1].append(ln)
     cwd = next((ln.record["cwd"] for ln in reversed(lines) if ln.record.get("cwd")), "")
@@ -361,7 +368,7 @@ def _newest_since(engine: Engine, pair: Pair, cpath: Path, copied: Cursor) -> tu
         total, first, kept = total + size, i, True
     if first == 0 or first == len(parts):
         return copied, 0
-    dropped = sum(1 for part in parts[:first] if any(is_typed(ln.record) for ln in part))
+    dropped = sum(1 for part in parts[:first] if is_user_input(part[0].record))
     end = parts[first - 1][-1].end
     anchor = (
         next(
@@ -463,6 +470,11 @@ def resolve(engine: Engine, pair: Pair, keep: str) -> str:
     if keep not in ("claude", "codex"):
         raise LinkError("keep claude or codex")
     if not pair.conflict:
+        if engine.config.on_conflict != "stop":
+            return (
+                "there is no conflict to resolve: both sides' turns are kept "
+                '(on_conflict = "stop" waits for resolve instead)'
+            )
         return "there is no conflict to resolve"
     cpath, xpath = engine.paths(pair)
     if keep == "claude":
@@ -491,11 +503,12 @@ def unlink(engine: Engine, pair: Pair, force: bool = False) -> str:
             "a write to this pair is not confirmed yet; run duologue sync first, or unlink "
             "with --force"
         )
+    # Not paired again by itself: the user decided (linking them again pairs them). Recorded
+    # first, so the pair is never gone without its decision.
+    AutoState.load(auto_state_file(engine.config)).ignore(pair.claude, pair.codex)
     engine.forget_pending(pair)
     del engine.pairs[pair.name]
     engine.save()
-    # Not paired again by itself: the user decided. Linking them again pairs them.
-    auto.AutoState.load(auto.state_file(engine)).ignore(pair.claude, pair.codex)
     engine.log.write(pair.name, "unlink", UNLINKED)
     return UNLINKED
 

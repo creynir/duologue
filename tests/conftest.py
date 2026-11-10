@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import stat
 import sys
 from pathlib import Path
@@ -14,6 +15,15 @@ from duologue.codex.threads import Codex
 from duologue.translate.common import iso_ms
 
 FAKE_CODEX = Path(__file__).parent / "fakes" / "fake_codex.py"
+
+
+@pytest.fixture(autouse=True, scope="session")
+def never_the_real_homes(tmp_path_factory: pytest.TempPathFactory) -> None:
+    """Every test runs against throwaway homes, including one that undoes its own settings:
+    the variables fall back to these, never to the user's real folders."""
+    base = tmp_path_factory.mktemp("session-homes")
+    for var in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+        os.environ[var] = str(base / var.lower())
 
 
 @pytest.fixture

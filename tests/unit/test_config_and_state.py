@@ -243,14 +243,27 @@ def test_no_service_elsewhere(tmp_path: Path):
         service.files()
 
 
-def test_auto_bookkeeping_that_cannot_be_read_starts_again(tmp_path: Path):
-    from duologue.auto import AutoState
+def test_auto_json_that_cannot_be_read_is_reported_not_reset(tmp_path: Path):
+    from duologue.pairs import AutoState, AutoStateError
 
     path = tmp_path / "auto.json"
-    for text in ("not json", "[1, 2]", '{"ignored": "x", "passed": [], "settings": 3}'):
+    for text in ("not json", "[1, 2]", '{"ignored": "x"}'):
         path.write_text(text)
-        state = AutoState.load(path)
-        assert (state.ignored, state.passed, state.settings) == (set(), {}, {})
-    state.ignore("a", "b")
+        with pytest.raises(AutoStateError):
+            AutoState.load(path)
+        assert path.read_text() == text  # the user's unlinks are not thrown away
+    path.write_text('{"ignored": ["a"], "passed": [], "settings": 3}')
+    state = AutoState.load(path)
+    assert (state.ignored, state.passed, state.settings) == ({"a"}, {}, {})
+    state.ignore("b")
     state.unignore("a")
     assert AutoState.load(path).ignored == {"b"}
+
+
+def test_a_pair_written_by_a_later_duologue_still_loads(tmp_path: Path):
+    store = Store(tmp_path / "pairs.json")
+    store.save({"x": Pair(name="x", claude="c", codex="t")})
+    data = json.loads((tmp_path / "pairs.json").read_text())
+    data["pairs"][0]["field_from_the_future"] = 1
+    (tmp_path / "pairs.json").write_text(json.dumps(data))
+    assert store.load()["x"].claude == "c"

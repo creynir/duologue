@@ -34,7 +34,7 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
 | Advanced setup | Separate OS users per agent, a shared work folder, a notifier hook for alerts. Driven by config, not code. |
 | Service | launchd (macOS) or a `systemd --user` timer (Linux). |
 | CLI | `link`, `unlink`, `status`, `sync`, `doctor`, `hold`/`release`, `resolve`, `log`, `service`. `rebuild` (a whole history merged from several copies) comes after 0.1. |
-| Pairing | Automatic by default, like Codex's own importer but both ways and continuing: each sync pairs every conversation that changed in the last 7 days and has no other side, newest first, at most 10 a pass. Scripted runs, subagent threads, archived threads, conversations whose folder is gone and pairs the user unlinked are left out. `link` stays for pairing by hand (`auto = false`). Decided 2026-11-10. |
+| Pairing | Automatic by default, like Codex's own importer but both ways and continuing: each sync pairs the conversations that changed in the last 7 days and have no other side, newest first, at most 10 tries a pass (failed ones count). Scripted runs, subagent, rewound, archived and compressed threads, conversations whose folder is gone and pairs the user unlinked are left out. What was left out is remembered by file size and time (`auto.json`); a try that failed for a reason outside the file is made again after 10 minutes and logged once; an unreadable `auto.json` stops pairing (it holds the unlinks) but not syncing. A pair one of whose conversations was deleted is removed, and the other side is added to the unlinked ones. `link` stays for pairing by hand (`auto = false`). Decided 2026-11-10. |
 | Writing in both apps | Keep both by default: each side gets the other's new turns after its own, with a note to the model that they happened at the same time. Stopping until `resolve` is the `on_conflict = "stop"` option. Decided 2026-11-10. |
 | Naming | No vendor trademarks in names or branding. |
 | Scope | No company-specific code in the package. Deployment details live in the user's config. |
@@ -147,7 +147,11 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   the transcript is quiet). New content on both sides since the last sync is kept on both: the
   Claude turns go to Codex after Codex's new turns, with a note turn before them, and Codex's
   cursor stays where it was, so the next pass copies Codex's turns to Claude after Claude's, with
-  a note in the lead. duologue's own turns in that batch are skipped, as always. With
+  a note in the lead. duologue's own turns in that batch are skipped, as always. The write
+  records an empty Codex target, so settling it after a crash or `release` keeps Codex's cursor
+  too. The note to Codex goes only before Claude turns that follow Codex turns made since
+  duologue's last copy there, and an undo in Codex of one of those copies counts as an undo of a
+  turn Claude holds. With
   `on_conflict = "stop"` nothing is copied until the user keeps one side's new turns
   (`duologue resolve`).
 - **Codex's importer.** Its ledger (`external_agent_session_imports.json`: source path, the

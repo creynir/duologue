@@ -31,10 +31,10 @@ def homes(tmp_path: Path, fake_codex_bin: Path, monkeypatch):
     duo, claude, codex = tmp_path / "duo", tmp_path / "claude", tmp_path / "codex"
     for d in (duo, claude, codex):
         d.mkdir()
-    # These tests pair by hand and stop at a conflict; test_auto covers the defaults.
+    # These tests pair by hand (test_auto covers pairing by itself).
     (duo / "config.toml").write_text(
         f'codex_bin = "{fake_codex_bin}"\nclaude_bin = "{tmp_path / "no-claude"}"\n'
-        'quiet_seconds = 0\nauto = false\non_conflict = "stop"\n'
+        "quiet_seconds = 0\nauto = false\n"
     )
     monkeypatch.setenv("DUOLOGUE_HOME", str(duo))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))
@@ -43,6 +43,13 @@ def homes(tmp_path: Path, fake_codex_bin: Path, monkeypatch):
         monkeypatch.delenv(knob, raising=False)
     monkeypatch.setattr(gate, "KNOWN_FORMATS", {FAKE_FORMAT: "the fake codex"})
     return SimpleNamespace(duo=duo, claude=claude, codex=codex, bin=str(fake_codex_bin))
+
+
+@pytest.fixture
+def stop(homes):
+    """The "stop" policy: after the user wrote in both apps, the pair waits for resolve."""
+    with open(homes.duo / "config.toml", "a") as fh:
+        fh.write('on_conflict = "stop"\n')
 
 
 def engine() -> Engine:
@@ -271,7 +278,7 @@ def test_a_quiet_pass_skips_unchanged_sides(pair):
 
 
 # ---------------------------------------------------------------------------------- conflicts
-def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair):
+def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     claude_size = pair.claude.path.stat().st_size
@@ -287,7 +294,7 @@ def test_writing_in_both_apps_is_a_conflict_until_one_side_is_kept(pair):
     assert "in codex" not in json.dumps(pair.claude.records())  # Codex's turn stays in Codex
 
 
-def test_resolve_by_keeping_codex(pair):
+def test_resolve_by_keeping_codex(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     sync(pair.name)
@@ -445,11 +452,25 @@ def test_unlink_and_find_pair(pair):
     assert engine().pairs == {}
 
 
-def test_a_missing_side_blocks(pair):
+def test_a_deleted_conversation_removes_its_pair(pair, homes):
     pair.claude.path.unlink()
+    e = engine()
+    outcome = e.sync(e.pairs[pair.name])
+    assert outcome.state == "removed" and "not on this machine any more" in outcome.text
+    e = engine()
+    assert e.pairs == {}
+    from duologue.pairs import AutoState, auto_state_file
+
+    assert THREAD in AutoState.load(auto_state_file(e.config)).ignored  # no copy made again
+
+
+def test_a_missing_app_folder_blocks_and_removes_nothing(pair, homes):
+    import shutil
+
+    shutil.rmtree(homes.claude)
     outcome, p = sync(pair.name)
     assert outcome.state == "blocked" and "not on this machine" in outcome.text
-    assert p.blocked
+    assert p.blocked and engine().pairs
 
 
 # ------------------------------------------------------------- what counts as new content
@@ -731,7 +752,7 @@ def test_the_format_alert_goes_out_once(pair, homes, monkeypatch):
     assert sent.read_text().count("has not been tested") == 1
 
 
-def test_resolve_keep_claude_waits_for_a_running_codex_turn(pair):
+def test_resolve_keep_claude_waits_for_a_running_codex_turn(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     sync(pair.name)
@@ -791,7 +812,7 @@ def test_a_source_rewritten_while_linking_blocks_the_new_pair(homes, monkeypatch
     )
 
 
-def test_a_codex_turn_that_finishes_after_the_pass_read_is_not_skipped(pair, monkeypatch):
+def test_a_codex_turn_that_finishes_after_the_pass_read_is_not_skipped(pair, monkeypatch, stop):
     from duologue.codex import threads
 
     pair.claude.turn("in claude", "ok")
@@ -907,7 +928,7 @@ def test_a_codex_turn_rolled_back_before_it_synced_never_reaches_claude(pair):
     assert "undone" not in json.dumps(pair.claude.records()[-6:])
 
 
-def test_a_claude_turn_after_a_codex_rollback_is_a_conflict(pair):
+def test_a_claude_turn_after_a_codex_rollback_is_a_conflict(pair, stop):
     pair.claude.turn("in claude", "ok")
     started = {"type": "task_started", "turn_id": "codex-empty", "started_at": 1}
     ended = {"type": "turn_aborted", "turn_id": "codex-empty", "reason": "interrupted"}
@@ -969,7 +990,7 @@ def test_a_codex_line_numbered_out_of_order_blocks_the_append(pair):
 
 
 # ------------------------------------------------------------- after the pre-merge review
-def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pair):
+def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pair, stop):
     pair.codex.turn("one", "ok")
     assert sync(pair.name)[0].state == "synced"
     pair.codex.add([pair.codex.rollback(1)])  # undone in Codex, nothing sent yet
@@ -1013,7 +1034,7 @@ def test_an_archived_compressed_thread_is_left_alone(pair, homes, tmp_path, monk
     assert "thread/resume" not in requests(log)
 
 
-def test_resolve_and_release_write_a_compressed_thread_out(pair):
+def test_resolve_and_release_write_a_compressed_thread_out(pair, stop):
     pair.claude.turn("in claude", "ok")
     pair.codex.turn("in codex", "ok")
     assert sync(pair.name)[0].state == "conflict"
@@ -1124,7 +1145,7 @@ def an_undo_conflict(pair) -> None:
     assert sync(pair.name)[0].state == "conflict"
 
 
-def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair):
+def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair, stop):
     an_undo_conflict(pair)
     turns = pair.codex.turn_ids()
     e = engine()
@@ -1134,7 +1155,7 @@ def test_keeping_claude_after_an_undo_conflict_sends_claudes_turn(pair):
     assert len(pair.codex.turn_ids()) == len(turns) + 1
 
 
-def test_keeping_codex_after_an_undo_conflict_tells_claude_then_moves_on(pair):
+def test_keeping_codex_after_an_undo_conflict_tells_claude_then_moves_on(pair, stop):
     an_undo_conflict(pair)
     e = engine()
     linking.resolve(e, e.pairs[pair.name], "codex")
@@ -1218,7 +1239,7 @@ def test_codex_turns_in_a_compressed_thread_reach_claude_whatever_the_codex_form
 
 
 # -------------------------------------------------------- after the third review round
-def test_an_undo_told_after_a_kept_codex_side_names_the_turn_codex_undid(pair):
+def test_an_undo_told_after_a_kept_codex_side_names_the_turn_codex_undid(pair, stop):
     an_undo_conflict(pair)  # "one" synced, undone in Codex, then "in claude" typed in Claude
     e = engine()
     linking.resolve(e, e.pairs[pair.name], "codex")
