@@ -8,6 +8,7 @@ that fit the copy budget, with a note saying where the older ones are.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -17,8 +18,15 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 from typing import TypeVar
 
+from duologue import auto
 from duologue.claude import sessions as claude_sessions
-from duologue.claude.transcript import PROJECTS, find_transcript, is_message, project_folder
+from duologue.claude.transcript import (
+    PROJECTS,
+    find_transcript,
+    is_message,
+    is_typed,
+    project_folder,
+)
 from duologue.codex import threads as codex_threads
 from duologue.codex.rollout import (
     SESSIONS,
@@ -57,8 +65,12 @@ from duologue.translate.codex_to_claude import (
     codex_to_claude_steps,
     codex_turns,
 )
-from duologue.translate.common import text_of
+from duologue.translate.common import CODEX_IMPORT_TURN, text_of
 
+UNLINKED = (
+    "unlinked; both conversations stay as they are, and duologue does not pair them again by "
+    "itself (link them to sync them again)"
+)
 NAME = re.compile(r"[^\x00-\x1f\x7f]{1,80}")
 LAST = "last"
 SCAN_LIMIT = 500  # rollouts looked at to find the newest thread in a folder
@@ -72,6 +84,10 @@ class LinkError(Exception):
 
 class NoSuchPair(LinkError):
     """No pair has that name or id."""
+
+
+class NotImported(LinkError):
+    """The thread Codex's importer made no longer matches the Claude session."""
 
 
 # ----------------------------------------------------------------------------------- finding
@@ -143,6 +159,7 @@ def link(
     engine.pairs[pair.name] = pair
     engine.save()
     engine.log.write(pair.name, "link", done)
+    auto.AutoState.load(auto.state_file(engine)).unignore(pair.claude, pair.codex)
     return pair, done
 
 
@@ -276,6 +293,106 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
     return pair, done
 
 
+def link_import(engine: Engine, claude: str, codex: str, sha256: str) -> tuple[Pair, str]:
+    """Pair a Claude session with the thread Codex's own importer made of it. What Codex copied
+    is not copied again: the Claude side syncs on from the point Codex copied it at (where its
+    file had the sha256 Codex recorded), the Codex side from after the importer's last turn.
+    Claude's turns since then travel on the next pass, as many as fit the copy budget (newest
+    first), after a note saying where the others are. Raises :class:`NotImported` when the
+    Claude session no longer starts with what Codex copied."""
+    for p in engine.pairs.values():
+        if claude in (p.claude, p.codex) or codex in (p.claude, p.codex):
+            raise LinkError(f'that conversation is already linked, as "{p.name}"')
+    cpath = find_transcript(engine.config.claude_home, claude)
+    if cpath is None:
+        raise LinkError(f"no Claude Code session {claude!r} in {engine.config.claude_home}")
+    copied = _prefix_with_digest(cpath, sha256)
+    if copied is None:
+        raise NotImported("the Claude session changed since Codex imported it")
+    pair = Pair(name=_unique(engine, _claude_title(engine, claude)), claude=claude, codex=codex)
+    xpath = engine.codex_path(pair)
+    pair.claude_cursor, dropped = _newest_since(engine, pair, cpath, copied)
+    if dropped:
+        pair.note_to_codex = (
+            f"the Claude Code session goes on after the turns imported above; its next {dropped} "
+            f"turn(s) are not copied here. They are in {cpath}"
+        )
+    lines = read_lines(xpath)
+    ends = [(turn, end) for turn, end in turn_ends(lines) if turn.startswith(CODEX_IMPORT_TURN)]
+    if ends:
+        turn, end = ends[-1]
+        pair.codex_cursor = Cursor(end, prefix_hash(xpath, end), turn)
+    else:
+        pair.codex_cursor = codex_start(xpath)
+    engine.pairs[pair.name] = pair
+    engine.save()
+    done = "paired with the thread Codex's importer made of it"
+    if dropped:
+        done += f" ({dropped} Claude turn(s) since the import left out: over the copy budget)"
+    engine.log.write(pair.name, "link", done)
+    return pair, done
+
+
+def _newest_since(engine: Engine, pair: Pair, cpath: Path, copied: Cursor) -> tuple[Cursor, int]:
+    """Where to sync Claude on from after ``copied``: the start of the newest turns that fit the
+    copy budget (at least one), and how many turns before them are left out."""
+    lines = read_lines(cpath, copied.end)
+    parts: list[list[Line]] = []
+    for ln in lines:
+        if is_typed(ln.record) or not parts:
+            parts.append([])
+        parts[-1].append(ln)
+    cwd = next((ln.record["cwd"] for ln in reversed(lines) if ln.record.get("cwd")), "")
+    total, first, kept = 0, len(parts), False
+    for i in range(len(parts) - 1, -1, -1):
+        made = claude_to_codex(
+            [ln.record for ln in parts[i]],
+            thread_id=pair.codex,
+            key=pair.key,
+            outputs=engine.outputs,
+            default_cwd=cwd,
+            skip_ours=True,
+        )
+        if not made:
+            continue
+        size = _model_size(made)
+        if kept and total + size > engine.config.copy_budget:
+            break
+        total, first, kept = total + size, i, True
+    if first == 0 or first == len(parts):
+        return copied, 0
+    dropped = sum(1 for part in parts[:first] if any(is_typed(ln.record) for ln in part))
+    end = parts[first - 1][-1].end
+    anchor = (
+        next(
+            (ln.record["uuid"] for ln in reversed(parts[first - 1]) if ln.record.get("uuid")), None
+        )
+        or copied.anchor
+    )
+    return Cursor(end, prefix_hash(cpath, end), anchor), dropped
+
+
+def _prefix_with_digest(path: Path, sha256: str) -> Cursor | None:
+    """A cursor at the end of the line where the file's first bytes hash to ``sha256``."""
+    h = hashlib.sha256()
+    end, anchor = 0, None
+    with open(path, "rb") as fh:
+        for raw in fh:
+            if not raw.endswith(b"\n"):
+                break
+            h.update(raw)
+            end += len(raw)
+            try:
+                record = json.loads(raw)
+            except ValueError:
+                record = None
+            if isinstance(record, dict) and record.get("uuid"):
+                anchor = record["uuid"]
+            if h.hexdigest() == sha256:
+                return Cursor(end, sha256, anchor)
+    return None
+
+
 def _source_unchanged(engine: Engine, pair: Pair, path: Path, cur: Cursor, what: str) -> None:
     """Block the new pair when the conversation it was copied from was rewritten meanwhile:
     the copy may not match it, so a person decides (``duologue release``)."""
@@ -377,8 +494,10 @@ def unlink(engine: Engine, pair: Pair, force: bool = False) -> str:
     engine.forget_pending(pair)
     del engine.pairs[pair.name]
     engine.save()
-    engine.log.write(pair.name, "unlink", "unlinked; both conversations stay as they are")
-    return "unlinked; both conversations stay as they are"
+    # Not paired again by itself: the user decided. Linking them again pairs them.
+    auto.AutoState.load(auto.state_file(engine)).ignore(pair.claude, pair.codex)
+    engine.log.write(pair.name, "unlink", UNLINKED)
+    return UNLINKED
 
 
 def find_pair(engine: Engine, ref: str) -> Pair:

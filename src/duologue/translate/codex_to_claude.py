@@ -23,8 +23,8 @@ from dataclasses import dataclass, field, replace
 from duologue.translate.common import (
     MARK,
     ORIGIN,
+    from_claude,
     is_codex_noise,
-    is_derived_id,
     is_note,
     iso_ms,
     stable_id,
@@ -73,11 +73,12 @@ def codex_to_claude_steps(
     records: Iterable[dict], *, key: str, outputs: OutputStore, skip_ours: bool = False
 ) -> list[ClaudeStep]:
     """Translate new Codex rollout records into Claude steps. ``key`` identifies the pair. Turns
-    Codex rolled back are left out. ``skip_ours`` also leaves out turns duologue wrote (their
-    turn ids are derived): a sync pass never sends those back."""
+    Codex rolled back are left out. ``skip_ours`` also leaves out turns that hold what was said
+    in Claude (duologue's, whose ids are derived, and Codex's importer's): a sync pass never
+    sends those back."""
     steps: list[ClaudeStep] = []
     for turn_key, group in _turns(list(records))[0]:
-        if skip_ours and is_derived_id(turn_key):
+        if skip_ours and from_claude(turn_key):
             continue
         steps += _turn_steps(group, f"{key}:{turn_key}", outputs)
     return steps
@@ -121,11 +122,12 @@ def _turn_prompt(group: list[dict]) -> str:
 def codex_turns(
     records: Iterable[dict], *, skip_ours: bool = False
 ) -> tuple[list[tuple[str, list[dict]]], int]:
-    """The turns in ``records`` that Codex still holds, as (turn id, records), without duologue's
-    own when ``skip_ours``; and how many turns from before ``records`` Codex rolled back in them
-    (edit and resend, undo): turns the other side may already hold."""
+    """The turns in ``records`` that Codex still holds, as (turn id, records), without the ones
+    that hold what was said in Claude when ``skip_ours``; and how many turns from before
+    ``records`` Codex rolled back in them (edit and resend, undo): turns the other side may
+    already hold."""
     groups, undone = _turns(list(records))
-    kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and is_derived_id(k))]
+    kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and from_claude(k))]
     return kept, undone
 
 

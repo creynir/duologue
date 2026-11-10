@@ -34,6 +34,8 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
 | Advanced setup | Separate OS users per agent, a shared work folder, a notifier hook for alerts. Driven by config, not code. |
 | Service | launchd (macOS) or a `systemd --user` timer (Linux). |
 | CLI | `link`, `unlink`, `status`, `sync`, `doctor`, `hold`/`release`, `resolve`, `log`, `service`. `rebuild` (a whole history merged from several copies) comes after 0.1. |
+| Pairing | Automatic by default, like Codex's own importer but both ways and continuing: each sync pairs every conversation that changed in the last 7 days and has no other side, newest first, at most 10 a pass. Scripted runs, subagent threads, archived threads, conversations whose folder is gone and pairs the user unlinked are left out. `link` stays for pairing by hand (`auto = false`). Decided 2026-11-10. |
+| Writing in both apps | Keep both by default: each side gets the other's new turns after its own, with a note to the model that they happened at the same time. Stopping until `resolve` is the `on_conflict = "stop"` option. Decided 2026-11-10. |
 | Naming | No vendor trademarks in names or branding. |
 | Scope | No company-specific code in the package. Deployment details live in the user's config. |
 
@@ -142,8 +144,22 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   ids recorded before writing, read back, and an accepted cursor that moves only after verification.
 - **Quiet and open-turn checks.** Sync only finished turns: a Codex turn once its `task_complete` is
   written, a Claude turn once its last message has a final stop reason (or its process is gone and
-  the transcript is quiet). New content on both sides since the last sync is a conflict: nothing
-  is copied until the user keeps one side's new turns (`duologue resolve`).
+  the transcript is quiet). New content on both sides since the last sync is kept on both: the
+  Claude turns go to Codex after Codex's new turns, with a note turn before them, and Codex's
+  cursor stays where it was, so the next pass copies Codex's turns to Claude after Claude's, with
+  a note in the lead. duologue's own turns in that batch are skipped, as always. With
+  `on_conflict = "stop"` nothing is copied until the user keeps one side's new turns
+  (`duologue resolve`).
+- **Codex's importer.** Its ledger (`external_agent_session_imports.json`: source path, the
+  source's sha256 when copied, the thread) pairs a Claude session with the thread Codex made of
+  it. The Claude cursor goes where the transcript's prefix hashes to that sha256, or later: to
+  the newest turns since then that fit the copy budget, with a note before them in Codex naming
+  the file the others are in. The Codex cursor goes after the last `external-import-turn-*`
+  turn. A session with no such prefix (on one machine, 7 of 25 imports 7 to 10 weeks old had
+  none) is not paired with that thread; it gets a thread of its own. Those turns hold Claude's
+  own words and never travel back. A thread the importer made of a session that is paired
+  already, gone or unlinked is left alone. Codex's importer appends to its thread only while
+  that thread is an exact prefix of the Claude session, so it stops once duologue writes there.
 - **Output caps.** The model sees 4,000 characters per tool output, the app shows 20,000. The rest
   goes to a pointer file.
 - **History rebuilds.**

@@ -19,6 +19,12 @@ def test_defaults(tmp_path: Path):
     assert cfg.codex_home == Path("~/.codex").expanduser()
     assert (cfg.quiet_seconds, cfg.copy_budget, cfg.codex_source) == (15.0, 400_000, "vscode")
     assert cfg.notify == () and not cfg.allow_untested_codex
+    assert (cfg.auto, cfg.auto_days, cfg.auto_scripted, cfg.on_conflict) == (
+        True,
+        7.0,
+        False,
+        "keep-both",
+    )
 
 
 def test_the_apps_variables_then_the_config_file(tmp_path: Path):
@@ -43,6 +49,10 @@ def test_the_apps_variables_then_the_config_file(tmp_path: Path):
         "not toml = =\n",
         "quiet_seconds = nan\n",
         "quiet_seconds = inf\n",
+        "auto = 1\n",
+        "auto_days = 0\n",
+        "auto_days = nan\n",
+        'on_conflict = "ask"\n',
     ],
 )
 def test_a_bad_config_file_is_reported(tmp_path: Path, text: str):
@@ -231,3 +241,16 @@ def test_no_service_elsewhere(tmp_path: Path):
     service.platform = "win32"
     with pytest.raises(RuntimeError):
         service.files()
+
+
+def test_auto_bookkeeping_that_cannot_be_read_starts_again(tmp_path: Path):
+    from duologue.auto import AutoState
+
+    path = tmp_path / "auto.json"
+    for text in ("not json", "[1, 2]", '{"ignored": "x", "passed": [], "settings": 3}'):
+        path.write_text(text)
+        state = AutoState.load(path)
+        assert (state.ignored, state.passed, state.settings) == (set(), {}, {})
+    state.ignore("a", "b")
+    state.unignore("a")
+    assert AutoState.load(path).ignored == {"b"}

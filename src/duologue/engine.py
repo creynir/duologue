@@ -8,8 +8,11 @@ One pass over a pair:
 3. Each cursor is checked against its file. A Claude transcript changed before its cursor blocks
    the pair; for a Codex thread, which Codex rewrites when it converts one, the cursor's turn is
    found again, and only if it is gone does the pair block.
-4. New content on both sides is a conflict: the user wrote in both apps. Nothing is copied until
-   they keep one side (``duologue resolve``).
+4. New content on both sides is a conflict: the user wrote in both apps. By default both are
+   kept: Claude's new turns go to Codex after Codex's, and on a later pass Codex's go to Claude
+   after Claude's, each with a note that the two happened at the same time. With
+   ``on_conflict = "stop"`` nothing is copied until the user keeps one side
+   (``duologue resolve``).
 5. New Claude content goes to Codex once Claude's turn has ended and the transcript has been
    quiet a moment. Codex's finished turns go to Claude while no Claude Code process has the
    session open.
@@ -49,7 +52,7 @@ from duologue.gate import CodexFormat, cached_format
 from duologue.journal import Blocked, Intent, Wait, prefix_hash, tail_state
 from duologue.jsonl import Line, iter_lines, read_lines
 from duologue.pairs import ActivityLog, Cursor, Pair, Pending, Store, now_iso, write_atomic
-from duologue.translate.claude_to_codex import claude_to_codex, has_content
+from duologue.translate.claude_to_codex import claude_to_codex, has_content, note_turn
 from duologue.translate.codex_to_claude import (
     LEAD_NOTE,
     UNDONE_NOTE,
@@ -61,8 +64,17 @@ from duologue.translate.codex_to_claude import (
     undone_steps,
     undone_what,
 )
+from duologue.translate.common import from_claude
 from duologue.translate.outputs import OutputStore
 
+ALONGSIDE_CODEX = (
+    "the user carried on in Claude Code at the same time as the turns just before this note, "
+    "so neither side saw the other's: the next turns come from Claude"
+)
+ALONGSIDE_CLAUDE = (
+    "Some of them happened while the user carried on here at the same time, so neither side saw "
+    "the other's."
+)
 CONFLICT = (
     "you wrote in both Claude and Codex since the last sync, so nothing was copied; keep one "
     'side\'s new turns with: duologue resolve "{name}" --keep claude (or --keep codex)'
@@ -95,8 +107,9 @@ class Engine:
             return Outcome("held", f"on hold: {pair.hold}")
         if pair.blocked:
             return Outcome("blocked", pair.blocked)
-        if pair.conflict:
+        if pair.conflict and self.config.on_conflict == "stop":
             return Outcome("conflict", CONFLICT.format(name=pair.name))
+        pair.conflict = False  # one left from "stop": both sides are kept now
         try:
             outcome = self._sync(pair, force)
         except Wait as e:
@@ -147,13 +160,15 @@ class Engine:
         xlines = [ln for ln in xall if ln.end <= end] if end else []
         if claude_new:
             steps, undone = self.codex_part(pair, xlines)
-            if steps or undone:
+            if (steps or undone) and self.config.on_conflict == "stop":
                 pair.conflict = True
                 text = CONFLICT.format(name=pair.name)
                 self.log.write(pair.name, "conflict", text)
                 self.notify(f'duologue: "{_printable(pair.name)}": {text}')
                 return Outcome("conflict", text)
-            return self.to_codex(pair, cpath, clines, xsize)
+            # Both apps gained turns: Claude's go after Codex's, and Codex's cursor stays, so
+            # Codex's go to Claude on the next pass.
+            return self.to_codex(pair, cpath, clines, xsize, alongside=bool(steps or undone))
         if xlines:
             live = self.claude_live(pair)
             if live() is not None:  # before translating: a waiting pass should cost nothing
@@ -171,7 +186,12 @@ class Engine:
         return Outcome("idle", "up to date")
 
     # ---------------------------------------------------------------------------- directions
-    def to_codex(self, pair: Pair, cpath: Path, clines: list[Line], xsize: int) -> Outcome:
+    def to_codex(
+        self, pair: Pair, cpath: Path, clines: list[Line], xsize: int, alongside: bool = False
+    ) -> Outcome:
+        """Copy Claude's new turns to Codex. ``alongside``: Codex has new turns of its own that
+        Claude has not been given yet; Claude's go after them, with a note, and Codex's cursor
+        stays before them."""
         self.ready_for_codex(pair, cpath, clines)
         cwd = next((ln.record["cwd"] for ln in reversed(clines) if ln.record.get("cwd")), "")
         cwd = cwd or session_meta(self.codex_path(pair)).get("cwd", "")
@@ -183,6 +203,10 @@ class Engine:
             default_cwd=cwd,
             skip_ours=True,
         )
+        notes = [n for n in (pair.note_to_codex, ALONGSIDE_CODEX if alongside else None) if n]
+        if notes and lines:
+            ms = lines[0].ms - 1
+            lines = note_turn(" ".join(notes), thread_id=pair.codex, key=pair.key, ms=ms) + lines
         after_claude = {
             "end": clines[-1].end,
             "anchor": _last_uuid(clines) or pair.claude_cursor.anchor,
@@ -191,9 +215,14 @@ class Engine:
         done = codex_threads.append_turns(
             self.codex, pair.codex, lines, journal=journal, expect_size=xsize
         )
-        self.confirm(pair, after_claude, {"end": done.end, "anchor": done.turns[-1]})
-        pair.copied["to_codex"] += len(done.turns)
-        text = f"copied {len(done.turns)} Claude turn(s) to Codex"
+        self.confirm(
+            pair, after_claude, None if alongside else {"end": done.end, "anchor": done.turns[-1]}
+        )
+        copied = len(done.turns) - (1 if notes else 0)
+        pair.copied["to_codex"] += copied
+        text = f"copied {copied} Claude turn(s) to Codex"
+        if alongside:
+            text += ", after the turns made in Codex meanwhile"
         self.log.write(pair.name, "to_codex", text if done.written else text + " (already there)")
         return Outcome("synced", text)
 
@@ -210,6 +239,10 @@ class Engine:
         t = tail(iter_lines(cpath))
         what = self.undone_what(pair, undone) if undone else ""
         lead, extra = LEAD_NOTE, UNDONE_NOTE.format(what=what) if undone else ""
+        records_x = [ln.record for ln in xlines]
+        if any(from_claude(k) for k, _ in codex_turns(records_x)[0]) and steps:
+            # Claude's turns went to Codex after these: they happened at the same time.
+            extra = f"{extra} {ALONGSIDE_CLAUDE}".strip()
         if not steps:  # Codex only undid turns Claude holds: say so
             last = xlines[-1]
             steps = undone_steps(undone, f"{last.end}:{last.record.get('timestamp')}", None)
@@ -302,6 +335,8 @@ class Engine:
             pair.codex_cursor = Cursor(
                 codex["end"], prefix_hash(xpath, codex["end"]), codex["anchor"]
             )
+        if pair.pending and pair.pending.side == "codex":
+            pair.note_to_codex = None  # it went with the turns
         pair.checked = {}
         pair.last_sync = now_iso()
         self.forget_pending(pair)

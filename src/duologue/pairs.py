@@ -75,6 +75,8 @@ class Pair:
     checked: dict = field(default_factory=dict)  # side -> file stamp its cursor last matched
     # [Codex cursor end, Codex file size] when a pass last found nothing in Codex to copy
     codex_quiet: list | None = None
+    # A note to put before the next Claude turns copied to Codex (turns left out before them)
+    note_to_codex: str | None = None
 
     @property
     def key(self) -> str:

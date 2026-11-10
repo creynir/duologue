@@ -31,9 +31,10 @@ def homes(tmp_path: Path, fake_codex_bin: Path, monkeypatch):
     duo, claude, codex = tmp_path / "duo", tmp_path / "claude", tmp_path / "codex"
     for d in (duo, claude, codex):
         d.mkdir()
+    # These tests pair by hand and stop at a conflict; test_auto covers the defaults.
     (duo / "config.toml").write_text(
         f'codex_bin = "{fake_codex_bin}"\nclaude_bin = "{tmp_path / "no-claude"}"\n'
-        "quiet_seconds = 0\n"
+        'quiet_seconds = 0\nauto = false\non_conflict = "stop"\n'
     )
     monkeypatch.setenv("DUOLOGUE_HOME", str(duo))
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(claude))

@@ -685,3 +685,22 @@ def test_undone_turns_are_named_by_their_prompts_or_counted():
     x.complete("on my own")
     assert undone_what(x.records, 2) == "the last 2 turn(s) of the conversation Codex held"
     assert undone_what(x.records, 5) == "the last 5 turn(s) of the conversation Codex held"
+
+
+def test_turns_codex_imported_from_claude_never_go_back(store):
+    """Codex's importer writes a Claude session's own words into turns it names
+    external-import-turn-N: a sync pass leaves them out, as it does duologue's turns."""
+    x = CodexRollout()
+    x.start("external-import-turn-1")
+    said = [{"type": "input_text", "text": "said in Claude"}]
+    x.response({"type": "message", "role": "user", "content": said})
+    answer = [{"type": "output_text", "text": "answered in Claude"}]
+    x.response({"type": "message", "role": "assistant", "content": answer})
+    x.complete("answered in Claude")
+    native = a_native_turn()
+    records = x.records + native.records
+    kept = codex_to_claude_steps(records, key="k", outputs=store, skip_ours=True)
+    assert "said in Claude" not in json.dumps([s.blocks for s in kept])
+    assert [k for k, _ in codex_turns(records, skip_ours=True)[0]] == ["turn-1"]
+    everything = codex_to_claude_steps(records, key="k", outputs=store)
+    assert "said in Claude" in json.dumps([s.blocks for s in everything])

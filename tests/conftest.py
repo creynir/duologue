@@ -41,16 +41,17 @@ def write_rollout(
     *,
     history_mode: str = "paginated",
     cwd: str = CWD,
+    meta: dict | None = None,
 ) -> Path:
-    """A rollout for ``thread_id``: session_meta, then ``records``, ordinals in sequence (none
-    in a legacy rollout)."""
+    """A rollout for ``thread_id``: session_meta (with ``meta`` added), then ``records``,
+    ordinals in sequence (none in a legacy rollout)."""
     folder = codex_home / "sessions" / "2026" / "11" / "04"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"rollout-2026-11-04T14-00-00-{thread_id}.jsonl"
     meta = {
         "timestamp": iso_ms(START_MS),
         "type": "session_meta",
-        "payload": {"id": thread_id, "cwd": cwd, "history_mode": history_mode},
+        "payload": {"id": thread_id, "cwd": cwd, "history_mode": history_mode, **(meta or {})},
     }
     lines = []
     for n, r in enumerate([meta, *records]):

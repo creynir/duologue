@@ -11,7 +11,7 @@ import sqlite3
 import sys
 from collections.abc import Iterator, Sequence
 
-from duologue import __version__, config, gate, linking
+from duologue import __version__, auto, config, gate, linking
 from duologue.codex.rollout import is_compressed
 from duologue.codex.rpc import daemon_running
 from duologue.engine import TRANSIENT, Engine, _printable
@@ -26,7 +26,7 @@ COMMANDS = {
     "link": "pair a Claude Code session with a Codex thread (or create the missing one)",
     "unlink": "stop syncing a pair; both conversations stay as they are",
     "status": "show every pair and where its sync stands",
-    "sync": "run one sync pass now",
+    "sync": "run one sync pass now (and pair new conversations, unless auto = false)",
     "doctor": "check the apps, their versions and duologue's own state",
     "hold": "pause syncing a pair",
     "release": "resume a held pair, or one that stopped and needed a person",
@@ -55,7 +55,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = command("status")
     p.add_argument("--json", action="store_true", help="every pair's state as JSON")
     p = command("sync")
-    p.add_argument("pairs", nargs="*", metavar="pair", help="only these pairs (default: all)")
+    p.add_argument(
+        "pairs", nargs="*", metavar="pair", help="only these pairs (default: all, and new ones)"
+    )
     p.add_argument("--force", action="store_true", help="check sides that look unchanged too")
     p.add_argument("--quiet", action="store_true", help="print only what changed")
     command("doctor")
@@ -127,8 +129,18 @@ def cmd_status(args) -> int:
     if args.json:
         print(json.dumps([p.to_dict() for p in pairs], indent=1, ensure_ascii=False))
         return 0
+    cfg = e.config
+    if cfg.auto:
+        print(
+            f"Pairing by itself every conversation that changed in the last {cfg.auto_days:g} "
+            "day(s), on each sync."
+        )
     if not pairs:
-        print("no pairs yet; link one with: duologue link --claude last --codex last")
+        print(
+            "no pairs yet; they appear on the next sync"
+            if cfg.auto
+            else "no pairs yet; link one with: duologue link --claude last --codex last"
+        )
         return 0
     for p in pairs:
         print(f'"{p.name}"  {p.state}')
@@ -142,6 +154,9 @@ def cmd_status(args) -> int:
 def cmd_sync(args) -> int:
     failed = False
     with engine() as e:
+        if e.config.auto and not args.pairs:
+            for line in auto.link_new(e):
+                print(line)
         chosen = [linking.find_pair(e, ref) for ref in args.pairs] or list(e.pairs.values())
         for pair in chosen:
             outcome = e.sync(pair, force=args.force or bool(args.pairs))
@@ -243,6 +258,16 @@ def cmd_doctor(args) -> int:
                     print(f'    pair "{p.name}": {text}')
                 else:
                     report(ok, f'pair "{p.name}": {text}')
+    print(
+        "    pairing: "
+        + (
+            f"every conversation that changed in the last {cfg.auto_days:g} day(s)"
+            + (", scripted runs included" if cfg.auto_scripted else "")
+            if cfg.auto
+            else "only the conversations you link (auto = false)"
+        )
+        + f"; after you write in both apps: {cfg.on_conflict}"
+    )
     try:
         print(f"    background service: {Service(cfg.home).status()}")
     except RuntimeError as err:
