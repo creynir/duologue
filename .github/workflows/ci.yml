@@ -47,9 +47,17 @@ jobs:
     # its model API (tests/e2e/mock_models.py), so no account is needed. The versions are the
     # ones duologue was tested with; a Codex whose item format changed fails the format gate.
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - claude: "2.1.318"
+            codex: "0.166.0"
+          - claude: "2.1.322"
+            codex: "0.167.0"
     env:
-      CLAUDE_CODE_VERSION: "2.1.318"
-      CODEX_VERSION: "0.166.0"
+      CLAUDE_CODE_VERSION: ${{ matrix.claude }}
+      CODEX_VERSION: ${{ matrix.codex }}
       DUOLOGUE_E2E_REQUIRED: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

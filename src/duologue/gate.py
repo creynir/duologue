@@ -26,6 +26,8 @@ ITEM_KINDS = ("userMessage", "agentMessage", "commandExecution", "fileChange", "
 # Fingerprints of those item kinds in Codex releases duologue was tested against.
 KNOWN_FORMATS = {
     "4a28793ccce040ab7e7ec9d03864f3d03da21843be41ef0616f0170cfb332ebf": "0.166.0",
+    # 0.167.0 (and the ChatGPT app's 0.167.0-alpha.3.2): only audio input gained a file id.
+    "5131295ce3d4706339277cdcaecc7bbe8fd0dc3fb05c958bb305a15635c86ca8": "0.167.0",
 }
 CODEX_FLOOR = (0, 163, 0)  # paginated history and the append path's behaviour
 CLAUDE_FLOOR = (2, 1, 303)  # the oldest Claude Code the transcript format was checked on

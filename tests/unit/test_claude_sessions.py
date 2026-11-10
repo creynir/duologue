@@ -188,6 +188,20 @@ def started(*args: str) -> subprocess.Popen:
     return p
 
 
+def started_as(program: str, *args: str) -> subprocess.Popen:
+    """A process whose program is named ``program`` (as Claude Code's own is) and whose command
+    line goes on with ``args``: a shell renamed with ``exec -a``, waiting for its input."""
+    script = 'exec -a "$0" /bin/sh -c "echo ready; read x" "$@"'
+    p = subprocess.Popen(
+        ["bash", "-c", script, program, *args],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    assert p.stdout.readline().strip() == "ready"
+    return p
+
+
 def stop(p: subprocess.Popen) -> None:
     p.stdin.close()
     p.wait(10)
@@ -233,7 +247,7 @@ def test_a_registered_pid_now_used_by_another_program(tmp_path: Path):
     [["--resume", SESSION], [f"--resume={SESSION}"], ["-r", SESSION], ["--session-id", SESSION]],
 )
 def test_a_process_that_resumed_the_session(tmp_path: Path, flag):
-    p = started("claude", *flag)
+    p = started_as("claude", *flag)
     try:
         assert live.live_pid(tmp_path, SESSION) == p.pid
     finally:
@@ -242,7 +256,7 @@ def test_a_process_that_resumed_the_session(tmp_path: Path, flag):
 
 
 def test_a_claude_whose_command_line_mentions_duologue_counts(tmp_path: Path):
-    p = started("/home/dev/duologue/bin/claude", "--resume", SESSION)
+    p = started_as("/home/dev/duologue/bin/claude", "--resume", SESSION)
     try:
         assert live.live_pid(tmp_path, SESSION) == p.pid
     finally:
@@ -250,7 +264,7 @@ def test_a_claude_whose_command_line_mentions_duologue_counts(tmp_path: Path):
 
 
 def test_naming_the_session_without_resuming_it_does_not_count(tmp_path: Path):
-    p = started("claude", "--name", SESSION, "--resume", "other")
+    p = started_as("claude", "--name", SESSION, "--resume", "other")
     try:
         assert live.live_pid(tmp_path, SESSION) is None
     finally:
@@ -696,3 +710,19 @@ def test_syncing_a_running_turn_starts_at_its_prompt_not_a_queued_message(tmp_pa
     lines = read_lines(path)
     assert not settled(lines)
     assert claude_start(path).end == lines[1].end  # just before "refactor the parser"
+
+
+def test_a_shell_that_mentions_resuming_the_session_does_not_count(tmp_path: Path):
+    """A shell or script whose command line holds a claude --resume command is not Claude Code
+    (found with a real test driver: its own shell kept a pair waiting)."""
+    p = started_as("/bin/zsh", "-c", f"cd /work && claude -p hi --resume {SESSION} --model haiku")
+    try:
+        assert live.live_pid(tmp_path, SESSION) is None
+    finally:
+        stop(p)
+
+
+def test_node_running_claude_code_counts():
+    words = ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js", "--resume", SESSION]
+    assert live._is_claude_code(words) and live._resumes(words, SESSION)
+    assert not live._is_claude_code(["/bin/zsh", "-c", f"claude --resume {SESSION}"])

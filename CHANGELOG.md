@@ -4,6 +4,16 @@
 
 Every conversation syncs by itself.
 
+- **Codex 0.167** (and the ChatGPT app's 0.167.0-alpha.3.2) is accepted: of the items duologue
+  writes, only audio input changed (it may name a file id). CI runs the end-to-end tests with
+  Claude Code 2.1.318 and Codex 0.166.0, and with 2.1.322 and 0.167.0.
+- **Checked with the real apps and models** (Claude Code 2.1.322, the ChatGPT app's Codex), both
+  ways, keep-both included. Two fixes came of it:
+  - The note before Codex's turns in Claude says the answers there are Codex's, not Claude's:
+    with the old wording Claude took them for its own, or could not tell.
+  - A shell or script whose command line holds a `claude --resume` command no longer counts as
+    Claude Code having the session open; only Claude Code's own program does.
+
 - **The Claude desktop app** lists the Claude sessions duologue creates, from the next time it
   starts: duologue writes the app's card for each (macOS, on by default; `desktop_cards = false`
   turns it off, `claude_desktop_dir` names the app's folder). When the user carries on in one
