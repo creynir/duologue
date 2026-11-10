@@ -10,10 +10,12 @@ What a study of 45 similar tools taught us, checked against Codex 0.166.0 and Cl
 - **Messages typed while Claude works** reach Codex in the turn they joined.
 - **Undo and edits in Codex.** Rolled-back turns that had not synced are left out; when Claude
   already has them, the next Codex turns arrive with a note saying how many were undone.
-- **Rewound and compressed Codex threads.** A rewound thread blocks with that reason. A thread
-  Codex compressed while idle is written out again when Claude has turns for it, instead of
-  waiting until it is opened in Codex.
+- **Rewound and compressed Codex threads.** A rewound thread blocks with that reason, and `link`
+  will not copy its history. A thread Codex compressed while idle is written out again when
+  either side has turns to copy (and by `release` and `resolve`), instead of waiting until it
+  is opened in Codex. An archived thread is still left alone.
 - **Claude's session list** shows the last prompt from Codex.
+- **Task notifications** that reach Claude as prompts are not copied to Codex as the user's.
 - **Echo guard.** Records duologue wrote are recognised by a field (Claude) or their id (Codex)
   and never sent back, even if a cursor moves behind them.
 - **Checks before writing to Codex:** whole turns, and line numbers that continue Codex's own.

@@ -255,3 +255,44 @@ def test_the_structure_check_names_what_is_wrong():
     p = dict(lines[items[0]].payload, thread_id="01a1ab4d-0000-7000-8000-00000000000c")
     elsewhere[items[0]] = replace(lines[items[0]], payload=p)
     assert "another turn or thread" in check_turns(elsewhere, THREAD)[0]
+
+
+def test_a_rollout_codex_compressed_in_place_is_found_by_its_recorded_name(tmp_path: Path):
+    elsewhere = tmp_path / "elsewhere" / f"rollout-x-{THREAD}.jsonl"
+    elsewhere.parent.mkdir()
+    packed = elsewhere.with_name(elsewhere.name + ".zst")
+    packed.write_bytes(b"")
+    con = sqlite3.connect(tmp_path / "state_5.sqlite")
+    con.execute("create table threads (id text primary key, rollout_path text)")
+    con.execute("insert into threads values (?, ?)", (THREAD, str(elsewhere)))
+    con.commit()
+    con.close()
+    assert find_rollout(tmp_path, THREAD) == packed  # not under sessions/: no walk found it
+
+
+def test_a_rollback_ends_an_open_turn(tmp_path: Path):
+    x = CodexRollout(THREAD)
+    x.start("t1")
+    x.user_says("hello", "u1")
+    x.records.append(
+        {
+            "timestamp": "t",
+            "type": "event_msg",
+            "payload": {"type": "thread_rolled_back", "num_turns": 1},
+        }
+    )
+    path = write_rollout(tmp_path, THREAD, x.records)
+    from duologue.codex.threads import last_turn_open
+
+    assert not open_turn(read_lines(path)) and not last_turn_open(path)
+
+
+def test_syncing_starts_after_a_rollback_that_follows_the_last_turn(tmp_path: Path):
+    from duologue.engine import codex_start
+
+    rolled = {"type": "thread_rolled_back", "num_turns": 1}
+    path = write_rollout(
+        tmp_path, THREAD, [*one_turn(), {"timestamp": "t", "type": "event_msg", "payload": rolled}]
+    )
+    cur = codex_start(path)
+    assert cur.end == path.stat().st_size and cur.anchor == "turn-1"

@@ -19,8 +19,7 @@ from pathlib import Path
 
 from duologue.ids import require_id
 from duologue.jsonl import Line
-from duologue.translate.claude_to_codex import queued_prompt
-from duologue.translate.common import LOCAL_COMMAND
+from duologue.translate.common import LOCAL_COMMAND, queued_prompt
 
 PROJECTS = "projects"
 CHAIN_TYPES = ("user", "assistant", "attachment", "system")
@@ -148,10 +147,8 @@ def dangling_calls(messages: Iterable[dict]) -> tuple[str, ...]:
 
 
 def is_typed(record: dict) -> bool:
-    """A user message that asks something of Claude: not a tool result, meta record, compaction
-    summary or local command. A message queued while Claude was busy counts."""
-    if queued_prompt(record) is not None:
-        return True
+    """A user message that starts a turn of Claude's: not a tool result, meta record, compaction
+    summary or local command. (A message queued while Claude works joins the running turn.)"""
     if record.get("type") != "user" or record.get("isMeta") or record.get("isCompactSummary"):
         return False
     content = (record.get("message") or {}).get("content")
@@ -172,9 +169,10 @@ def settled(lines: Iterable[Line]) -> bool:
     last = None
     for ln in lines:
         r = ln.record
-        if not (is_message(r) or queued_prompt(r)):
+        queued = queued_prompt(r) is not None  # typed while Claude worked: it answers that too
+        if not (is_message(r) or queued):
             continue
-        if r.get("type") == "assistant" or is_typed(r) or _is_result(r):
+        if r.get("type") == "assistant" or is_typed(r) or queued or _is_result(r):
             last = r
     if last is None:
         return True  # nothing has happened in it yet

@@ -96,7 +96,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
 - **Codex's own importer** (`externalAgentConfig/import`) creates legacy, text-only threads. Its
   append mode refuses any thread with native turns.
 - **Compression.** Rollouts idle for 7 days are compressed to `.jsonl.zst`; `thread/resume` writes
-  one out plain. duologue resumes a compressed thread only when Claude has turns to add.
+  one out plain, and Codex keeps recording the plain name. duologue resumes a compressed thread
+  only when there is something to copy: Claude has turns to add, or Codex's index ends past the
+  cursor. Archived threads are never resumed.
 - **Managed developer instructions** reach a chat once, when it starts. Policy changes do not reach
   chats that are already running.
 

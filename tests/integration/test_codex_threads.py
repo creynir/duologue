@@ -530,3 +530,11 @@ class TestSharedDaemon:
         with pytest.raises(Wait, match="open in Codex"):
             append_turns(codex, THREAD, claude_lines(tmp_path), journal=MemoryJournal())
         assert "thread/archive" not in methods(daemon)
+
+
+def test_lines_that_are_not_whole_turns_are_refused_before_the_write(codex, thread, tmp_path):
+    lines = claude_lines(tmp_path)[:-1]  # the turn never ends
+    size = thread.stat().st_size
+    with pytest.raises(Blocked, match="structure check: the last turn does not end"):
+        append_turns(codex, THREAD, lines, journal=MemoryJournal())
+    assert thread.stat().st_size == size

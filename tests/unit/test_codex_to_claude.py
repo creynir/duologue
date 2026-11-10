@@ -10,8 +10,8 @@ from duologue.translate.codex_to_claude import (
     ClaudeStep,
     claude_records,
     codex_to_claude_steps,
+    codex_turns,
     parse_unified_diff,
-    undone_turns,
 )
 from duologue.translate.common import MARK
 from duologue.translate.outputs import OutputStore
@@ -277,6 +277,15 @@ def test_a_failed_edit_stays_an_error(store):
             {"/w/a.txt": {"type": "update", "unified_diff": "@@ -1,2 +1,2 @@\n-a\n"}},
             id="a cut-off diff",
         ),
+        pytest.param(
+            {
+                "/w/a.txt": {
+                    "type": "update",
+                    "unified_diff": "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+a\n",
+                }
+            },
+            id="a hunk whose text does not change",
+        ),
     ],
 )
 def test_other_file_changes_stay_one_apply_patch_call(store, changes):
@@ -293,8 +302,20 @@ def test_other_file_changes_stay_one_apply_patch_call(store, changes):
     assert not any(s.tool_use_result for s in steps)
 
 
+def test_a_large_edit_stays_a_patch(tmp_path):
+    small = OutputStore(tmp_path / "outputs", model_limit=10)
+    change = {"type": "update", "unified_diff": "@@ -1 +1 @@\n-" + "a" * 6 + "\n+" + "b" * 6 + "\n"}
+    x = CodexRollout()
+    x.start("t")
+    x.user_says("fix it", "u")
+    x.item({"type": "FileChange", "id": "f", "changes": {"/w/a": change}, "status": "completed"})
+    (use,) = tool_uses(steps_of(x, small))
+
+    assert use["name"] == "mcp__codex__apply_patch"
+
+
 def test_a_large_change_stays_a_patch(tmp_path):
-    small = OutputStore(tmp_path / "outputs", ui_limit=10)
+    small = OutputStore(tmp_path / "outputs", model_limit=10)
     change = {"type": "add", "content": "x" * 11}
     x = CodexRollout()
     x.start("t")
@@ -521,7 +542,7 @@ def test_turns_codex_rolled_back_are_left_out_and_counted(store, plan, kept, und
         rollback(x, step) if isinstance(step, int) else a_turn(x, step)
 
     assert said(steps_of(x, store)) == kept
-    assert undone_turns(x.records) == undone
+    assert codex_turns(x.records)[1] == undone
 
 
 def test_a_rollback_ends_the_turn_it_falls_in(store):
@@ -540,7 +561,7 @@ def test_setup_lines_before_the_first_turn_are_not_a_turn():
     x.records.append({"timestamp": "t", "type": "session_meta", "payload": {"id": "th-1"}})
     rollback(x, 1)
 
-    assert undone_turns(x.records) == 1
+    assert codex_turns(x.records)[1] == 1
 
 
 # ------------------------------------------------------------------------------ echo guard
@@ -609,3 +630,39 @@ def test_no_last_prompt_without_a_typed_message(store):
     rs = records_of(steps_of(x, store))
 
     assert all(r["type"] != "last-prompt" for r in rs)
+
+
+def test_a_change_result_survives_merging_with_the_next_prompt(store):
+    x = CodexRollout()
+    x.start("t1")
+    x.user_says("make it", "u1")
+    x.item(
+        {
+            "type": "FileChange",
+            "id": "f",
+            "changes": {"/w/new.py": {"type": "add", "content": "x = 1\n"}},
+            "status": "completed",
+        }
+    )
+    x._line("event_msg", {"type": "turn_aborted", "turn_id": "t1", "reason": "interrupted"})
+    x.start("t2")
+    x.user_says("go on", "u2")
+    x.agent_says("done", "a2")
+    x.complete("done")
+    rs = records_of(steps_of(x, store))
+    (result,) = [
+        r
+        for r in rs
+        if r["type"] == "user"
+        and any(b.get("type") == "tool_result" for b in r["message"]["content"])
+    ]
+
+    assert result["toolUseResult"]["type"] == "create"
+    assert any(b.get("text") == "go on" for b in result["message"]["content"])
+
+
+def test_a_form_feed_inside_a_line_does_not_end_the_hunk():
+    diff = "@@ -1,3 +1,3 @@\n-a = 1\n+a = 2\n \x0c\n-b = 1\n+b = 2\n"
+    (hunk,) = parse_unified_diff(diff)
+
+    assert hunk["lines"] == ["-a = 1", "+a = 2", " \x0c", "-b = 1", "+b = 2"]

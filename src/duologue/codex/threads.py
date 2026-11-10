@@ -35,6 +35,7 @@ from pathlib import Path
 from duologue.codex import lock
 from duologue.codex.history import HistoryIndex, read_index
 from duologue.codex.rollout import (
+    ROLLED_BACK,
     TURN_ENDS,
     find_rollout,
     history_mode,
@@ -414,7 +415,7 @@ def last_turn_open(path: Path) -> bool:
             continue
         if p.get("type") == "task_started":
             state = True
-        elif p.get("type") in TURN_ENDS:
+        elif p.get("type") in TURN_ENDS or p.get("type") == ROLLED_BACK:
             state = False
     return state
 

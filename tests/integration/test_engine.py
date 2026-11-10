@@ -1,5 +1,6 @@
 """Syncing pairs end to end against the fake codex and Claude transcripts in throwaway homes."""
 
+import gzip
 import json
 import subprocess
 import sys
@@ -835,9 +836,10 @@ def test_release_after_codex_took_nothing_copies_the_turn_again(pair, monkeypatc
 
 # ------------------------------------------------------------------ what Codex does to threads
 def compress(path: Path) -> Path:
-    """Codex compresses an idle thread's rollout (here only renamed; the fake reads it as is)."""
+    """Codex compresses an idle thread's rollout in place (gzip here: the fake reads it back)."""
     packed = path.with_name(path.name + ".zst")
-    path.rename(packed)
+    packed.write_bytes(gzip.compress(path.read_bytes()))
+    path.unlink()
     return packed
 
 
@@ -962,3 +964,145 @@ def test_a_codex_line_numbered_out_of_order_blocks_the_append(pair):
     outcome, _ = sync(pair.name)
     assert outcome.state == "blocked" and "Codex's index expects" in outcome.text
     assert pair.codex.path.stat().st_size == size
+
+
+# ------------------------------------------------------------- after the pre-merge review
+def test_an_undo_in_codex_with_nothing_after_it_conflicts_with_a_claude_turn(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    pair.codex.add([pair.codex.rollback(1)])  # undone in Codex, nothing sent yet
+    pair.claude.turn("in claude", "ok")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "conflict" and p.conflict
+
+
+def test_an_undo_in_codex_with_nothing_after_it_reaches_claude_with_the_next_turn(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    pair.codex.add([pair.codex.rollback(1)])
+    assert sync(pair.name)[0].state == "idle"  # nothing to show Claude yet
+    pair.codex.turn("two", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text
+    notes = json.dumps(pair.claude.records(), ensure_ascii=False).count("undone in Codex")
+    assert notes == 1
+
+
+def test_codex_turns_waiting_in_a_compressed_thread_still_reach_claude(pair):
+    pair.codex.turn("from codex", "ok")  # not synced before Codex compresses the thread
+    compress(pair.codex.path)
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    assert "from codex" in prompts(pair.claude.records())
+
+
+def test_an_archived_compressed_thread_is_left_alone(pair, homes, tmp_path, monkeypatch):
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    archived = homes.codex / "archived_sessions" / pair.codex.path.name
+    archived.parent.mkdir()
+    pair.codex.path.rename(archived)
+    compress(archived)
+    pair.claude.turn("second", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "archived" in outcome.text
+    assert "thread/resume" not in requests(log)
+
+
+def test_resolve_and_release_write_a_compressed_thread_out(pair):
+    pair.claude.turn("in claude", "ok")
+    pair.codex.turn("in codex", "ok")
+    assert sync(pair.name)[0].state == "conflict"
+    compress(pair.codex.path)
+    e = engine()
+    linking.resolve(e, e.pairs[pair.name], "codex")
+    assert pair.codex.path.exists()
+    compress(pair.codex.path)
+    e = engine()
+    e.pairs[pair.name].blocked = "for the test"
+    e.save()
+    assert "unblocked" in linking.release(e, e.pairs[pair.name])
+
+
+def test_a_waiting_pass_does_not_translate_codex_turns(pair, claude_running, monkeypatch):
+    from duologue import engine as engine_module
+
+    def refuse(*args, **kwargs):
+        raise AssertionError("translated while Claude has the session open")
+
+    monkeypatch.setattr(engine_module, "codex_to_claude_steps", refuse)
+    pair.codex.turn("from codex", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting", outcome.text
+
+
+def test_link_from_codex_leaves_out_turns_rolled_back_across_several(homes):
+    codex = CodexThread(homes.codex, homes.bin)
+    codex.turn("keep me", "ok")
+    codex.turn("withdrawn A", "ok")
+    codex.turn("withdrawn B", "ok")
+    codex.turn("edited", "ok", before=(codex.rollback(2),))
+    e = engine()
+    p, said = linking.link(e, claude=None, codex=THREAD, name=None, cwd=CWD)
+    asked = prompts([ln.record for ln in read_lines(find_transcript(homes.claude, p.claude))])
+    assert asked == ["hello", "keep me", "edited"]
+    assert "with 3 turn(s)" in said
+
+
+def test_link_from_a_rewound_codex_thread_is_refused(homes):
+    codex = CodexThread(homes.codex, homes.bin)
+    rewound = codex.path.with_name(
+        codex.path.name.replace(".jsonl", "_01a1ab4d-0000-7000-8000-000000000001.jsonl")
+    )
+    base = {"thread_id": THREAD, "end_ordinal_exclusive": 3}
+    meta = {"id": THREAD, "cwd": CWD, "history_mode": "paginated", "history_base": base}
+    first = {"timestamp": "2026-11-04T16:00:00.000Z", "type": "session_meta", "payload": meta}
+    rewound.write_text(json.dumps(dict(first, ordinal=3)) + "\n")
+    with pytest.raises(linking.LinkError, match="rewound"):
+        linking.link(engine(), claude=None, codex=THREAD, name=None, cwd=CWD)
+
+
+def test_link_from_claude_keeps_a_queued_message_in_its_turn(homes):
+    claude = Claude(homes.claude)
+    claude.t.user("build it")
+    claude.t.call("Bash", {"command": "make"}, "built")
+    claude.t.queued("and test it too")
+    claude.t.assistant("built and tested")
+    claude.save()
+    p, said = linking.link(engine(), claude=SESSION, codex=None, name="q", cwd=CWD)
+    assert "with 1 turn(s)" in said
+
+
+def test_a_compressed_thread_is_not_resumed_while_claude_is_still_working(
+    pair, claude_running, tmp_path, monkeypatch
+):
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    packed = compress(pair.codex.path)
+    pair.claude.t.user("still being answered")
+    pair.claude.save()
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "working" in outcome.text
+    assert packed.exists() and "thread/resume" not in requests(log)
+
+
+def test_a_compressed_thread_codex_did_not_write_out_waits(pair, monkeypatch):
+    monkeypatch.setenv("FAKE_CODEX_NO_EXPAND", "1")
+    compress(pair.codex.path)
+    pair.claude.turn("second", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "did not write it out" in outcome.text
+
+
+def test_records_duologue_wrote_stay_out_of_a_claude_turn_sent_after_them(pair):
+    size = pair.claude.path.stat().st_size
+    pair.codex.turn("from codex", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    turns = pair.codex.turn_ids()
+    rewind_cursor(pair.name, "claude", size)
+    pair.claude.turn("typed in claude", "ok")
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "synced", outcome.text
+    assert len(pair.codex.turn_ids()) == len(turns) + 1
+    said = [i["content"][0]["text"] for i in items(pair.codex.path) if i["type"] == "UserMessage"]
+    assert said.count("from codex") == 1 and said[-1] == "typed in claude"

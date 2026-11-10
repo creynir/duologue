@@ -78,10 +78,15 @@ def codex_to_claude_steps(
     return steps
 
 
-def undone_turns(records: Iterable[dict]) -> int:
-    """How many turns from before ``records`` Codex rolled back in them (edit and resend, undo):
-    turns the other side may already hold."""
-    return _turns(list(records))[1]
+def codex_turns(
+    records: Iterable[dict], *, skip_ours: bool = False
+) -> tuple[list[tuple[str, list[dict]]], int]:
+    """The turns in ``records`` that Codex still holds, as (turn id, records), without duologue's
+    own when ``skip_ours``; and how many turns from before ``records`` Codex rolled back in them
+    (edit and resend, undo): turns the other side may already hold."""
+    groups, undone = _turns(list(records))
+    kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and is_derived_id(k))]
+    return kept, undone
 
 
 def _turns(records: list[dict]) -> tuple[list[tuple[str, list[dict]]], int]:
@@ -433,6 +438,7 @@ def _alternate(seq: list[ClaudeStep]) -> list[ClaudeStep]:
                 list(prev.blocks) + list(s.blocks),
                 prev.timestamp or s.timestamp,
                 prev.key or s.key,
+                prev.tool_use_result or s.tool_use_result,
             )
         else:
             out.append(replace(s, blocks=list(s.blocks)))
@@ -472,7 +478,7 @@ def _native_edit(item: dict, outputs: OutputStore) -> tuple[str, dict, dict] | N
     kind = change.get("type")
     if kind == "add" and isinstance(change.get("content"), str):
         content = change["content"]
-        if len(content) > outputs.ui_limit:
+        if len(content) > outputs.model_limit:  # the model reads it: past this, a capped patch
             return None
         result = {
             "type": "create",
@@ -493,7 +499,7 @@ def _native_edit(item: dict, outputs: OutputStore) -> tuple[str, dict, dict] | N
     new = "\n".join(ln[1:] for ln in hunk["lines"] if ln[:1] in (" ", "+"))
     # An empty old string means "create the file" to Claude's Edit, so a bare insertion stays a
     # patch.
-    if not old or old == new or len(old) + len(new) > outputs.ui_limit:
+    if not old or old == new or len(old) + len(new) > outputs.model_limit:
         return None
     result = {
         "filePath": path,
@@ -514,7 +520,10 @@ def parse_unified_diff(text: str) -> list[dict]:
     a file header. Empty for a diff that does not add up."""
     hunks: list[dict] = []
     old_left = new_left = 0
-    for line in text.splitlines():
+    lines = text.split("\n")  # not splitlines(): a form feed or U+2028 is inside a line
+    if lines and lines[-1] == "":
+        lines.pop()
+    for line in lines:
         if old_left > 0 or new_left > 0:
             tag = line[:1] or " "  # a context line whose trailing space was trimmed
             if tag == "\\":

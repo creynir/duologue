@@ -113,7 +113,7 @@ without it.
 | Codex numbers every line of a paginated rollout. It continues from the last line's number, and its history index accepts only the next number. | codex-rs `rollout/src/ordinal.rs`, `thread-store/src/local/thread_history.rs`; ccswitchmulti | Before appending, the file's last ordinal must be the one before the index's next, or the pair blocks with both numbers. |
 | A thread rewound in Codex (`thread/revert`) continues in a new file, `rollout-<time>-<thread>_<rollout>.jsonl`, whose `session_meta` has `history_base` (thread and end ordinal). Codex's state database then points at it. | codex-rs `thread-store/src/local/revert_thread.rs`; codeg | Finds that file by name, and blocks with "rewound in Codex" instead of a generic message. `release` resumes from where the new file stands. |
 | Editing an earlier message or undoing in Codex appends `thread_rolled_back` with `num_turns`. Codex ends the open turn, then drops the last `num_turns` turns. | codex-rs `app-server-protocol/src/protocol/thread_history.rs` (`handle_thread_rollback`) | Turns rolled back before they synced never reach Claude. When turns Claude already has are rolled back, the lead note says how many. A Claude turn on top of a rollback is a conflict. |
-| Codex may keep a rollout compressed (`.jsonl.zst`), and writes it out plain when the thread is resumed. | codex-rs `rollout/src/recorder.rs`; checked with Codex 0.166.0 | A compressed thread stays compressed while Claude has nothing to add, and is resumed only when Claude does, instead of waiting until someone opens it in Codex. |
+| Codex may keep a rollout compressed (`.jsonl.zst`), and writes it out plain when the thread is resumed. | codex-rs `rollout/src/recorder.rs`; checked with Codex 0.166.0 | A compressed thread stays compressed while neither side has anything to copy (Codex's index ends at the cursor), and is resumed when one does, instead of waiting until someone opens it in Codex. Archived threads are left alone. |
 | A message typed while Claude works is stored as an `attachment` of type `queued_command` (`commandMode` "prompt", origin `human`) and folded into the running turn. Task notifications and messages from other agents (origin `peer`, marked `isMeta`) use the same record. | codeg; checked in about 1,000 such records written by Claude Code 2.1.220 to 2.1.316 | Travels to Codex as a second user message in the same turn, as Codex records a message sent mid-turn. Task notifications and other agents' messages do not. |
 | Claude's session list reads the first and last 64 KiB of a transcript. It shows the prompt in the last `last-prompt` line (`lastPrompt`, `leafUuid`, `sessionId`), cut to 200 characters. | mirkobrombin, FredrikAhman, Maxaccurate; checked in transcripts Claude Code wrote | Every append from Codex ends with a `last-prompt` line naming the last message typed in Codex. |
 | The Claude app draws a diff from the result record of its own `Edit` and `Write` tools (`structuredPatch`, `oldString`, `newString`). | tandem, opal-bridge; the fields checked in records Claude Code wrote | A Codex change to one file becomes Claude's own `Write` (new file) or `Edit` (one hunk) with that record. Anything else stays one `apply_patch` call. Claude Code 2.1.318 resumes a session holding them (an end-to-end test). |
@@ -163,6 +163,14 @@ without it.
 - **Re-rendering whole files.** It destroys turns added on the other side (opal-bridge and
   pass-the-thread both added guards after losing messages).
 - **Turn counts as cursors.** They go wrong after compaction or an edit.
+
+## Known trade-offs
+
+- **Claude Code treats a file it sees in a native `Edit` or `Write` as read.** When it resumes a
+  session, Claude Code 2.1.318 seeds its read-before-write check from those records, so after a
+  Codex change arrives as `Edit`, Claude may overwrite that file without reading it first. Claude
+  Code's own edits do the same; the lead note asks Claude to check the repository first. We keep
+  the native records for the diff they show.
 
 ## Open questions
 

@@ -24,6 +24,7 @@ from duologue.translate.common import (
     ORIGIN,
     epoch_ms,
     is_note,
+    queued_prompt,
     stable_id,
     text_of,
     tool_result_text,
@@ -47,33 +48,6 @@ class RolloutLine:
     type: str  # "event_msg" or "response_item"
     ms: int  # epoch milliseconds, the line's timestamp
     payload: dict
-
-
-def queued_prompt(record: dict) -> dict | None:
-    """A message the user typed while Claude was busy, as a user record. Claude Code stores it
-    as an ``attachment`` of type ``queued_command`` (``commandMode`` "prompt", a human origin)
-    and folds it into the running turn. Other queued commands are not the user's: task
-    notifications, and messages from other agents (a ``peer`` origin, marked ``isMeta``)."""
-    if record.get("type") != "attachment" or record.get("isSidechain"):
-        return None
-    a = record.get("attachment")
-    if not isinstance(a, dict) or a.get("type") != "queued_command":
-        return None
-    if a.get("commandMode") != "prompt" or a.get("isMeta"):
-        return None
-    origin = a.get("origin")
-    if not (a.get("humanTurn") or (isinstance(origin, dict) and origin.get("kind") == "human")):
-        return None
-    prompt = a.get("prompt")
-    blocks = [{"type": "text", "text": prompt}] if isinstance(prompt, str) else prompt
-    if not isinstance(blocks, list) or not text_of(blocks).strip():
-        return None
-    return {
-        **record,
-        "type": "user",
-        "message": {"role": "user", "content": blocks},
-        "queued": True,
-    }
 
 
 def conversation(records: Iterable[dict], skip_ours: bool = False) -> list[dict]:
@@ -103,13 +77,17 @@ def conversation(records: Iterable[dict], skip_ours: bool = False) -> list[dict]
 
 
 def is_user_input(record: dict) -> bool:
-    """A message the user typed: not a tool result, meta record, summary or duologue note."""
+    """A message the user typed: not a tool result, meta record, summary, duologue note, or a
+    prompt Claude Code made (``origin`` other than human, such as a task notification)."""
     if record.get("type") != "user" or record.get("isSidechain"):
         return False
     if record.get("isMeta") or record.get("isCompactSummary"):
         return False
     if _is_local_command(record):
         return False
+    origin = record.get("origin")
+    if isinstance(origin, dict) and origin.get("kind") not in (None, "human"):
+        return False  # Claude Code's own prompts, such as task notifications: not the user's words
     content = (record.get("message") or {}).get("content")
     if isinstance(content, str):
         return bool(content.strip()) and not is_note(content)

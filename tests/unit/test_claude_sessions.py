@@ -156,7 +156,7 @@ def test_a_queued_message_waits_for_its_answer(tmp_path: Path):
     assert settled(read_lines(write(tmp_path, c.records)))
     c.queued("one more thing")
     assert not settled(read_lines(write(tmp_path, c.records)))
-    assert is_typed(c.records[-1])
+    assert not is_typed(c.records[-1])  # it joins the running turn, it does not start one
     c.assistant("done too")
     assert settled(read_lines(write(tmp_path, c.records)))
     c.queued("<task-notification>x</task-notification>", mode="task-notification", human=False)
@@ -679,3 +679,20 @@ def test_create_session(tmp_path: Path):
     assert records[0]["parentUuid"] is None
     assert oct(done.path.stat().st_mode & 0o777) == "0o600"
     assert journal.intent.base == 0
+
+
+def test_syncing_a_running_turn_starts_at_its_prompt_not_a_queued_message(tmp_path: Path):
+    from duologue.engine import claude_start
+
+    c = ClaudeTranscript()
+    c.user("done before")
+    c.assistant("ok")
+    c.user("refactor the parser")
+    c.call("Bash", {"command": "ls"}, "a.py")
+    c.queued("and add tests too")
+    running = c.assistant([{"type": "tool_use", "id": "toolu_9", "name": "Bash", "input": {}}])
+    running["message"]["stop_reason"] = "tool_use"  # Claude is still at work
+    path = write(tmp_path, c.records)
+    lines = read_lines(path)
+    assert not settled(lines)
+    assert claude_start(path).end == lines[1].end  # just before "refactor the parser"

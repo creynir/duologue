@@ -91,11 +91,11 @@ def test_doctor_looks_at_each_pairs_files(linked, capsys, monkeypatch):
     main(["doctor"])
     out = capsys.readouterr().out
     assert 'pair "work": the Claude transcript is 0.0 MiB; above 5 MiB' in out
-    assert "it catches up when the thread is next opened" in out
+    assert '    pair "work": Codex has indexed' in out  # a note, not a problem
     data = codex.path.read_bytes()
     codex.path.write_bytes(data[:200])  # shorter than what Codex indexed
     main(["doctor"])
-    assert "past the end of its file (200 bytes)" in capsys.readouterr().out
+    assert 'NO  pair "work": Codex\'s index of the thread ends at byte' in capsys.readouterr().out
 
 
 def test_a_wait_is_one_line_not_a_traceback(linked, capsys, monkeypatch):

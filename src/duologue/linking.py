@@ -20,7 +20,14 @@ from typing import TypeVar
 from duologue.claude import sessions as claude_sessions
 from duologue.claude.transcript import PROJECTS, find_transcript, is_message, project_folder
 from duologue.codex import threads as codex_threads
-from duologue.codex.rollout import SESSIONS, is_compressed, session_meta, turn_ends, uuid7
+from duologue.codex.rollout import (
+    SESSIONS,
+    batch_end,
+    is_compressed,
+    session_meta,
+    turn_ends,
+    uuid7,
+)
 from duologue.codex.threads import last_turn_open
 from duologue.engine import (
     Engine,
@@ -42,7 +49,12 @@ from duologue.translate.claude_to_codex import (
     is_user_input,
     note_turn,
 )
-from duologue.translate.codex_to_claude import ClaudeStep, claude_records, codex_to_claude_steps
+from duologue.translate.codex_to_claude import (
+    ClaudeStep,
+    claude_records,
+    codex_to_claude_steps,
+    codex_turns,
+)
 from duologue.translate.common import text_of
 
 NAME = re.compile(r"[^\x00-\x1f\x7f]{1,80}")
@@ -190,12 +202,20 @@ def _codex_from_claude(engine: Engine, claude: str, name: str | None) -> tuple[P
 
 def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pair, str]:
     xpath = engine.codex_path(Pair(name="", claude="", codex=codex))
+    if session_meta(xpath).get("history_base"):
+        # Its earlier turns are in the file it was rewound from; copying only the rest would
+        # look like the whole conversation.
+        raise LinkError(
+            "the Codex thread was rewound in Codex, and duologue cannot copy its history yet; "
+            "link it to an existing Claude session instead"
+        )
     lines = read_lines(xpath)
     ends = turn_ends(lines)
     if not ends:
         raise LinkError("the Codex thread has no finished turn to copy yet")
-    finished = [ln for ln in lines if ln.end <= ends[-1][1]]
-    groups = _rollout_turns(finished)
+    finished = [ln for ln in lines if ln.end <= batch_end(lines)]
+    # The turns Codex still holds: a rollback drops earlier turns, as Codex rebuilds the thread.
+    groups = [g for _, g in codex_turns([ln.record for ln in finished])[0]]
     cwd = session_meta(xpath).get("cwd") or os.getcwd()
     session_id = str(uuid.uuid4())
     pair = Pair(
@@ -420,25 +440,11 @@ def _claude_turns(records: list[dict]) -> list[list[dict]]:
     first prompt make a part of their own)."""
     parts: list[list[dict]] = []
     for r in conversation(records):
-        if is_user_input(r) or not parts:
+        # A message queued while Claude worked joins the running turn, as it does in sync.
+        if (is_user_input(r) and not r.get("queued")) or not parts:
             parts.append([])
         parts[-1].append(r)
     return parts
-
-
-def _rollout_turns(lines: list[Line]) -> list[list[dict]]:
-    groups: list[list[dict]] = []
-    for ln in lines:
-        p = ln.record.get("payload")
-        if (
-            ln.record.get("type") == "event_msg"
-            and isinstance(p, dict)
-            and p.get("type") == "task_started"
-        ):
-            groups.append([])
-        if groups:
-            groups[-1].append(ln.record)
-    return groups
 
 
 def _model_size(turn: list[RolloutLine]) -> int:

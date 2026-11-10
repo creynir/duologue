@@ -119,3 +119,30 @@ def is_codex_noise(text: str) -> bool:
     """Text Codex put in a user-role message that the user did not type, or one of our notes."""
     s = text.strip()
     return not s or s.startswith(CODEX_INJECTED) or is_note(s) or CODEX_IMPORT_SENTINEL in s
+
+
+def queued_prompt(record: dict) -> dict | None:
+    """A message the user typed while Claude was busy, as a user record. Claude Code stores it
+    as an ``attachment`` of type ``queued_command`` (``commandMode`` "prompt", a human origin)
+    and folds it into the running turn. Other queued commands are not the user's: task
+    notifications, and messages from other agents (a ``peer`` origin, marked ``isMeta``)."""
+    if record.get("type") != "attachment" or record.get("isSidechain"):
+        return None
+    a = record.get("attachment")
+    if not isinstance(a, dict) or a.get("type") != "queued_command":
+        return None
+    if a.get("commandMode") != "prompt" or a.get("isMeta"):
+        return None
+    origin = a.get("origin")
+    if not (a.get("humanTurn") or (isinstance(origin, dict) and origin.get("kind") == "human")):
+        return None
+    prompt = a.get("prompt")
+    blocks = [{"type": "text", "text": prompt}] if isinstance(prompt, str) else prompt
+    if not isinstance(blocks, list) or not text_of(blocks).strip():
+        return None
+    return {
+        **record,
+        "type": "user",
+        "message": {"role": "user", "content": blocks},
+        "queued": True,
+    }
