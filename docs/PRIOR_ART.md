@@ -172,6 +172,10 @@ without it.
   Code's own edits do the same; the lead note asks Claude to check the repository first. We keep
   the native records for the diff they show.
 
+- **A cursor that stops after an undo is anchored on that undo.** If Codex later converts a
+  legacy thread, the conversion drops undo lines (codex-rs `rollout_migration/rollback_plan.rs`),
+  so the anchor is not found and the pair blocks until `release`.
+
 ## Open questions
 
 - pass-the-thread reports that the Claude desktop app may rewrite a transcript when it opens it.

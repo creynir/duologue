@@ -15,7 +15,7 @@ from duologue import config, gate, linking
 from duologue.claude.transcript import find_transcript, project_folder
 from duologue.codex.threads import Codex, resume
 from duologue.engine import Engine
-from duologue.journal import Blocked
+from duologue.journal import Blocked, Wait
 from duologue.jsonl import encode, read_lines
 from duologue.pairs import ActivityLog, Store
 from duologue.translate.common import MARK
@@ -891,7 +891,7 @@ def test_a_codex_rollback_of_synced_turns_is_told_to_claude(pair):
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced", outcome.text
     texts = json.dumps(pair.claude.records()[-6:], ensure_ascii=False)
-    assert "the last 1 turn(s) of the conversation were undone in Codex" in texts
+    assert 'before this, the turn(s) that began \\"one\\" were undone in Codex' in texts
     assert prompts(pair.claude.records())[-1] == "one, edited"
 
 
@@ -984,7 +984,7 @@ def test_an_undo_in_codex_with_nothing_after_it_is_told_to_claude_once(pair):
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced" and "Codex undid 1 turn(s)" in outcome.text
     said = json.dumps(pair.claude.records()[-3:], ensure_ascii=False)
-    assert "the last 1 turn(s) of the conversation were undone" in said
+    assert 'in Codex, the turn(s) that began \\"one\\" were undone' in said
     pair.codex.turn("two", "ok")
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced" and "copied 1 Codex turn(s)" in outcome.text
@@ -1211,3 +1211,69 @@ def test_codex_turns_in_a_compressed_thread_reach_claude_whatever_the_codex_form
     outcome, _ = sync(pair.name)
     assert outcome.state == "synced", outcome.text
     assert "from codex" in prompts(pair.claude.records())
+
+
+# -------------------------------------------------------- after the third review round
+def test_an_undo_told_after_a_kept_codex_side_names_the_turn_codex_undid(pair):
+    an_undo_conflict(pair)  # "one" synced, undone in Codex, then "in claude" typed in Claude
+    e = engine()
+    linking.resolve(e, e.pairs[pair.name], "codex")
+    assert sync(pair.name)[0].state == "synced"
+    last = json.dumps(pair.claude.records()[-3:], ensure_ascii=False)
+    assert 'began \\"one\\"' in last and "in claude" not in last
+
+
+def test_an_edit_and_resend_arrives_in_one_piece(pair):
+    pair.codex.turn("one", "ok")
+    assert sync(pair.name)[0].state == "synced"
+    started = {"type": "task_started", "turn_id": "codex-edited", "started_at": 1}
+    pair.codex.add(  # the undo, then the edited turn still running
+        [
+            pair.codex.rollback(1),
+            {"timestamp": "2026-11-04T15:00:01.000Z", "type": "event_msg", "payload": started},
+        ]
+    )
+    outcome, _ = sync(pair.name)
+    assert outcome.state == "waiting" and "running after an undo" in outcome.text
+    assert "nothing else" not in json.dumps(pair.claude.records(), ensure_ascii=False)
+
+
+def test_a_write_codex_indexed_whole_settles_although_the_thread_is_compressed(pair, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+    real = threads.finish
+    crash_in(monkeypatch, threads, "finish")  # written, then the pass stops before confirming
+    with pytest.raises(Crash):
+        sync(pair.name)
+    monkeypatch.setattr(threads, "finish", real)  # not undo(): that drops the test's homes too
+    resume(pair.codex.codex, THREAD)  # Codex indexes it (as when the thread is opened)
+    compress(pair.codex.path)
+    outcome, p = sync(pair.name)
+    assert p.pending is None, outcome.text
+    assert outcome.state in ("idle", "synced"), outcome.text
+
+
+def test_release_will_not_have_codex_index_an_unsettled_write(pair, tmp_path, monkeypatch):
+    from duologue.codex import threads
+
+    pair.claude.turn("second", "ok")
+
+    def torn(path, intent):  # half the lines land, then duologue stops
+        with open(path, "ab") as fh:
+            fh.write(intent.data[: len(intent.data) // 2])
+        raise Crash
+
+    monkeypatch.setattr(threads, "_write", torn)
+    with pytest.raises(Crash):
+        sync(pair.name)
+    e = engine()
+    e.journal_file(e.pairs[pair.name]).unlink()  # and its record of the write is lost
+    assert sync(pair.name)[0].state == "blocked"
+    log = tmp_path / "requests.log"
+    monkeypatch.setenv("FAKE_CODEX_LOG", str(log))
+    packed = compress(pair.codex.path)
+    e = engine()
+    with pytest.raises(Wait, match="not settled"):
+        linking.release(e, e.pairs[pair.name])
+    assert packed.exists() and "thread/resume" not in requests(log)

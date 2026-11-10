@@ -42,13 +42,13 @@ UNANSWERED_NOTE = (
 )
 NOT_RECORDED = "(tool result not recorded)"
 UNDONE_NOTE = (
-    "before this, the last {n} turn(s) of the conversation were undone in Codex (the user edited "
-    "or rolled back there): treat them as withdrawn."
+    "before this, {what} were undone in Codex (the user edited or rolled back there): treat them "
+    "as withdrawn."
 )
 UNDONE_ONLY_NOTE = (
-    "in Codex, the last {n} turn(s) of the conversation were undone (the user edited or rolled "
-    "back there): treat them as withdrawn."
+    "in Codex, {what} were undone (the user edited or rolled back there): treat them as withdrawn."
 )
+PROMPT_CHARS = 80  # of each undone turn's prompt, to say which turns
 NOTHING_ELSE_NOTE = "noted; nothing else has happened in Codex since."
 LAST_PROMPT_CHARS = 200  # Claude Code cuts the prompt its session list shows to this
 SKIPPED_ITEMS = (
@@ -89,6 +89,33 @@ def undone_steps(n: int, ref: str, timestamp: str | None) -> list[ClaudeStep]:
     this reply. ``ref`` identifies the rollback, for the records' ids."""
     text = f"[{MARK}: {NOTHING_ELSE_NOTE}]"
     return [ClaudeStep("assistant", [{"type": "text", "text": text}], timestamp, f"undo:{ref}")]
+
+
+def undone_what(records_before: Iterable[dict], n: int) -> str:
+    """Which turns an undo of ``n`` took back, for the notes: the prompts that began the last
+    ``n`` turns Codex held in ``records_before`` (the thread up to the cursor), quoted. "The last
+    n turns" alone would point at the wrong ones once Claude has turns of its own after them."""
+    groups = codex_turns(records_before)[0][-n:] if n > 0 else []
+    prompts = [p for p in (_turn_prompt(g) for _, g in groups) if p]
+    if not prompts or len(groups) < n:
+        return f"the last {n} turn(s) of the conversation Codex held"
+    return "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
+
+
+def _turn_prompt(group: list[dict]) -> str:
+    for r in group:
+        p = _payload(r)
+        if r.get("type") != "event_msg":
+            continue
+        text = ""
+        if p.get("type") == "item_completed" and (p.get("item") or {}).get("type") == "UserMessage":
+            text = _item_text(p["item"])
+        elif p.get("type") == "user_message":
+            text = str(p.get("message") or "")
+        if text and not is_codex_noise(text):
+            line = " ".join(text.split())
+            return line if len(line) <= PROMPT_CHARS else line[:PROMPT_CHARS] + "\u2026"
+    return ""
 
 
 def codex_turns(

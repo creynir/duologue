@@ -39,6 +39,7 @@ from duologue.codex.rollout import (
     batch_end,
     is_archived,
     is_compressed,
+    open_turn,
     session_meta,
 )
 from duologue.codex.rpc import AppServerError, daemon_running
@@ -58,6 +59,7 @@ from duologue.translate.codex_to_claude import (
     codex_to_claude_steps,
     codex_turns,
     undone_steps,
+    undone_what,
 )
 from duologue.translate.outputs import OutputStore
 
@@ -159,6 +161,9 @@ class Engine:
                     "the Claude session is open; Codex's turns are copied to it once it closes"
                 )
             steps, undone = self.codex_part(pair, xlines)
+            if not steps and undone and open_turn(xall):
+                # An edit and resend: the edited turn is running. Both travel once it ends.
+                raise Wait("a Codex turn is running after an undo; both are copied once it ends")
             if steps or undone:
                 return self.to_claude(pair, cpath, xlines, steps, csize, live, undone)
         pair.seen = seen
@@ -203,11 +208,12 @@ class Engine:
         undone: int = 0,
     ) -> Outcome:
         t = tail(iter_lines(cpath))
-        lead, extra = LEAD_NOTE, UNDONE_NOTE.format(n=undone) if undone else ""
+        what = self.undone_what(pair, undone) if undone else ""
+        lead, extra = LEAD_NOTE, UNDONE_NOTE.format(what=what) if undone else ""
         if not steps:  # Codex only undid turns Claude holds: say so
             last = xlines[-1]
             steps = undone_steps(undone, f"{last.end}:{last.record.get('timestamp')}", None)
-            lead, extra = UNDONE_ONLY_NOTE.format(n=undone), ""
+            lead, extra = UNDONE_ONLY_NOTE.format(what=what), ""
         records = claude_records(
             steps,
             session_id=pair.claude,
@@ -424,15 +430,22 @@ class Engine:
         resumed). An archived thread is left alone, as every write to Codex leaves it."""
         if is_archived(self.codex.home, xpath):
             raise Wait("the thread is archived in Codex; it syncs again once it is unarchived")
-        if pair.pending and pair.pending.side == "codex":
-            # Codex would index whatever of that write landed before duologue could look at it.
-            raise Wait("Codex compressed the thread while a write to it was not settled")
+        p = pair.pending
+        if p and p.side == "codex":
+            if not self.codex.index(pair.codex).holds(tuple(p.ids), p.base + p.length):
+                # Codex would index whatever of that write landed before duologue looked at it.
+                raise Wait("Codex compressed the thread while a write to it was not settled")
         codex_threads.resume(self.codex, pair.codex)
         xpath = self.codex_file(pair)
         if is_compressed(xpath):
             raise Wait("Codex compressed the idle thread and did not write it out again")
         self.log.write(pair.name, "expand", "Codex wrote the compressed thread out again")
         return xpath
+
+    def undone_what(self, pair: Pair, n: int) -> str:
+        """Which turns before the cursor an undo of ``n`` took back (read only when one did)."""
+        before = read_lines(self.codex_path(pair), 0, pair.codex_cursor.end)
+        return undone_what([ln.record for ln in before], n)
 
     def codex_part(self, pair: Pair, xlines: list[Line]) -> tuple[list[ClaudeStep], int]:
         """The steps for Codex's new turns (never the ones duologue wrote), and how many earlier
