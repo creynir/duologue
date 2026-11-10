@@ -84,7 +84,7 @@ def _is_claude_code(words: list[str]) -> bool:
     if program == "claude":
         return True
     return program in ("node", "bun") and any(
-        "claude-code" in w and w.endswith(".js") for w in words[1:3]
+        "claude-code" in w and os.path.basename(w) == "cli.js" for w in words[1:3]
     )
 
 

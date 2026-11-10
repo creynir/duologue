@@ -726,3 +726,5 @@ def test_node_running_claude_code_counts():
     words = ["node", "/usr/lib/node_modules/@anthropic-ai/claude-code/cli.js", "--resume", SESSION]
     assert live._is_claude_code(words) and live._resumes(words, SESSION)
     assert not live._is_claude_code(["/bin/zsh", "-c", f"claude --resume {SESSION}"])
+    helper = ["node", "/opt/claude-code-helper.js", "--resume", SESSION]
+    assert not live._is_claude_code(helper)  # another script, not Claude Code's cli.js
