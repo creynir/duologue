@@ -52,14 +52,14 @@ class RolloutLine:
 def queued_prompt(record: dict) -> dict | None:
     """A message the user typed while Claude was busy, as a user record. Claude Code stores it
     as an ``attachment`` of type ``queued_command`` (``commandMode`` "prompt", a human origin)
-    and folds it into the running turn; other queued commands (task notifications) are not the
-    user's."""
+    and folds it into the running turn. Other queued commands are not the user's: task
+    notifications, and messages from other agents (a ``peer`` origin, marked ``isMeta``)."""
     if record.get("type") != "attachment" or record.get("isSidechain"):
         return None
     a = record.get("attachment")
     if not isinstance(a, dict) or a.get("type") != "queued_command":
         return None
-    if a.get("commandMode") != "prompt":
+    if a.get("commandMode") != "prompt" or a.get("isMeta"):
         return None
     origin = a.get("origin")
     if not (a.get("humanTurn") or (isinstance(origin, dict) and origin.get("kind") == "human")):

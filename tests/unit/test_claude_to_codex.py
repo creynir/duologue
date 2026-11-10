@@ -459,6 +459,23 @@ def test_a_queued_message_with_no_turn_running_opens_one(store):
     assert items(lines)[0]["content"][0]["text"] == "a fresh request"
 
 
+def test_a_message_from_another_agent_is_left_out(store):
+    from duologue.translate.claude_to_codex import has_content
+
+    t = ClaudeTranscript()
+    t.user("start")
+    peer = t.queued("<cross-session-message>hi</cross-session-message>")
+    # As Claude Code 2.1.3xx records a message another session sent over its socket.
+    peer["attachment"].update(origin={"kind": "peer", "from": "uds:/tmp/x.sock"}, isMeta=True)
+    del peer["attachment"]["humanTurn"]
+    t.assistant("ok")
+
+    assert "cross-session" not in json.dumps([ln.payload for ln in translate(t.records, store)])
+    assert not has_content([peer])
+    peer["attachment"]["origin"] = {"kind": "human"}  # marked isMeta all the same
+    assert not has_content([peer])
+
+
 @pytest.mark.parametrize(
     "mode, human", [("task-notification", False), ("task-notification", True), ("prompt", False)]
 )
