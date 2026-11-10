@@ -287,7 +287,12 @@ class AutoState:
             return {k: v for k, v in value.items() if fits(v)} if isinstance(value, dict) else {}
 
         def stamped(v) -> bool:
-            return isinstance(v, list) and len(v) >= 3 and all(isinstance(x, int) for x in v[:2])
+            return (
+                isinstance(v, list)
+                and len(v) == 3
+                and all(isinstance(x, int) for x in v[:2])
+                and isinstance(v[2], str)
+            )
 
         def tried(v) -> bool:
             return isinstance(v, list) and len(v) >= 2 and isinstance(v[0], int | float)

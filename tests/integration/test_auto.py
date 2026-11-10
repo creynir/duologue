@@ -752,7 +752,7 @@ def test_auto_json_that_cannot_be_written_does_not_stop_the_pairs(both, monkeypa
 
     monkeypatch.setattr(State, "save", full)
     code, out = run("sync")
-    assert "copied 1 Claude turn(s) to Codex" in out, out
+    assert code == 1 and "copied 1 Claude turn(s) to Codex" in out, out
     assert "nothing paired by itself" in capsys.readouterr().err
 
 

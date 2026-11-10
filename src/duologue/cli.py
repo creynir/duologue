@@ -160,7 +160,7 @@ def cmd_sync(args) -> int:
             try:
                 for line in auto.link_new(e):
                     print(line)
-            except (AutoStateError, OSError) as err:  # the pairs still sync; status says so
+            except (AutoStateError, OSError) as err:  # the pairs still sync
                 failed = True
                 if not args.quiet:
                     print(f"duologue sync: nothing paired by itself: {err}", file=sys.stderr)

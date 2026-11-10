@@ -281,7 +281,7 @@ def test_auto_json_entries_that_are_not_well_formed_are_dropped(tmp_path: Path):
         json.dumps(
             {
                 "ignored": ["a"],
-                "passed": {"/p": 5, "/q": [1, 2, "why"]},
+                "passed": {"/p": 5, "/q": [1, 2, "why"], "/s": [1, 2, 3]},
                 "failed": {"/r": "soon"},
                 "waiting": {"x": 1},
                 "from_the_future": {"k": 1},

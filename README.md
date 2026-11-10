@@ -50,9 +50,10 @@ Left out: scripted runs (`claude -p`, the Agent SDK, `codex exec`) unless `auto_
 Claude sessions that continue in another session, Codex subagent threads, threads rewound in
 Codex, archived threads, threads Codex compressed while idle (until you open them again),
 conversations whose folder is gone, ones with nothing typed or no finished turn yet, and pairs you
-unlinked. When a conversation has been deleted for an hour,
-its pair goes, and the other side is paired again only once you carry on in it. To pair only what
-you choose, set `auto = false` and link by hand, in the folder you work in:
+unlinked. When a conversation has been deleted for an hour (while its app's folder of
+conversations is there; a folder that is not, such as an unmounted drive, blocks the pair
+instead), its pair goes, and the other side is paired again only once you carry on in it. To pair
+only what you choose, set `auto = false` and link by hand, in the folder you work in:
 
 ```sh
 duologue link --claude last --codex last   # pair the newest Claude session and Codex thread here
