@@ -32,6 +32,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 
+from duologue.claude import desktop
 from duologue.claude import sessions as claude_sessions
 from duologue.claude.live import live_pid
 from duologue.claude.transcript import PROJECTS, find_transcript, is_typed, settled, tail
@@ -78,7 +79,7 @@ from duologue.translate.codex_to_claude import (
     undone_held,
     undone_steps,
 )
-from duologue.translate.common import from_claude
+from duologue.translate.common import epoch_ms, from_claude
 from duologue.translate.outputs import OutputStore
 
 ALONGSIDE_CODEX = (
@@ -125,6 +126,7 @@ class Engine:
         conversations was deleted is removed."""
         before = pair.to_dict()
         try:
+            self.desktop(pair)
             try:  # every pair: a held or blocked one goes too once its conversation is gone
                 self.claude_path(pair), self.codex_file(pair)
                 pair.gone_since = None
@@ -161,6 +163,73 @@ class Engine:
         if pair.to_dict() != before:
             self.save()
         return outcome
+
+    # --------------------------------------------------------------------- the desktop app
+    def desktop(self, pair: Pair) -> None:
+        """List a Claude session duologue created in the Claude desktop app, and follow the
+        session when the app goes on with it in a copy. A card that cannot be written is
+        logged and not tried again: it is not needed to sync."""
+        folder = self.config.claude_desktop if self.config.desktop_cards else None
+        if folder is None or pair.pending:
+            return
+        if pair.card_wanted and not pair.card:
+            pair.card_wanted = False
+            try:
+                card = self._write_card(pair, folder)
+            except (Blocked, OSError) as e:
+                self.log.write(pair.name, "error", f"the desktop app's card was not written: {e}")
+                return
+            if card is not None:
+                pair.card = card.id
+                self.log.write(
+                    pair.name,
+                    "desktop",
+                    "listed in the Claude desktop app (it shows the next time the app starts)",
+                )
+            return
+        if pair.card:
+            card = desktop.find(folder, pair.card)
+            if card is not None and card.session and card.session != pair.claude:
+                self.follow(pair, card.session)
+
+    def _write_card(self, pair: Pair, folder: Path):
+        cpath = self.claude_path(pair)
+        records = [ln.record for ln in iter_lines(cpath)]
+        stamps = [ms for ms in (epoch_ms(r.get("timestamp")) for r in records) if ms]
+        now = int(time.time() * 1000)
+        return desktop.write_card(
+            folder,
+            session_id=pair.claude,
+            cwd=tail(iter_lines(cpath)).cwd,
+            title=pair.name,
+            created_ms=min(stamps, default=now),
+            last_ms=max(stamps, default=now),
+            turns=sum(1 for r in records if is_typed(r)),
+        )
+
+    def follow(self, pair: Pair, session: str) -> None:
+        """The desktop app goes on with the pair's Claude session in a copy (``session``), which
+        holds the same records: the pair follows it from the point already synced."""
+        cpath = find_transcript(self.config.claude_home, session)
+        if cpath is None:
+            return  # not written yet: next pass
+        anchor = pair.claude_cursor.anchor
+        ends = (ln.end for ln in iter_lines(cpath) if anchor and ln.record.get("uuid") == anchor)
+        end = next(ends, None)
+        if end is None:
+            raise Blocked(
+                "the Claude desktop app went on with the session in a copy that lacks the point "
+                "already synced; check both, then run duologue release"
+            )
+        old = pair.claude
+        pair.claude = session
+        pair.claude_cursor = Cursor(end, prefix_hash(cpath, end), anchor)
+        pair.seen, pair.checked = [], {}
+        self.log.write(
+            pair.name,
+            "desktop",
+            f"the Claude desktop app goes on with session {old} in {session}; the pair follows",
+        )
 
     def retire(self, pair: Pair, gone: Gone) -> Outcome:
         """Remove a pair one of whose conversations has been gone for :data:`GONE_AFTER`. The

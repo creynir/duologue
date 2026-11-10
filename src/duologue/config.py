@@ -17,6 +17,8 @@ optional::
     auto_days = 7                  # ... ones that changed within this many days
     auto_scripted = false          # ... and scripted runs (claude -p, the Agent SDK, codex exec)
     on_conflict = "keep-both"      # after you wrote in both apps; "stop" waits for resolve
+    desktop_cards = true           # list the Claude sessions duologue creates in the desktop app
+    claude_desktop_dir = "~/Library/Application Support/Claude"   # the desktop app's folder
 """
 
 from __future__ import annotations
@@ -27,6 +29,8 @@ import tomllib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from duologue.claude.desktop import default_folder as default_desktop_folder
 
 
 class ConfigError(Exception):
@@ -49,6 +53,8 @@ class Config:
     auto_days: float = 7.0
     auto_scripted: bool = False
     on_conflict: str = "keep-both"
+    desktop_cards: bool = True
+    claude_desktop: Path | None = None  # the Claude desktop app's folder; None: no app here
 
     @property
     def config_file(self) -> Path:
@@ -89,6 +95,8 @@ _TYPES: dict[str, tuple[type, ...]] = {
     "auto_days": (int, float),
     "auto_scripted": (bool,),
     "on_conflict": (str,),
+    "desktop_cards": (bool,),
+    "claude_desktop_dir": (str,),
 }
 CONFLICT_POLICIES = ("keep-both", "stop")
 
@@ -99,6 +107,8 @@ def load(env: Mapping[str, str] | None = None) -> Config:
     data = _read(home / "config.toml")
     claude_home = data.get("claude_home") or env.get("CLAUDE_CONFIG_DIR") or "~/.claude"
     codex_home = data.get("codex_home") or env.get("CODEX_HOME") or "~/.codex"
+    desktop = data.get("claude_desktop_dir")
+    desktop_folder = Path(desktop).expanduser() if desktop else default_desktop_folder()
     notify = data.get("notify", [])
     if not all(isinstance(x, str) for x in notify):
         raise ConfigError("notify must be a list of strings: the command and its arguments")
@@ -117,6 +127,8 @@ def load(env: Mapping[str, str] | None = None) -> Config:
         auto_days=float(data.get("auto_days", 7.0)),
         auto_scripted=data.get("auto_scripted", False),
         on_conflict=data.get("on_conflict", "keep-both"),
+        desktop_cards=data.get("desktop_cards", True),
+        claude_desktop=desktop_folder,
     )
 
 

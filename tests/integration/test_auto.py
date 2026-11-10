@@ -760,3 +760,98 @@ def test_doctor_marks_an_unreadable_auto_json(auto_homes):
     (auto_homes.duo / "auto.json").write_text("{not json")
     code, out = run("doctor")
     assert "NO  pairing: nothing is paired by itself" in out
+
+
+# ------------------------------------------------------------------- the Claude desktop app
+@pytest.fixture
+def app(auto_homes, tmp_path):
+    """A Claude desktop app folder, as the app lays it out, for duologue's config."""
+    folder = tmp_path / "Claude"
+    device = folder / "claude-code-sessions" / "acct" / "dev"
+    device.mkdir(parents=True)
+    (folder / "config.json").write_text(json.dumps({"lastKnownAccountUuid": "acct"}))
+    (device / "local_00000000-0000-4000-8000-000000000000.json").write_text(
+        json.dumps({"model": "claude-test", "effort": "high", "permissionMode": "auto"})
+    )
+    set_config(auto_homes, f'claude_desktop_dir = "{folder}"\n')
+    return SimpleNamespace(folder=folder, device=device)
+
+
+def cards(app) -> list[dict]:
+    return [
+        json.loads(p.read_text())
+        for p in app.device.glob("local_*.json")
+        if not p.name.startswith("local_00000000")
+    ]
+
+
+def test_a_session_duologue_creates_is_listed_in_the_desktop_app(auto_homes, app):
+    codex_thread(auto_homes)
+    code, out = run("sync")
+    assert code == 0, out
+    [pair] = pairs().values()
+    [card] = cards(app)
+    assert card["cliSessionId"] == pair.claude and card["cwd"] == auto_homes.work
+    assert card["title"] == pair.name and pair.card == card["sessionId"]
+    run("sync")
+    assert len(cards(app)) == 1  # written once
+
+
+def test_sessions_the_user_made_and_desktop_cards_off_get_none(auto_homes, app):
+    claude_session(auto_homes)  # the user's own: the Codex side is the one created
+    run("sync")
+    assert cards(app) == []
+    set_config(auto_homes, "desktop_cards = false\n")
+    codex_thread(auto_homes, thread=THREAD_2)
+    run("sync")
+    assert cards(app) == []
+
+
+def go_on_in_a_copy(path: Path, new_session: str, prompt: str) -> Path:
+    """What the desktop app does when the user carries on in a session it did not make: a copy
+    of every record under a new session id, then the new turn."""
+    records = [ln.record for ln in read_lines(path)]
+    copy = [dict(r, sessionId=new_session) if "sessionId" in r else r for r in records]
+    last = [r["uuid"] for r in copy if r.get("uuid")][-1]
+    t = ClaudeTranscript(cwd=records[0].get("cwd") or "/", session=new_session)
+    t._n, t._parent = 90, last
+    t.user(prompt)
+    t.assistant("ok")
+    target = path.with_name(f"{new_session}.jsonl")
+    target.write_bytes(encode(copy + t.records))
+    return target
+
+
+def test_the_pair_follows_the_session_the_desktop_app_goes_on_with(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    old = find_transcript(auto_homes.claude, pair.claude)
+    copy = go_on_in_a_copy(old, OTHER, "carried on in the desktop app")
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card = json.loads(card_path.read_text())
+    card_path.write_text(json.dumps(dict(card, cliSessionId=OTHER)))
+    turns = list(Codex(auto_homes.codex, auto_homes.bin).index(THREAD).turns)
+    code, out = run("sync")
+    assert code == 0 and "copied 1 Claude turn(s) to Codex" in out, out
+    [pair] = pairs().values()
+    assert pair.claude == OTHER
+    assert len(Codex(auto_homes.codex, auto_homes.bin).index(THREAD).turns) == len(turns) + 1
+    assert run("sync", "--quiet") == (0, "")  # nothing of the copy went back as new
+    assert copy.exists()
+
+
+def test_a_copy_without_the_synced_point_blocks(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    t = ClaudeTranscript(cwd=auto_homes.work, session=OTHER)
+    t.user("something else entirely")
+    t.assistant("ok")
+    old = find_transcript(auto_homes.claude, pair.claude)
+    old.with_name(f"{OTHER}.jsonl").write_bytes(encode(t.records))
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    run("sync")
+    [pair] = [p for p in pairs().values() if p.card]  # (the copy is paired as a new session)
+    assert pair.blocked and "desktop app" in pair.blocked and pair.claude != OTHER

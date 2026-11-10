@@ -78,6 +78,8 @@ class Pair:
     # A note to put before the next Claude turns copied to Codex (turns left out before them)
     note_to_codex: str | None = None
     gone_since: float | None = None  # when a pass first found one of its conversations missing
+    card: str | None = None  # the Claude desktop app's card duologue wrote for the session
+    card_wanted: bool = False  # duologue created the Claude session: it gets a card
     # Fields a later duologue wrote: kept as they are, so saving here does not drop them.
     extra: dict = field(default_factory=dict)
 

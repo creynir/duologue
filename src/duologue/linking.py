@@ -292,6 +292,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
         )[1],
     )
     engine.confirm(pair, {"end": made.end, "anchor": made.uuids[-1]}, after_codex)
+    pair.card_wanted = True  # listed in the Claude desktop app on its first sync
     source = Cursor(end, before_digest, after_codex["anchor"])
     _source_unchanged(engine, pair, xpath, source, "Codex thread")
     done = f"created Claude session {session_id} with {kept['turns']} turn(s) from Codex"
