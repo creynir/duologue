@@ -237,6 +237,7 @@ def test_a_conversation_passed_over_is_looked_at_again_once_it_changes(auto_home
     path.write_bytes(encode(records))
     assert run("sync")[0] == 0
     assert [p.claude for p in pairs().values()] == [SESSION]
+    assert str(path) not in state().passed  # paired: not "left out" any more
 
 
 def test_one_pass_tries_the_newest_first_and_at_most_per_pass(auto_homes, monkeypatch):
@@ -727,3 +728,35 @@ def test_a_link_that_must_wait_is_tried_on_the_next_pass(auto_homes, monkeypatch
         "Codex's thread locks are busy"
     ]
     assert run("sync")[0] == 0 and [p.claude for p in pairs().values()] == [SESSION]
+
+
+def test_a_session_that_moved_to_a_folder_that_is_there_is_paired(auto_homes):
+    path = claude_session(auto_homes, cwd="/no/such/folder")
+    records = [ln.record for ln in read_lines(path)]
+    later = dict(records[-1], uuid="c1a0de00-0000-4000-8000-000000000099", cwd=auto_homes.work)
+    later["parentUuid"] = records[-1]["uuid"]
+    with open(path, "ab") as fh:
+        fh.write(encode([later]))
+    assert run("sync")[0] == 0
+    assert [p.claude for p in pairs().values()] == [SESSION]
+
+
+def test_auto_json_that_cannot_be_written_does_not_stop_the_pairs(both, monkeypatch, capsys):
+    from duologue.pairs import AutoState as State
+
+    both.claude.turn("second", "ok")
+    claude_session(both.h, session=OTHER)  # makes the pass write auto.json
+
+    def full(self):
+        raise OSError("no space left on device")
+
+    monkeypatch.setattr(State, "save", full)
+    code, out = run("sync")
+    assert "copied 1 Claude turn(s) to Codex" in out, out
+    assert "nothing paired by itself" in capsys.readouterr().err
+
+
+def test_doctor_marks_an_unreadable_auto_json(auto_homes):
+    (auto_homes.duo / "auto.json").write_text("{not json")
+    code, out = run("doctor")
+    assert "NO  pairing: nothing is paired by itself" in out

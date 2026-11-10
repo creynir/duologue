@@ -43,13 +43,14 @@ A new side gets the newest turns that fit the copy budget (400,000 characters by
 note telling the model where the older ones are. A Claude session that Codex's own importer
 already copied is paired with that thread instead of getting a second one; what Claude added
 since the import follows, within the same budget. (If the session changed since in another way,
-the two sync from now on when you carried on in Codex's copy; otherwise the session gets a
-thread of its own.)
+the two are paired from now on only if you carried on in Codex's copy; otherwise the session
+gets a thread of its own, and Codex's copy stays as it is.)
 
 Left out: scripted runs (`claude -p`, the Agent SDK, `codex exec`) unless `auto_scripted = true`,
-Codex subagent threads, threads rewound in Codex, archived threads, threads Codex compressed while
-idle (until you open them again), conversations whose folder is gone, ones with nothing typed or
-no finished turn yet, and pairs you unlinked. When a conversation has been deleted for an hour,
+Claude sessions that continue in another session, Codex subagent threads, threads rewound in
+Codex, archived threads, threads Codex compressed while idle (until you open them again),
+conversations whose folder is gone, ones with nothing typed or no finished turn yet, and pairs you
+unlinked. When a conversation has been deleted for an hour,
 its pair goes, and the other side is paired again only once you carry on in it. To pair only what
 you choose, set `auto = false` and link by hand, in the folder you work in:
 

@@ -64,7 +64,7 @@ from duologue.translate.codex_to_claude import (
     codex_to_claude_steps,
     codex_turns,
 )
-from duologue.translate.common import CODEX_IMPORT_TURN, text_of
+from duologue.translate.common import CODEX_IMPORT_TURN, ORIGIN, text_of
 
 UNLINKED = (
     "unlinked; both conversations stay as they are, and duologue does not pair them again by "
@@ -371,7 +371,10 @@ def _newest_since(engine: Engine, pair: Pair, cpath: Path, copied: Cursor) -> tu
         total, first, kept = total + size, i, True
     if first == 0 or first == len(parts):
         return copied, 0
-    dropped = sum(1 for part in parts[:first] if is_user_input(part[0].record))
+    # Turns the user typed (duologue's own copies from Codex are not sent back, so not counted).
+    dropped = sum(
+        1 for part in parts[:first] if is_user_input(r := part[0].record) and not r.get(ORIGIN)
+    )
     end = parts[first - 1][-1].end
     anchor = (
         next(

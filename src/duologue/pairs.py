@@ -116,6 +116,8 @@ class Pair:
 def _known(cls, d: dict) -> dict:
     """``d``'s fields that ``cls`` has: a later duologue's additions inside a cursor or a write
     record are left out (they are worked out again)."""
+    if not isinstance(d, dict):
+        raise TypeError(f"a {cls.__name__.lower()} is not an object")
     return {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
 
 

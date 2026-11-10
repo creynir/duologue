@@ -135,7 +135,7 @@ def cmd_status(args) -> int:
             f"Pairing by itself every conversation that changed in the last {cfg.auto_days:g} "
             "day(s), on each sync."
         )
-        for line in auto.summary(cfg):
+        for _, line in auto.summary(cfg):
             print(f"  {line}")
     if not pairs:
         print(
@@ -160,7 +160,7 @@ def cmd_sync(args) -> int:
             try:
                 for line in auto.link_new(e):
                     print(line)
-            except AutoStateError as err:  # the pairs still sync; status says so too
+            except (AutoStateError, OSError) as err:  # the pairs still sync; status says so
                 failed = True
                 if not args.quiet:
                     print(f"duologue sync: nothing paired by itself: {err}", file=sys.stderr)
@@ -279,8 +279,8 @@ def cmd_doctor(args) -> int:
         + f"; after you write in both apps: {cfg.on_conflict}"
     )
     if cfg.auto:
-        for line in auto.summary(cfg):
-            report(not line.startswith("nothing is paired"), f"pairing: {line}")
+        for ok, line in auto.summary(cfg):
+            report(ok, f"pairing: {line}")
     try:
         print(f"    background service: {Service(cfg.home).status()}")
     except RuntimeError as err:

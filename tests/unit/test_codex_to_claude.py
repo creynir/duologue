@@ -723,7 +723,8 @@ def test_turns_codex_imported_from_claude_never_go_back(store):
     native = a_native_turn()
     records = x.records + native.records
     kept = codex_to_claude_steps(records, key="k", outputs=store, skip_ours=True)
-    assert "said in Claude" not in json.dumps([s.blocks for s in kept])
+    shown = json.dumps([s.blocks for s in kept])
+    assert "said in Claude" not in shown and "answered in Claude" not in shown
     assert [k for k, _ in codex_turns(records, skip_ours=True)[0]] == ["turn-1"]
     everything = codex_to_claude_steps(records, key="k", outputs=store)
     assert "said in Claude" in json.dumps([s.blocks for s in everything])

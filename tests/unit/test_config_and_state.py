@@ -291,4 +291,16 @@ def test_auto_json_entries_that_are_not_well_formed_are_dropped(tmp_path: Path):
     state = AutoState.load(path)
     assert state.passed == {"/q": [1, 2, "why"]} and state.failed == {} and state.waiting == {}
     state.save()
-    assert json.loads(path.read_text())["from_the_future"] == {"k": 1}
+    saved = json.loads(path.read_text())
+    assert saved["from_the_future"] == {"k": 1}
+    assert saved["passed"] == {"/q": [1, 2, "why"]} and saved["failed"] == saved["waiting"] == {}
+
+
+def test_a_cursor_that_is_not_an_object_is_reported_not_a_traceback(tmp_path: Path):
+    store = Store(tmp_path / "pairs.json")
+    store.save({"x": Pair(name="x", claude="c", codex="t")})
+    data = json.loads((tmp_path / "pairs.json").read_text())
+    data["pairs"][0]["codex_cursor"] = 7
+    (tmp_path / "pairs.json").write_text(json.dumps(data))
+    with pytest.raises(ValueError, match="a pair is not readable"):
+        store.load()

@@ -128,9 +128,9 @@ def codex_turns(
     records: Iterable[dict], *, skip_ours: bool = False
 ) -> tuple[list[tuple[str, list[dict]]], int]:
     """The turns in ``records`` that Codex still holds, as (turn id, records), without the ones
-    that hold what was said in Claude when ``skip_ours``; and how many turns from before
-    ``records`` Codex rolled back in them (edit and resend, undo): turns the other side may
-    already hold."""
+    that hold what was said in Claude when ``skip_ours``; and how many turns Codex rolled back in
+    them (edit and resend, undo) that the other side may already hold: turns from before
+    ``records``, and, when ``skip_ours``, duologue's copies of Claude's turns within them."""
     groups, undone, ours = _turns(list(records))
     kept = [(k, g) for k, g in groups if _is_turn(g) and not (skip_ours and from_claude(k))]
     # Claude holds its own turns, so an undo of duologue's copy of one is news to Claude.

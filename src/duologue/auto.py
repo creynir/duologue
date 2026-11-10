@@ -149,8 +149,8 @@ def claude_reason(config: Config, path: Path) -> str | None:
             if first and r.get(ORIGIN):
                 return "duologue made it"
             first = False
-        if cwd is None and isinstance(r.get("cwd"), str) and r["cwd"]:
-            cwd = r["cwd"]
+        if isinstance(r.get("cwd"), str) and r["cwd"]:
+            cwd = r["cwd"]  # the last one: where the session goes on, as linking takes it
         entry = r.get("entrypoint")
         if isinstance(entry, str) and entry.startswith("sdk") and not config.auto_scripted:
             return "a script ran it"
@@ -346,8 +346,9 @@ def link_new(engine: Engine, now: float | None = None) -> list[str]:
             state.pass_over(str(f.path), f.stamp, result)
             continue
         pair, done = result
-        if state.failed.pop(str(f.path), None):
-            state.changed = True
+        for memo in (state.passed, state.failed):  # paired now: nothing left to remember
+            if memo.pop(str(f.path), None) is not None:
+                state.changed = True
         said.append(f'"{pair.name}": {done}')
     state.changed |= state.waiting != waiting
     if state.changed:
@@ -355,12 +356,14 @@ def link_new(engine: Engine, now: float | None = None) -> list[str]:
     return said
 
 
-def summary(config: Config) -> list[str]:
-    """What the last passes found and could not pair, for ``duologue status``."""
+def summary(config: Config) -> list[tuple[bool, str]]:
+    """What the last passes found and could not pair, for ``duologue status`` and ``doctor``:
+    (whether all is well, what to say) per line."""
     try:
         state = AutoState.load(auto_state_file(config))
     except AutoStateError as e:
-        return [f"nothing is paired by itself: {e}; fix it, or remove it to forget the unlinks"]
+        text = f"nothing is paired by itself: {e}; fix it, or remove it to forget the unlinks"
+        return [(False, text)]
     out = []
     if state.waiting:
         reasons = Counter(state.waiting.values())
@@ -371,13 +374,18 @@ def summary(config: Config) -> list[str]:
         )
     if state.failed:
         out.append(f"not paired yet, tried again later: {len(state.failed)} (see duologue log)")
+    out = [(True, line) for line in out]
     left = Counter(entry[2] for entry in state.passed.values() if len(entry) > 2)
     if left:
         out.append(
-            f"left out: {sum(left.values())} ("
-            + "; ".join(f"{n} {why}" for why, n in left.most_common())
-            + ")"
+            (
+                True,
+                f"left out: {sum(left.values())} ("
+                + "; ".join(f"{n} {why}" for why, n in left.most_common())
+                + ")",
+            )
         )
     if state.ignored:
-        out.append(f"unlinked, not paired again by itself: {len(state.ignored)} conversation(s)")
+        text = f"unlinked, not paired again by itself: {len(state.ignored)} conversation(s)"
+        out.append((True, text))
     return out

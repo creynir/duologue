@@ -161,9 +161,9 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   the newest turns since then that fit the copy budget, with a note before them in Codex naming
   the file the others are in. The Codex cursor goes after the last `external-import-turn-*`
   turn. A session with no such prefix (on one machine, 7 of 25 imports 7 to 10 weeks old had
-  none), or whose thread was rewound in Codex, is not paired with that thread; it gets a thread
-  of its own, unless the user carried on in Codex's copy, which then syncs from now on. Those turns hold Claude's
-  own words and never travel back. A thread the importer made of a session that is paired
+  none) is paired with that thread only if the user carried on in it in Codex, and then from
+  that point on; otherwise it gets a thread of its own, and so does one whose thread was rewound
+  in Codex. The importer's turns hold Claude's own words and never travel back. A thread the importer made of a session that is paired
   already, gone or unlinked is left alone. Codex's importer appends to its thread only while
   that thread is an exact prefix of the Claude session, so it stops once duologue writes there.
 - **Output caps.** The model sees 4,000 characters per tool output, the app shows 20,000. The rest
