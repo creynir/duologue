@@ -107,10 +107,16 @@ class Pair:
         extra = {k: v for k, v in d.items() if k not in known}
         d = {k: v for k, v in d.items() if k in known}
         d["extra"] = extra
-        d["claude_cursor"] = Cursor(**d.get("claude_cursor") or {})
-        d["codex_cursor"] = Cursor(**d.get("codex_cursor") or {})
-        d["pending"] = Pending(**d["pending"]) if d.get("pending") else None
+        d["claude_cursor"] = Cursor(**_known(Cursor, d.get("claude_cursor") or {}))
+        d["codex_cursor"] = Cursor(**_known(Cursor, d.get("codex_cursor") or {}))
+        d["pending"] = Pending(**_known(Pending, d["pending"])) if d.get("pending") else None
         return cls(**d)
+
+
+def _known(cls, d: dict) -> dict:
+    """``d``'s fields that ``cls`` has: a later duologue's additions inside a cursor or a write
+    record are left out (they are worked out again)."""
+    return {k: v for k, v in d.items() if k in cls.__dataclass_fields__}
 
 
 class Store:

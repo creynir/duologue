@@ -39,6 +39,7 @@ from duologue.codex.rollout import (
 from duologue.codex.threads import last_turn_open
 from duologue.engine import (
     Engine,
+    Gone,
     PairJournal,
     _printable,
     claude_start,
@@ -315,6 +316,8 @@ def link_import(engine: Engine, claude: str, codex: str, sha256: str) -> tuple[P
     pair = Pair(name=_unique(engine, _claude_title(engine, claude)), claude=claude, codex=codex)
     xpath = engine.codex_path(pair)
     lines = read_lines(xpath)
+    if session_meta(xpath).get("history_base"):  # its imported turns are in another file
+        raise NotImported("the Codex thread was rewound in Codex", continued=False)
     copied = _prefix_with_digest(cpath, sha256)
     if copied is None:
         continued = any(not t.startswith(CODEX_IMPORT_TURN) for t, _ in turn_ends(lines))
@@ -450,7 +453,10 @@ def release(engine: Engine, pair: Pair) -> str:
             except Blocked:
                 engine.accept_pending(pair)
                 said.append("the interrupted write was settled as the files stand")
-        cpath, xpath = engine.paths(pair)
+        try:
+            cpath, xpath = engine.paths(pair)
+        except Gone as e:
+            raise LinkError(f"{e}; the pair is removed by itself within the hour") from e
         if not _cursor_matches(cpath, pair.claude_cursor):
             pair.claude_cursor = _reanchor_claude(cpath, pair.claude_cursor)
             said.append("the Claude side syncs on from where it stands")

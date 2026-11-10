@@ -1368,3 +1368,71 @@ def test_an_unmounted_projects_folder_blocks_and_removes_nothing(pair, homes, tm
     outcome, p = sync(pair.name)
     assert outcome.state == "blocked" and p.gone_since is None
     assert engine().pairs
+
+
+def test_the_hour_counts_from_when_the_conversation_was_first_missing(pair):
+    from duologue.engine import GONE_AFTER
+
+    pair.claude.path.unlink()
+    for _ in range(2):  # two passes half an hour apart: still within the hour
+        assert sync(pair.name)[0].state == "waiting"
+        e = engine()
+        e.pairs[pair.name].gone_since -= GONE_AFTER / 2 + 1
+        e.save()
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+
+
+def test_a_deleted_codex_thread_leaves_the_claude_session_unpaired_until_it_changes(pair, homes):
+    from duologue.pairs import AutoState, auto_state_file
+
+    pair.codex.path.unlink()
+    sync(pair.name)
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+    passed = AutoState.load(auto_state_file(engine().config)).passed
+    assert passed[str(pair.claude.path)][2] == "its other side was deleted"
+
+
+def test_an_unmounted_codex_sessions_folder_blocks_and_removes_nothing(pair, homes, tmp_path):
+    import shutil
+
+    shutil.rmtree(homes.codex / "sessions")
+    (homes.codex / "sessions").symlink_to(tmp_path / "not-mounted")
+    outcome, p = sync(pair.name)
+    assert outcome.state == "blocked" and p.gone_since is None
+    assert engine().pairs
+
+
+def test_a_write_cut_off_when_the_other_side_went_is_taken_out(pair, monkeypatch):
+    from duologue.claude import sessions
+
+    pair.codex.turn("from codex", "ok")
+    size = pair.claude.path.stat().st_size
+    crash_in(monkeypatch, sessions, "_verify")
+    with pytest.raises(Crash):
+        sync(pair.name)
+    with open(pair.claude.path, "r+b") as fh:  # the append was cut off partway
+        fh.truncate(size + 40)
+    pair.codex.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"
+    assert pair.claude.path.stat().st_size == size  # no half record left in Claude's file
+
+
+def test_a_blocked_pair_whose_conversation_is_gone_is_removed_too(pair, capsys):
+    from duologue.cli import main
+
+    e = engine()
+    e.block(e.pairs[pair.name], "something needed a person")
+    e.save()
+    pair.claude.path.unlink()
+    assert sync(pair.name)[0].state == "waiting"
+    assert main(["release", pair.name]) == 1
+    assert "removed by itself within the hour" in capsys.readouterr().err
+    gone_an_hour(pair.name)
+    e = engine()
+    assert e.sync(e.pairs[pair.name]).state == "removed"

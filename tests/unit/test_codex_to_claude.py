@@ -672,19 +672,42 @@ def test_a_form_feed_inside_a_line_does_not_end_the_hunk():
     assert hunk["lines"] == ["-a = 1", "+a = 2", " \x0c", "-b = 1", "+b = 2"]
 
 
+def rolled_back(n: int) -> list[dict]:
+    payload = {"type": "thread_rolled_back", "num_turns": n}
+    return [{"timestamp": "2026-11-04T15:00:00.000Z", "type": "event_msg", "payload": payload}]
+
+
 def test_undone_turns_are_named_by_their_prompts_or_counted():
-    from duologue.translate.codex_to_claude import undone_what
+    from duologue.translate.codex_to_claude import undone_held
 
     x = CodexRollout()
     a_turn(x, "first")
     a_turn(x, "second")
-    assert undone_what(x.records, 1) == 'the turn(s) that began "second"'
-    assert undone_what(x.records, 2) == 'the turn(s) that began "first", "second"'
+    assert undone_held(x.records, rolled_back(1)) == (1, 'the turn(s) that began "second"')
+    assert undone_held(x.records, rolled_back(2)) == (
+        2,
+        'the turn(s) that began "first", "second"',
+    )
     x.start("no-prompt")  # a turn with no message from the user
     x.agent_says("on my own", "np-a")
     x.complete("on my own")
-    assert undone_what(x.records, 2) == "the last 2 turn(s) of the conversation Codex held"
-    assert undone_what(x.records, 5) == "the last 5 turn(s) of the conversation Codex held"
+    assert undone_held(x.records, rolled_back(2)) == (
+        2,
+        "the last 2 turn(s) of the conversation Codex held",
+    )
+    assert undone_held(x.records, rolled_back(5))[0] == 3  # only 3 were there
+
+
+def test_an_undone_note_from_duologue_is_not_a_turn_claude_holds():
+    from duologue.translate.claude_to_codex import note_turn
+    from duologue.translate.codex_to_claude import undone_held
+
+    x = CodexRollout()
+    a_turn(x, "first")
+    note = note_turn("a note for Codex", thread_id="th-1", key="k", ms=START_MS + 99_000)
+    records = x.records + [{"type": ln.type, "payload": ln.payload} for ln in note]
+    assert undone_held(records, rolled_back(2)) == (1, 'the turn(s) that began "first"')
+    assert undone_held(records, rolled_back(1))[0] == 0
 
 
 def test_turns_codex_imported_from_claude_never_go_back(store):
@@ -704,3 +727,21 @@ def test_turns_codex_imported_from_claude_never_go_back(store):
     assert [k for k, _ in codex_turns(records, skip_ours=True)[0]] == ["turn-1"]
     everything = codex_to_claude_steps(records, key="k", outputs=store)
     assert "said in Claude" in json.dumps([s.blocks for s in everything])
+
+
+def test_an_undo_of_duologues_note_and_copy_counts_only_the_copy():
+    from duologue.translate.claude_to_codex import note_turn
+    from duologue.translate.codex_to_claude import undone_held
+    from duologue.translate.common import stable_id
+
+    x = CodexRollout()
+    a_turn(x, "before")
+    before = list(x.records)
+    note = note_turn("they happened at the same time", thread_id="th-1", key="k", ms=START_MS)
+    copy = CodexRollout()
+    copy.start(str(stable_id("claude-turn", "k", "u-1")))  # duologue's copy of a Claude turn
+    copy.user_says("in claude", "c-u")
+    copy.agent_says("ok", "c-a")
+    copy.complete("ok")
+    new = [{"type": ln.type, "payload": ln.payload} for ln in note] + copy.records
+    assert undone_held(before, new + rolled_back(2)) == (1, 'the turn(s) that began "in claude"')

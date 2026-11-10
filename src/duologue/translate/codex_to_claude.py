@@ -92,19 +92,20 @@ def undone_steps(n: int, ref: str, timestamp: str | None) -> list[ClaudeStep]:
     return [ClaudeStep("assistant", [{"type": "text", "text": text}], timestamp, f"undo:{ref}")]
 
 
-def undone_what(records_before: Iterable[dict], n: int, records: Iterable[dict] = ()) -> str:
-    """Which turns an undo of ``n`` took back, for the notes, quoted by the prompts that began
-    them: duologue's copies of Claude's turns that ``records`` (the new part) rolls back, then
-    the last of the turns Codex held in ``records_before`` (the thread up to the cursor). "The
-    last n turns" alone would point at the wrong ones once Claude has turns of its own after
-    them."""
-    ours = _turns(list(records))[2]
-    earlier = n - len(ours)
+def undone_held(records_before: Iterable[dict], records: Iterable[dict]) -> tuple[int, str]:
+    """How many turns Claude holds an undo in ``records`` (the new part) took back, and which,
+    quoted by the prompts that began them: turns from before them (``records_before``, the
+    thread up to the cursor) and duologue's copies of Claude's turns among them. duologue's own
+    notes, which Codex counts as turns, were never Claude's. "The last n turns" alone would point
+    at the wrong ones once Claude has turns of its own after them."""
+    _, earlier, ours = _turns(list(records))
     groups = codex_turns(records_before)[0][-earlier:] if earlier > 0 else []
-    prompts = [p for p in (_turn_prompt(g) for _, g in [*groups, *ours]) if p]
+    held = [g for _, g in groups if not _is_note_turn(g)] + [g for _, g in ours]
+    n = len(held)
+    prompts = [p for p in (_turn_prompt(g) for g in held) if p]
     if len(prompts) < n:  # a turn without a prompt cannot be named: say how many instead
-        return f"the last {n} turn(s) of the conversation Codex held"
-    return "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
+        return n, f"the last {n} turn(s) of the conversation Codex held"
+    return n, "the turn(s) that began " + ", ".join(f'"{p}"' for p in prompts)
 
 
 def _turn_prompt(group: list[dict]) -> str:
@@ -154,7 +155,11 @@ def _turns(
             turns = [g for g in groups if _is_turn(g)]
             gone = turns[len(turns) - min(n, len(turns)) :]
             undone += n - len(gone)
-            ours += [(k, g) for k, g in ((_group_key(g), g) for g in gone) if from_claude(k)]
+            ours += [
+                (k, g)
+                for k, g in ((_group_key(g), g) for g in gone)
+                if from_claude(k) and not _is_note_turn(g)
+            ]
             groups = [g for g in groups if not any(g is x for x in gone)] + [[]]
             continue
         if kind == "task_started" and groups[-1]:
@@ -167,6 +172,17 @@ def _group_key(group: list[dict]) -> str:
     started = next((_payload(r) for r in group if _payload(r).get("type") == "task_started"), {})
     # Not the group's position: a later batch that starts elsewhere must give the same key.
     return str(started.get("turn_id") or f"untitled-{group[0].get('timestamp')}")
+
+
+def _is_note_turn(group: list[dict]) -> bool:
+    """A turn duologue wrote to Codex that holds only one of its notes: Claude never had it."""
+    texts = [
+        _item_text(_payload(r)["item"])
+        for r in group
+        if _payload(r).get("type") == "item_completed"
+        and (_payload(r).get("item") or {}).get("type") == "UserMessage"
+    ]
+    return bool(texts) and all(is_note(t) for t in texts)
 
 
 def _is_turn(group: list[dict]) -> bool:

@@ -127,7 +127,7 @@ def test_the_session_duologue_creates_is_in_the_threads_folder(auto_homes):
 
 
 def test_claude_sessions_left_alone_and_why(auto_homes):
-    claude_session(auto_homes, session=OTHER, entrypoint="sdk-cli")  # claude -p
+    scripted = claude_session(auto_homes, session=OTHER, entrypoint="sdk-cli")  # claude -p
     gone = claude_session(
         auto_homes, session="5e550000-0000-4000-8000-000000000003", cwd="/no/such/folder"
     )
@@ -145,46 +145,42 @@ def test_claude_sessions_left_alone_and_why(auto_homes):
     os.utime(old, (eight_days, eight_days))
     assert run("sync")[0] == 0
     assert pairs() == {}
-    assert reasons() == [
-        "a script ran it",
-        "duologue made it",
-        "it continues in another session",
-        "its folder is gone",
-        "nothing was typed in it yet",
-    ]
-    assert str(gone) in state().passed and str(old) not in state().passed  # too old to look at
+    why = {path: entry[2] for path, entry in state().passed.items()}
+    assert why == {
+        str(scripted): "a script ran it",
+        str(gone): "its folder is gone",
+        str(ours): "duologue made it",
+        str(moved): "it continues in another session",
+        str(told): "nothing was typed in it yet",
+    }  # and the one too old to look at is not there at all
 
 
 def test_codex_threads_left_alone_and_why(auto_homes):
     n = iter(range(10, 99))
+    made = {}
 
-    def thread() -> str:
-        return f"01a1ab4d-705e-7cc1-9b67-8e3e3f3f97{next(n)}"
+    def thread(why: str, **kwargs) -> None:
+        tid = f"01a1ab4d-705e-7cc1-9b67-8e3e3f3f97{next(n)}"
+        made[str(codex_thread(auto_homes, thread=tid, **kwargs))] = why
 
-    codex_thread(auto_homes, thread=thread(), meta={"source": "exec"})
-    codex_thread(auto_homes, thread=thread(), meta={"source": "mcp"})
-    codex_thread(auto_homes, thread=thread(), meta={"source": {"subagent": {}}})
-    codex_thread(auto_homes, thread=thread(), meta={"originator": "duologue"})
-    codex_thread(auto_homes, thread=thread(), meta={"history_base": {"rollout": "x"}})
-    codex_thread(auto_homes, thread=thread(), cwd="/no/such/folder")
+    thread("a script ran it", meta={"source": "exec"})
+    thread("a script ran it", meta={"source": "mcp"})
+    thread("a subagent thread", meta={"source": {"subagent": {}}})
+    thread("duologue made it", meta={"originator": "duologue"})
+    thread("it was rewound in Codex", meta={"history_base": {"rollout": "x"}})
+    thread("its folder is gone", cwd="/no/such/folder")
     x = CodexRollout(THREAD_2)
     x.start("running")
     x.user_says("still going", "r-u")
-    write_rollout(auto_homes.codex, THREAD_2, x.records, cwd=auto_homes.work)
-    zst = auto_homes.codex / "sessions" / "2026" / "11" / "04"
-    (zst / f"rollout-2026-11-04T14-00-00-{thread()}.jsonl.zst").write_bytes(b"compressed")
+    running = write_rollout(auto_homes.codex, THREAD_2, x.records, cwd=auto_homes.work)
+    made[str(running)] = "no turn has finished in it yet"
+    folder = auto_homes.codex / "sessions" / "2026" / "11" / "04"
+    zst = folder / "rollout-2026-11-04T14-00-00-01a1ab4d-705e-7cc1-9b67-8e3e3f3f9799.jsonl.zst"
+    zst.write_bytes(b"compressed")
+    made[str(zst)] = "Codex compressed it while it was idle"
     assert run("sync")[0] == 0
     assert pairs() == {}
-    assert reasons() == [
-        "Codex compressed it while it was idle",
-        "a script ran it",
-        "a script ran it",
-        "a subagent thread",
-        "duologue made it",
-        "it was rewound in Codex",
-        "its folder is gone",
-        "no turn has finished in it yet",
-    ]
+    assert {path: entry[2] for path, entry in state().passed.items()} == made
 
 
 def test_scripted_runs_are_paired_once_the_user_asks(auto_homes):
@@ -323,6 +319,7 @@ def test_new_claude_sessions_wait_for_a_codex_duologue_knows(auto_homes, monkeyp
         assert "waiting to be paired: 1" in out and "has not been tested" in out
     (auto_homes.duo / "gate.json").unlink()
     assert run("sync")[0] == 0 and [p.claude for p in pairs().values()] == [SESSION]
+    assert "waiting to be paired" not in run("status")[1]
 
 
 def test_status_says_what_was_left_out(auto_homes):
@@ -333,11 +330,23 @@ def test_status_says_what_was_left_out(auto_homes):
 
 
 def test_a_pipe_named_like_a_transcript_is_not_opened(auto_homes):
+    import signal
+
     folder = auto_homes.claude / "projects" / project_folder(auto_homes.work)
     folder.mkdir(parents=True)
     os.mkfifo(folder / f"{OTHER}.jsonl")
     claude_session(auto_homes)
-    assert run("sync")[0] == 0  # did not hang
+
+    def hung(*args):
+        raise TimeoutError("the pass opened the pipe and hung")
+
+    old = signal.signal(signal.SIGALRM, hung)
+    signal.alarm(20)  # a failure, not a stuck run, if the pipe is ever opened
+    try:
+        assert run("sync")[0] == 0
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, old)
     assert [p.claude for p in pairs().values()] == [SESSION]
 
 
@@ -643,7 +652,9 @@ def test_an_out_of_date_import_found_first_is_left_alone(auto_homes):
     first = auto.found(e, AutoState.load(auto_state_file(e.config)), time.time())[0]
     assert (first.side, first.id) == ("codex", THREAD)
     assert run("sync")[0] == 0
-    assert "Codex's copy of a Claude session that changed since" in reasons()
+    assert state().passed[str(xpath)][2] == (
+        "Codex's importer made it, and the Claude session changed since Codex imported it"
+    )
     [pair] = pairs().values()
     assert pair.claude == SESSION and pair.codex != THREAD  # the session got its own thread
 
@@ -681,3 +692,38 @@ def test_status_forgets_what_was_paired_since(auto_homes, monkeypatch):
     run("sync")
     assert not state().failed
     assert "not paired yet" not in run("status")[1]
+
+
+def test_an_import_rewound_in_codex_is_not_used(auto_homes):
+    spath = claude_session(auto_homes)
+    xpath = imported(auto_homes, spath)
+    suffix = "_01a1ab4d-705e-7cc1-9b67-000000000001.jsonl"
+    rewound = xpath.with_name(xpath.name.replace(".jsonl", suffix))
+    lines = xpath.read_text().splitlines()
+    meta = json.loads(lines[0])
+    meta["payload"]["history_base"] = {"rollout": str(xpath)}
+    rewound.write_text("\n".join([json.dumps(meta), *lines[1:]]) + "\n")
+    old = time.time() - 60
+    os.utime(xpath, (old, old))
+    assert Codex(auto_homes.codex, auto_homes.bin).rollout(THREAD) == rewound
+    code, out = run("sync")
+    assert code == 0 and "importer" not in out, out
+    [pair] = pairs().values()
+    assert pair.claude == SESSION and pair.codex != THREAD  # a thread of its own
+
+
+def test_a_link_that_must_wait_is_tried_on_the_next_pass(auto_homes, monkeypatch):
+    from duologue.journal import Wait
+
+    claude_session(auto_homes)
+
+    def busy(*args, **kwargs):
+        raise linking.LinkError("Codex's thread locks are busy") from Wait("busy")
+
+    with monkeypatch.context() as m:
+        m.setattr(linking, "link", busy)
+        run("sync")
+    assert not state().failed and list(state().waiting.values()) == [
+        "Codex's thread locks are busy"
+    ]
+    assert run("sync")[0] == 0 and [p.claude for p in pairs().values()] == [SESSION]

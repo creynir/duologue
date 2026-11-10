@@ -24,6 +24,7 @@ def never_the_real_homes(tmp_path_factory: pytest.TempPathFactory) -> None:
     base = tmp_path_factory.mktemp("session-homes")
     for var in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
         os.environ[var] = str(base / var.lower())
+    os.environ.pop("CODEX_SQLITE_HOME", None)  # Codex keeps its databases there when it is set
 
 
 @pytest.fixture

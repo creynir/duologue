@@ -294,7 +294,7 @@ def link_new(engine: Engine, now: float | None = None) -> list[str]:
                     )
                     return pair, f"{e}; {done}"
                 if f.side == "codex":
-                    return "Codex's copy of a Claude session that changed since"
+                    return f"Codex's importer made it, and {e}"
                 # The Claude session gets a thread of its own, as if there were no import.
         if f.side == "claude" and gate:
             raise Wait(gate)

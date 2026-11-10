@@ -151,7 +151,8 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   records an empty Codex target, so settling it after a crash or `release` keeps Codex's cursor
   too. The note to Codex goes only before Claude turns that follow Codex turns made since
   duologue's last copy there, and an undo in Codex of one of those copies counts as an undo of a
-  turn Claude holds. With
+  turn Claude holds. duologue's note turns, which Codex counts as turns, are never counted or
+  named as turns Claude held. With
   `on_conflict = "stop"` nothing is copied until the user keeps one side's new turns
   (`duologue resolve`).
 - **Codex's importer.** Its ledger (`external_agent_session_imports.json`: source path, the
@@ -160,7 +161,8 @@ Nobody else does exactly this (prior-art review, 2026-11-03; the full study of 4
   the newest turns since then that fit the copy budget, with a note before them in Codex naming
   the file the others are in. The Codex cursor goes after the last `external-import-turn-*`
   turn. A session with no such prefix (on one machine, 7 of 25 imports 7 to 10 weeks old had
-  none) is not paired with that thread; it gets a thread of its own. Those turns hold Claude's
+  none), or whose thread was rewound in Codex, is not paired with that thread; it gets a thread
+  of its own, unless the user carried on in Codex's copy, which then syncs from now on. Those turns hold Claude's
   own words and never travel back. A thread the importer made of a session that is paired
   already, gone or unlinked is left alone. Codex's importer appends to its thread only while
   that thread is an exact prefix of the Claude session, so it stops once duologue writes there.

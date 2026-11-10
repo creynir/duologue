@@ -12,7 +12,8 @@ Every conversation syncs by itself.
   status` says what waits or was left out, and why. A try that failed is made again ten minutes
   later. `auto = false` turns it off.
 - **A conversation deleted for an hour removes its pair**; the other side is paired again only
-  once the user carries on in it. A folder that is not there (an unmounted drive) blocks instead.
+  once the user carries on in it. A write cut off on the side that is left is finished or taken
+  out first. A folder that is not there (an unmounted drive) blocks instead.
 - **`sync --quiet`** (the service) prints a stop once, not on every pass, and a pass that
   changed nothing does not rewrite the pairs file.
 - **Codex's own importer.** A Claude session Codex already imported is paired with that thread
