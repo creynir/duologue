@@ -25,7 +25,8 @@ from duologue.jsonl import encode, ends_with_newline, iter_lines, read_lines
 THINKING = ("thinking", "redacted_thinking")
 TRAILERS = ("last-prompt",)  # bookkeeping lines that may follow the records, outside the chain
 
-Live = Callable[[], "int | None"]  # the pid of a Claude Code that has the session, or None
+# The pid of a Claude Code that has the session, a reason it is someone else's now (str), or None
+Live = Callable[[], "int | str | None"]
 
 
 @dataclass(frozen=True)
@@ -221,6 +222,8 @@ def _check_trailers(chain: list[dict], trailers: list[dict]) -> list[str]:
 
 def _not_live(live: Live | None) -> None:
     pid = live() if live is not None else None
+    if isinstance(pid, str):
+        raise Wait(pid)
     if pid == UNKNOWN:
         raise Wait("the Claude session may be open (the process list could not be read)")
     if pid is not None:
@@ -314,3 +317,18 @@ def _verify(path: Path, intent: Intent) -> None:
     back = [ln.record.get("uuid") for ln in read_lines(path, intent.base, intent.end)]
     if tuple(u for u in back if u) != intent.ids:
         raise Blocked("the records duologue wrote to the Claude session did not read back")
+
+
+def retitle(path: Path, session_id: str, title: str, live: Live | None = None) -> bool:
+    """Give the session another title in Claude Code's lists (the last ``custom-title`` line
+    wins), while no Claude Code has it and its last line is whole. Best effort: whether it was
+    done."""
+    try:
+        if (live is not None and live() is not None) or not ends_with_newline(path):
+            return False
+        record = {"type": "custom-title", "customTitle": title, "sessionId": session_id}
+        with open(path, "ab") as fh:
+            fh.write(encode([record]))
+    except OSError:
+        return False
+    return True

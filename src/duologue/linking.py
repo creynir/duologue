@@ -13,6 +13,7 @@ import json
 import os
 import re
 import subprocess
+import time
 import uuid
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -38,6 +39,7 @@ from duologue.codex.rollout import (
 )
 from duologue.codex.threads import last_turn_open
 from duologue.engine import (
+    COPY_QUIET,
     Engine,
     Gone,
     PairJournal,
@@ -163,6 +165,8 @@ def link(
     engine.pairs[pair.name] = pair
     engine.save()
     engine.log.write(pair.name, "link", done)
+    engine.desktop(pair)  # a Claude session created here is listed in the desktop app now
+    engine.save()
     try:  # linked by hand: the user wants them paired again
         AutoState.load(auto_state_file(engine.config)).unignore(pair.claude, pair.codex)
     except (AutoStateError, OSError) as e:
@@ -248,6 +252,7 @@ def _claude_from_codex(engine: Engine, codex: str, name: str | None) -> tuple[Pa
     pair = Pair(
         name=_unique(engine, name or _codex_title(finished)), claude=session_id, codex=codex
     )
+    pair.card_wanted = True  # listed in the Claude desktop app once it is there
     version = claude_version(engine.config.claude_bin)
     key, kept = pair.key, {}
 
@@ -444,6 +449,10 @@ def release(engine: Engine, pair: Pair) -> str:
     when that is what blocked the pair, accepted as it stands; a side rewritten under duologue
     syncs on from where it stands now (its anchor if that is still there, else its end)."""
     said = []
+    moved = engine.card_moved(pair) if pair.blocked else None
+    copy = find_transcript(engine.config.claude_home, moved) if moved else None
+    if copy is not None and time.time() - copy.stat().st_mtime < COPY_QUIET:
+        raise Wait("the Claude desktop app is writing its copy of the session; release it then")
     if pair.hold:
         pair.hold = None
         said.append("taken off hold")
@@ -456,6 +465,11 @@ def release(engine: Engine, pair: Pair) -> str:
             except Blocked:
                 engine.accept_pending(pair)
                 said.append("the interrupted write was settled as the files stand")
+        if moved and copy is not None:
+            # The desktop app goes on with the session in a copy that lacks the synced point:
+            # the pair goes on with the copy from where it stands.
+            engine.move_to(pair, moved, _reanchor_claude(copy, pair.claude_cursor))
+            said.append("the pair goes on with the Claude desktop app's copy of the session")
         try:
             cpath, xpath = engine.paths(pair)
         except Gone as e:

@@ -16,6 +16,7 @@ import re
 import shutil
 import subprocess
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -377,4 +378,47 @@ def test_turns_written_in_both_apps_reach_both_models(world: World):
     # left to copy.
     out = world.duologue("sync") + world.duologue("sync")
     assert "copied 1 Claude turn(s) to Codex" in out and "copied 1 Codex turn(s) to Claude" in out
+    assert "idle: up to date" in world.duologue("sync")
+
+
+def test_a_session_the_desktop_app_copies_is_followed(world: World):
+    """duologue lists the Claude session it creates in the desktop app. When the user carries
+    on in it there, the app copies the session (as `claude --resume --fork-session` does) and
+    points its card at the copy: the pair follows, and the new turn reaches Codex once."""
+    app = world.root / "Claude"
+    account = "acc00000-0000-4000-8000-000000000001"
+    device = app / "claude-code-sessions" / account / "dev"
+    device.mkdir(parents=True)
+    (app / "config.json").write_text(json.dumps({"lastKnownAccountUuid": account}))
+    (device / "local_00000000-0000-4000-8000-000000000000.json").write_text(
+        json.dumps({"model": "claude-mock-1", "effort": "high", "permissionMode": "default"})
+    )
+    with open(world.root / "duologue" / "config.toml", "a") as fh:
+        fh.write(f'claude_desktop_dir = "{app}"\n')
+    thread = world.codex("run the codex probe")
+    out = world.duologue("link", "--codex", thread)
+    session = re.search(r"created Claude session (" + ID.pattern + ")", out).group(1)
+    world.duologue("sync")
+    [card_path] = [p for p in device.glob("local_*.json") if "00000000" not in p.name]
+    card = json.loads(card_path.read_text())
+    assert card["cliSessionId"] == session
+
+    copy = world.claude("carried on in the desktop app", "--resume", session, "--fork-session")
+    assert copy != session  # a copy of its own, as the app makes
+    card_path.write_text(json.dumps(dict(card, cliSessionId=copy)))
+    from duologue.claude.transcript import find_transcript
+    from duologue.engine import COPY_QUIET
+
+    old = time.time() - COPY_QUIET - 1  # the app finished writing its copy a while ago
+    os.utime(find_transcript(world.root / "claude", copy), (old, old))
+    out = world.duologue("sync")
+    assert "copied 1 Claude turn(s) to Codex" in out, out
+    [pair] = json.loads(world.duologue("status", "--json"))
+    assert pair["claude"] == copy
+    world.codex("resume", thread, "what did claude say")
+    shown = json.dumps(world.mock.seen("responses")[-1]["input"])
+    assert shown.count("carried on in the desktop app") == 1
+    # That Codex turn goes to the copy the pair follows now, and then nothing is left.
+    assert "copied 1 Codex turn(s) to Claude" in world.duologue("sync")
+    assert "what did claude say" in find_transcript(world.root / "claude", copy).read_text()
     assert "idle: up to date" in world.duologue("sync")

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import pwd
 import stat
 import sys
 from pathlib import Path
@@ -12,19 +13,53 @@ import pytest
 from builders import CWD, START_MS
 
 from duologue.codex.threads import Codex
+from duologue.ids import is_id
 from duologue.translate.common import iso_ms
 
 FAKE_CODEX = Path(__file__).parent / "fakes" / "fake_codex.py"
 
 
+def _real_traces(home: Path) -> set[str]:
+    """What a test could leave in the user's real folders: duologue's own folder, and cards in
+    the Claude desktop app's list for sessions that are not in the real Claude folder (the app's
+    own cards, made while the tests run, are not counted)."""
+    found = set()
+    ours = home / ".duologue"
+    if ours.exists():  # every file in it, as it stands: a change inside it counts too
+        for path in [ours, *ours.rglob("*")]:
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            found.add(f"{path} {st.st_size} {st.st_mtime_ns}")
+    cards = home / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
+    for card in cards.glob("*/*/local_*.json") if cards.is_dir() else []:
+        try:
+            session = json.loads(card.read_text()).get("cliSessionId")
+        except (OSError, ValueError):
+            continue
+        if not is_id(session) or not list(
+            (home / ".claude" / "projects").glob(f"*/{session}.jsonl")
+        ):
+            found.add(str(card))
+    return found
+
+
 @pytest.fixture(autouse=True, scope="session")
-def never_the_real_homes(tmp_path_factory: pytest.TempPathFactory) -> None:
+def never_the_real_homes(tmp_path_factory: pytest.TempPathFactory):
     """Every test runs against throwaway homes, including one that undoes its own settings:
-    the variables fall back to these, never to the user's real folders."""
+    the variables fall back to these, never to the user's real folders. HOME too, so nothing
+    derived from it (the Claude desktop app's folder) is real. The run fails if anything new
+    turned up in the real folders all the same."""
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    before = _real_traces(real_home)
     base = tmp_path_factory.mktemp("session-homes")
-    for var in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME"):
+    for var in ("DUOLOGUE_HOME", "CLAUDE_CONFIG_DIR", "CODEX_HOME", "HOME"):
         os.environ[var] = str(base / var.lower())
     os.environ.pop("CODEX_SQLITE_HOME", None)  # Codex keeps its databases there when it is set
+    yield
+    new = _real_traces(real_home) - before
+    assert not new, f"the tests wrote to the user's real folders: {sorted(new)}"
 
 
 @pytest.fixture

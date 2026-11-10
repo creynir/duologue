@@ -12,6 +12,7 @@ import sys
 from collections.abc import Iterator, Sequence
 
 from duologue import __version__, auto, config, gate, linking
+from duologue.claude import desktop
 from duologue.codex.rollout import is_compressed
 from duologue.codex.rpc import daemon_running
 from duologue.engine import TRANSIENT, Engine, _printable
@@ -281,6 +282,17 @@ def cmd_doctor(args) -> int:
     if cfg.auto:
         for ok, line in auto.summary(cfg):
             report(ok, f"pairing: {line}")
+    device = desktop.workspace(cfg.claude_desktop) if cfg.desktop_cards else None
+    print(
+        "    Claude desktop app: "
+        + (
+            f"lists the sessions duologue creates ({device})"
+            if device
+            else "not listed there (desktop_cards = false)"
+            if not cfg.desktop_cards
+            else "no list of Claude Code sessions here; sessions show in Claude Code and VS Code"
+        )
+    )
     try:
         print(f"    background service: {Service(cfg.home).status()}")
     except RuntimeError as err:

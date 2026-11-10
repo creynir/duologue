@@ -148,6 +148,8 @@ auto = true                        # pair new conversations by itself; false: on
 auto_days = 7                      # ... the ones that changed within this many days
 auto_scripted = false              # ... and scripted runs too
 on_conflict = "keep-both"          # after you wrote in both apps; "stop" waits for resolve
+desktop_cards = true               # list the sessions duologue creates in the Claude desktop app
+claude_desktop_dir = "~/Library/Application Support/Claude"   # that app's folder
 ```
 
 ## Where conversations show up
@@ -155,7 +157,12 @@ on_conflict = "keep-both"          # after you wrote in both apps; "stop" waits 
 - **Claude Code** (the CLI's `--resume` list and the VS Code extension) lists a session duologue
   created with the others from its folder.
 - **The Codex app** lists a thread duologue created under its folder, as it lists its own.
-- **The Claude desktop app** lists only the sessions it started itself.
+- **The Claude desktop app** lists a session duologue created, under its folder, the next time
+  the app starts (macOS, with Claude Code's default folder; `desktop_cards = false` stops new
+  cards, and the cards already there are still followed). When you carry on in it there, the app
+  copies the session into one of its own; duologue follows the copy, and the old session is
+  titled "(continued in the Claude desktop app)". Not yet checked with the real desktop app: the
+  card format is the app's own, undocumented, and may change.
 - **Remote Control** shows a Claude session while a Claude Code process runs it with remote
   control on; duologue does not start one.
 
