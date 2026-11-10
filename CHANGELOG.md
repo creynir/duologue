@@ -5,9 +5,11 @@
 Every conversation syncs by itself.
 
 - **The Claude desktop app** lists the Claude sessions duologue creates, from the next time it
-  starts: duologue writes the app's card for each (macOS; `desktop_cards`). When the user carries
-  on in one there, the app copies the session into one of its own and points the card at it;
-  the pair follows the copy.
+  starts: duologue writes the app's card for each (macOS, on by default; `desktop_cards = false`
+  turns it off, `claude_desktop_dir` names the app's folder). When the user carries on in one
+  there, the app copies the session into one of its own and points the card at it; the pair
+  follows the copy once it has been quiet for 10 seconds, and a copy without the synced point
+  blocks until `duologue release`. Not yet checked with the real desktop app.
 
 - **Automatic pairing.** Each sync pass pairs the Claude Code sessions and Codex threads that
   changed in the last 7 days (`auto_days`) and have no other side yet, newest first and up to 10

@@ -986,3 +986,33 @@ def test_a_creation_cut_short_still_gets_its_card(auto_homes, app, monkeypatch):
     run("sync")
     run("sync")
     assert len(cards(app)) == 1
+
+
+def test_linking_by_hand_lists_the_new_session_at_once(auto_homes, app):
+    codex_thread(auto_homes)
+    set_config(auto_homes, "auto = false\n")
+    code, out = run("link", "--codex", THREAD)
+    assert code == 0, out
+    [card] = cards(app)  # before any sync
+    assert card["cliSessionId"] == next(iter(pairs().values())).claude
+
+
+def test_release_waits_while_the_app_writes_its_copy(auto_homes, app):
+    codex_thread(auto_homes)
+    run("sync")
+    [pair] = pairs().values()
+    t = ClaudeTranscript(cwd=auto_homes.work, session=OTHER)
+    t.user("something else entirely")
+    t.assistant("ok")
+    copy = find_transcript(auto_homes.claude, pair.claude).with_name(f"{OTHER}.jsonl")
+    copy.write_bytes(encode(t.records))
+    settled_copy(copy)
+    card_path = next(app.device.glob(f"{pair.card}.json"))
+    card_path.write_text(json.dumps(dict(json.loads(card_path.read_text()), cliSessionId=OTHER)))
+    set_config(auto_homes, "auto = false\n")
+    run("sync")
+    assert next(iter(pairs().values())).blocked
+    os.utime(copy)  # the app writes to it again
+    code, _ = run("release", pair.name)
+    [pair] = pairs().values()
+    assert code == 1 and pair.blocked and pair.claude != OTHER  # nothing changed yet

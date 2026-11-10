@@ -13,6 +13,7 @@ import pytest
 from builders import CWD, START_MS
 
 from duologue.codex.threads import Codex
+from duologue.ids import is_id
 from duologue.translate.common import iso_ms
 
 FAKE_CODEX = Path(__file__).parent / "fakes" / "fake_codex.py"
@@ -22,14 +23,22 @@ def _real_traces(home: Path) -> set[str]:
     """What a test could leave in the user's real folders: duologue's own folder, and cards in
     the Claude desktop app's list for sessions that are not in the real Claude folder (the app's
     own cards, made while the tests run, are not counted)."""
-    found = {"~/.duologue"} if (home / ".duologue").exists() else set()
+    found = set()
+    ours = home / ".duologue"
+    if ours.exists():  # every file in it, as it stands: a change inside it counts too
+        for path in [ours, *ours.rglob("*")]:
+            try:
+                st = path.lstat()
+            except OSError:
+                continue
+            found.add(f"{path} {st.st_size} {st.st_mtime_ns}")
     cards = home / "Library" / "Application Support" / "Claude" / "claude-code-sessions"
     for card in cards.glob("*/*/local_*.json") if cards.is_dir() else []:
         try:
             session = json.loads(card.read_text()).get("cliSessionId")
         except (OSError, ValueError):
             continue
-        if not isinstance(session, str) or not list(
+        if not is_id(session) or not list(
             (home / ".claude" / "projects").glob(f"*/{session}.jsonl")
         ):
             found.add(str(card))

@@ -404,6 +404,7 @@ def test_a_session_the_desktop_app_copies_is_followed(world: World):
     assert card["cliSessionId"] == session
 
     copy = world.claude("carried on in the desktop app", "--resume", session, "--fork-session")
+    assert copy != session  # a copy of its own, as the app makes
     card_path.write_text(json.dumps(dict(card, cliSessionId=copy)))
     from duologue.claude.transcript import find_transcript
     from duologue.engine import COPY_QUIET
